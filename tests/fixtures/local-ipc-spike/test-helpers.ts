@@ -104,7 +104,16 @@ export function createPhaseDeadline(
   const validPhase = validatePhase(phase);
   const validNow = validateNow(now);
   const validTimeout = validateDuration(timeoutMs);
-  return { phase: validPhase, at: validNow + validTimeout };
+  if (validTimeout > Number.MAX_VALUE - validNow) {
+    throw new RangeError(
+      `deadline must remain finite after adding timeout, got now=${validNow}, timeout=${validTimeout}`,
+    );
+  }
+  const at = validNow + validTimeout;
+  if (!Number.isFinite(at)) {
+    throw new RangeError(`deadline must be finite after adding timeout, got ${String(at)}`);
+  }
+  return { phase: validPhase, at };
 }
 
 /** Create a finite absolute timestamp for callers that do not need a phase name. */
@@ -349,22 +358,46 @@ function childExitState(child: ChildProcess): ChildExit | undefined {
   return undefined;
 }
 
+function childStdioClosed(child: ChildProcess): boolean {
+  return [child.stdin, child.stdout, child.stderr].every((stream) => {
+    if (stream === null) {
+      return true;
+    }
+    const state = stream as {
+      readonly destroyed?: boolean;
+      readonly readableEnded?: boolean;
+      readonly writableEnded?: boolean;
+    };
+    return state.destroyed === true || state.readableEnded === true || state.writableEnded === true;
+  });
+}
+
+const childCloseStates = new WeakMap<ChildProcess, ChildExit>();
+
 /** Wait for child close using one absolute, bounded deadline. */
 export function waitForChildExit(
   child: ChildProcess,
   deadline: Deadline = createPhaseDeadline('child-exit', DEFAULT_PHASE_TIMEOUT_MS),
   signal?: AbortSignal,
 ): Promise<ChildExit> {
+  const closed = childCloseStates.get(child);
+  if (closed !== undefined) {
+    return Promise.resolve(closed);
+  }
   const exited = childExitState(child);
-  if (exited !== undefined) {
+  if (exited !== undefined && childStdioClosed(child)) {
     return Promise.resolve(exited);
   }
+
+  // `exit` fires before `close`; always wait for close so piped stdio is drained.
 
   let onClose: ((code: number | null, closeSignal: NodeJS.Signals | null) => void) | undefined;
   let onError: ((error: Error) => void) | undefined;
   const completion = new Promise<ChildExit>((resolve, reject) => {
     onClose = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
-      resolve({ code, signal: closeSignal });
+      const result = { code, signal: closeSignal };
+      childCloseStates.set(child, result);
+      resolve(result);
     };
     onError = (error: Error): void => {
       reject(error);
@@ -381,6 +414,44 @@ export function waitForChildExit(
     if (onError !== undefined) {
       child.removeListener('error', onError);
     }
+  });
+}
+
+/** Wait for a forced child to close; a live child never produces a result. */
+function waitForChildClose(child: ChildProcess): Promise<ChildExit> {
+  const closed = childCloseStates.get(child);
+  if (closed !== undefined) {
+    return Promise.resolve(closed);
+  }
+  const exited = childExitState(child);
+  if (exited !== undefined) {
+    return Promise.resolve(exited);
+  }
+
+  return new Promise<ChildExit>((resolve, reject) => {
+    let settled = false;
+    let onClose: (code: number | null, signal: NodeJS.Signals | null) => void = () => undefined;
+    let onError: (error: Error) => void = () => undefined;
+    const dispose = (): void => {
+      child.removeListener('close', onClose);
+      child.removeListener('error', onError);
+    };
+    const settle = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      dispose();
+      callback();
+    };
+    onClose = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
+      const result = { code, signal: closeSignal };
+      childCloseStates.set(child, result);
+      settle(() => resolve(result));
+    };
+    onError = (error: Error): void => settle(() => reject(error));
+    child.once('close', onClose);
+    child.once('error', onError);
   });
 }
 
@@ -407,8 +478,8 @@ function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
 
 /**
  * Terminate a child and escalate once the first absolute deadline expires.
- * Even the escalation wait has a finite bound, so this helper never waits on a
- * child forever.
+ * The initial and escalation waits are finite; after a force timeout it waits
+ * for child close so cleanup never returns while the child remains alive.
  */
 export async function cleanupChildProcess(
   child: ChildProcess,
@@ -443,11 +514,9 @@ export async function cleanupChildProcess(
     if (!(error instanceof PhaseDeadlineExceededError)) {
       throw error;
     }
-    return {
-      code: child.exitCode,
-      signal: child.signalCode,
-      timedOut: true,
-    };
+    killChild(child, options.forceSignal ?? 'SIGKILL');
+    const finalExit = await waitForChildClose(child);
+    return { ...finalExit, timedOut: true };
   }
 }
 
@@ -537,6 +606,7 @@ export function captureChildDiagnostics(
   };
   const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
     exit = { code, signal };
+    childCloseStates.set(child, exit);
   };
 
   child.stdout?.on('data', onStdout);
