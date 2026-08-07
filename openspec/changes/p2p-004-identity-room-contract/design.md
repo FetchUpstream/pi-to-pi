@@ -46,7 +46,7 @@ Pi's native `/name` and `session_info_changed` remain authoritative only when no
 
 ### Normalize names into canonical labels
 
-Name input is NFKC-normalized, lowercased, and validated for control characters. Unicode letters and numbers are retained; whitespace, punctuation, and symbols become hyphens. Repeated hyphens and leading/trailing hyphens are removed. The normalized base is bounded to 48 Unicode code points. An explicitly supplied value that becomes empty is rejected; when no name is supplied, the fallback base is `agent`.
+Name input is NFKC-normalized, lowercased, and validated by rejecting Unicode control and format characters (`Cc`/`Cf`). Unicode letters and numbers are retained; whitespace, punctuation, and symbols become hyphens. Repeated hyphens and leading/trailing hyphens are removed. The normalized base is bounded to 48 Unicode code points. An explicitly supplied value that becomes empty is rejected; when no name is supplied, the fallback base is `agent`.
 
 The published network name is `<base>-<suffix>`. The suffix is the first four lowercase Crockford-base32 characters of the SHA-256 digest of the runtime UUID. It changes with the runtime, not with a session-name rename. The suffix improves usability but is not the security or routing identity; four-character collisions remain safe because resolution can return full runtime addresses.
 

@@ -12,7 +12,7 @@ The extension MUST expose `--p2p-name` as the explicit network-name override and
 - **THEN** the published network name is based on Pi's current session name, or the `agent` fallback when no session name exists
 
 ### Requirement: Canonical lowercase name normalization
-The extension MUST normalize a name by applying NFKC normalization, lowercasing, rejecting control characters, retaining Unicode letters and numbers, replacing runs of whitespace/punctuation/symbols with `-`, collapsing repeated hyphens, trimming hyphens, and enforcing a maximum of 48 Unicode code points.
+The extension MUST normalize a name by applying NFKC normalization, lowercasing, rejecting Unicode control and format characters (`Cc`/`Cf`), retaining Unicode letters and numbers, replacing runs of whitespace/punctuation/symbols with `-`, collapsing repeated hyphens, trimming hyphens, and enforcing a maximum of 48 Unicode code points.
 
 #### Scenario: Mixed-case and symbols are normalized
 - **WHEN** a name contains uppercase letters, whitespace, punctuation, or symbols

@@ -19,7 +19,7 @@ The extension MUST normalize explicit project labels, validate them, and derive 
 - **THEN** the room ID is deterministic, begins with `r1-`, contains only the permitted safe hash characters, and is identical for peers using the same normalized label
 
 #### Scenario: Invalid explicit project is supplied
-- **WHEN** a project label is empty after normalization or contains rejected control input
+- **WHEN** a project label is empty after normalization or contains a Unicode control or format character (`Cc`/`Cf`)
 - **THEN** startup rejects the configuration rather than selecting a global default room
 
 ### Requirement: Git common-directory derivation

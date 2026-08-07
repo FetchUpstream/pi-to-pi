@@ -3,9 +3,9 @@
 Pi-to-Pi is an independent community extension for direct communication between
 independent [Pi](https://github.com/earendil-works/pi) sessions.
 
-This repository contains the package and test foundation for the project. Peer
-messaging, discovery, transport, and orchestration are intentionally not
-implemented yet.
+This repository contains the package and implementation foundation for the project. The identity,
+configuration, room, peer naming, lookup, registry, and lease modules are implemented; end-to-end
+discovery wiring, peer messaging, transport, and orchestration are not implemented yet.
 
 ## Install
 
@@ -15,11 +15,18 @@ The package can be installed as a Pi package from this repository:
 pi install git:github.com/FetchUpstream/pi-to-pi
 ```
 
-The current scaffold only verifies that the extension can load and participate in Pi's session lifecycle without starting background resources.
+The extension registers its namespaced flags and wires identity, configuration, and room resolution into
+Pi's native session lifecycle without allocating sockets, timers, watchers, or processes during module
+evaluation. Registry and lease primitives are implemented as modules, but registry publication, renewal,
+and end-to-end discovery integration are not yet wired into the Pi lifecycle.
 
 ## Identity, names, and rooms
 
-The identity and room rules below are the contract for the identity/room foundation. The current scaffold does **not** implement these flags, a registry, discovery, transport, or Pi-facing peer tools yet; `src/config.ts`, `src/identity.ts`, and `src/room.ts` are reserved boundaries. This section describes the behavior that the implementation must provide and does not promise a working peer protocol in this release.
+The identity, configuration, room, naming, lookup, registry, and lease rules below describe the implemented
+foundation and its module contracts. `--p2p-name` and `--p2p-project` are registered and resolved
+through Pi's lifecycle, while registry publication and lease renewal remain available as modules but are not
+yet wired into that lifecycle. Peer transport, Agent Cards, request routing, and Pi-facing tools
+remain outside this release, as does end-to-end message delivery.
 
 ### Session and runtime identity
 
@@ -37,7 +44,7 @@ The namespaced `--p2p-name` option is an explicit network-name override:
 
 - When `--p2p-name` is present, its normalized value is used instead of Pi's native session name.
 - Without the override, the base comes from Pi's current session name, or falls back to `agent` when no session name exists. Pi's `session_info_changed` name changes update the published base only when no override is configured; they do not change the session ID, runtime ID, room, or endpoint.
-- Normalization applies NFKC, lowercases, rejects control characters, retains Unicode letters and numbers, converts runs of whitespace, punctuation, and symbols to `-`, collapses and trims hyphens, and bounds the result to 48 Unicode code points. An explicitly supplied value that becomes empty is rejected.
+- Normalization applies NFKC, lowercases, rejects Unicode control and format characters (`Cc`/`Cf`), retains Unicode letters and numbers, converts runs of whitespace, punctuation, and symbols to `-`, collapses and trims hyphens, and bounds the result to 48 Unicode code points. An explicitly supplied value that becomes empty is rejected.
 
 The published network name is `<base>-<suffix>`, where `<suffix>` is the first four lowercase Crockford-base32 characters of the SHA-256 digest of the runtime UUID. The suffix identifies the runtime generation, so it changes when the runtime is replaced and does not change merely because the Pi session is renamed. Four characters are not a uniqueness guarantee.
 
@@ -45,7 +52,7 @@ The full runtime UUID is the canonical machine-actionable peer address. A networ
 
 ### Project rooms and automatic room derivation
 
-The namespaced `--p2p-project` option is an explicit project-room label, not a filesystem path. The label is normalized and validated; control characters or a value that becomes empty are rejected rather than selecting a global default. Room resolution is performed once for a runtime using this precedence:
+The namespaced `--p2p-project` option is an explicit project-room label, not a filesystem path. The label is normalized and validated; Unicode control or format characters (`Cc`/`Cf`) or a value that becomes empty are rejected rather than selecting a global default room. Room resolution is performed once for a runtime using this precedence:
 
 1. The normalized `--p2p-project` label, when supplied.
 2. The canonical Git common directory, when the working directory is in a Git repository.
