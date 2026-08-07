@@ -86,15 +86,15 @@ function createLifecycle(flags: { name?: string; project?: string } = {}) {
 }
 
 class FailingFirstRenameRegistry extends RuntimeRegistry {
-  private renewalCount = 0;
+  private publicationCount = 0;
 
-  public override renew(): Promise<void> {
-    this.renewalCount += 1;
-    const renewal = super.renew();
-    if (this.renewalCount !== 2) {
-      return renewal;
+  protected override publishCurrentName(): Promise<void> {
+    this.publicationCount += 1;
+    const publication = super.publishCurrentName();
+    if (this.publicationCount !== 2) {
+      return publication;
     }
-    return renewal.then(() => {
+    return publication.then(() => {
       throw new Error('first overlapping rename fails');
     });
   }
@@ -306,6 +306,36 @@ describe('Pi-to-Pi extension lifecycle integration', () => {
     expect(await listRuntimeRecords(before!.room.roomId, { rootDirectory: registryRoot })).toEqual(
       [],
     );
+  });
+  it('keeps overlapping successful native renames synchronized with the committed record', async () => {
+    const lifecycle = createLifecycle({ project: 'Project Label' });
+    const context = createContext('native-session-id', 'Planner');
+
+    await lifecycle.onSessionStart(startEvent('startup'), context);
+    const firstRename = lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'First' },
+      context,
+    );
+    const secondRename = lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'Second' },
+      context,
+    );
+
+    await expect(firstRename).resolves.toBeUndefined();
+    await expect(secondRename).resolves.toBeUndefined();
+
+    const runtime = lifecycle.current();
+    expect(runtime?.config.name).toBe('second');
+    expect(runtime?.publishedName.base).toBe('second');
+    expect(runtime?.registry.networkName).toBe(runtime?.publishedName.networkName);
+    expect(runtime?.registry.current()?.networkName).toBe(runtime?.publishedName.networkName);
+    expect(
+      await readRuntimeRecord(runtime!.room.roomId, runtime!.identity.runtimeId, {
+        rootDirectory: registryRoot,
+      }),
+    ).toEqual(runtime?.registry.current());
+
+    await lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
   });
 
   it('keeps overlapping native renames consistent after an earlier publication fails', async () => {

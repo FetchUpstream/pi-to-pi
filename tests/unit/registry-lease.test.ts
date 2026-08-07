@@ -55,6 +55,36 @@ function record(runtimeId: string, roomId = ROOM_ID, now = 1_000, ttlMs = DEFAUL
   });
 }
 
+class OrderedPublicationRegistry extends RuntimeRegistry {
+  private publicationCount = 0;
+  private releaseBlockedRenewal: (() => void) | undefined;
+  private resolveRenewalStarted: (() => void) | undefined;
+  public readonly renewalStarted = new Promise<void>((resolve) => {
+    this.resolveRenewalStarted = resolve;
+  });
+  public readonly observedNames: string[] = [];
+
+  public releaseBlockedRenewalNow(): void {
+    this.releaseBlockedRenewal?.();
+    this.releaseBlockedRenewal = undefined;
+  }
+
+  protected override async publishCurrentName(): Promise<void> {
+    this.publicationCount += 1;
+    if (this.publicationCount === 2) {
+      this.resolveRenewalStarted?.();
+      await new Promise<void>((resolve) => {
+        this.releaseBlockedRenewal = resolve;
+      });
+    }
+    this.observedNames.push(this.networkName);
+    if (this.publicationCount === 3) {
+      throw new Error('rename publication fails');
+    }
+    await super.publishCurrentName();
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories
@@ -436,6 +466,36 @@ describe('serialized lease and lifecycle cleanup', () => {
     expect(await readRuntimeRecord(ROOM_ID, RUNTIME_B, { rootDirectory: root, now })).toBeDefined();
     await replacement.shutdown();
   });
+  it('serializes renewal ahead of a failed staged name publication', async () => {
+    const root = await temporaryRoot();
+    const registry = new OrderedPublicationRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+
+    await registry.start();
+    const renewal = registry.renew();
+    await registry.renewalStarted;
+    const rename = registry.updateNetworkName('renamed');
+    registry.releaseBlockedRenewalNow();
+
+    await expect(renewal).resolves.toBeUndefined();
+    await expect(rename).rejects.toThrow('rename publication fails');
+    expect(registry.observedNames).toEqual(['planner', 'planner', 'renamed']);
+    expect(registry.networkName).toBe('planner');
+    expect(registry.current()?.networkName).toBe('planner');
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toEqual(registry.current());
+
+    await registry.shutdown();
+  });
+
   it('removes the last committed record when shutdown rejects a queued name publication', async () => {
     const root = await temporaryRoot();
     const registry = new RuntimeRegistry({

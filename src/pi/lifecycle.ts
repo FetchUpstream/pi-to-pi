@@ -112,6 +112,29 @@ export function createPiToPiLifecycle(
   let active: ActiveRuntime | undefined;
   let stopping: Promise<void> | undefined;
 
+  function isCurrentRuntime(runtime: ActiveRuntime): boolean {
+    const current = active;
+    return (
+      current !== undefined &&
+      current.identity.runtimeId === runtime.identity.runtimeId &&
+      current.identity.sessionId === runtime.identity.sessionId &&
+      current.registry === runtime.registry
+    );
+  }
+
+  function hasCommittedName(runtime: ActiveRuntime, publishedName: PublishedPeerName): boolean {
+    const record = runtime.registry.current();
+    return (
+      record !== undefined &&
+      runtime.registry.networkName === publishedName.networkName &&
+      record.runtimeId === runtime.identity.runtimeId &&
+      record.sessionId === runtime.identity.sessionId &&
+      record.roomId === runtime.room.roomId &&
+      record.endpoint === runtime.endpoint &&
+      record.networkName === publishedName.networkName
+    );
+  }
+
   function stopRuntime(runtime: ActiveRuntime): Promise<void> {
     if (runtime.stopPromise !== undefined) {
       return runtime.stopPromise;
@@ -213,9 +236,13 @@ export function createPiToPiLifecycle(
         projectOverride: runtime.config.projectOverride,
       });
       await runtime.registry.updateNetworkName(publishedName.networkName);
-      if (active === runtime) {
+      if (!isCurrentRuntime(runtime) || !hasCommittedName(runtime, publishedName)) {
+        return;
+      }
+      const current = active;
+      if (current !== undefined) {
         active = {
-          ...runtime,
+          ...current,
           config,
           publishedName,
         };
