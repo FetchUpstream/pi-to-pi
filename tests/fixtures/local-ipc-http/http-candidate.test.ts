@@ -1,4 +1,7 @@
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
+import { basename, dirname } from 'node:path';
 import { createConnection } from 'node:net';
 import type { Socket } from 'node:net';
 
@@ -11,6 +14,7 @@ import {
   withPhaseDeadline,
 } from '../local-ipc-spike/test-helpers.js';
 import {
+  __removeStaleHttpIpcEndpointForTest,
   bindHttpIpc,
   DEFAULT_HTTP_CONNECT_TIMEOUT_MS,
   DEFAULT_HTTP_MAX_RESPONSE_BYTES,
@@ -36,6 +40,57 @@ async function closeRunningServers(): Promise<void> {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForChildReady(child: ChildProcess): Promise<void> {
+  const stdout = child.stdout;
+  if (stdout === null) {
+    throw new Error('HTTP stale-endpoint child stdout is not piped');
+  }
+  let output = '';
+  const ready = new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      stdout.off('data', onData);
+      child.off('error', onError);
+      child.off('close', onClose);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      output += chunk.toString();
+      if (output.includes('READY\n')) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = (): void => {
+      cleanup();
+      reject(new Error(`HTTP stale-endpoint child exited before READY: ${output}`));
+    };
+    stdout.on('data', onData);
+    child.once('error', onError);
+    child.once('close', onClose);
+  });
+  await withPhaseDeadline('http-stale-child-ready', 500, ready, {
+    onTimeout: () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+    },
+  });
+}
+
+async function waitForChildClose(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  await withPhaseDeadline(
+    'http-stale-child-close',
+    500,
+    new Promise<void>((resolve) => child.once('close', () => resolve())),
+  );
 }
 
 async function startServer(
@@ -465,12 +520,63 @@ describe('HTTP over local IPC comparison candidate', () => {
     if (process.platform !== 'win32') {
       expect(existsSync(endpoint)).toBe(false);
     }
+    if (process.platform !== 'win32') {
+      const staleEndpoint = createHttpIpcEndpoint();
+      const script = [
+        "import { createServer } from 'node:net';",
+        'const staleServer = createServer(() => undefined);',
+        "staleServer.listen(process.argv[1], () => process.stdout.write('READY\\n'));",
+      ].join('\n');
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script, staleEndpoint], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      try {
+        await waitForChildReady(child);
+        child.kill('SIGKILL');
+        await waitForChildClose(child);
+        expect(existsSync(staleEndpoint)).toBe(true);
+        await __removeStaleHttpIpcEndpointForTest(staleEndpoint, { timeoutMs: 500 });
+        expect(existsSync(staleEndpoint)).toBe(false);
+        const residuals = (await readdir(dirname(staleEndpoint))).filter((entry) =>
+          entry.startsWith(`${basename(staleEndpoint)}.cleanup-`),
+        );
+        expect(residuals).toEqual([]);
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL');
+        }
+        await waitForChildClose(child).catch(() => undefined);
+        await __removeStaleHttpIpcEndpointForTest(staleEndpoint, { timeoutMs: 500 }).catch(
+          () => undefined,
+        );
+      }
+    }
   });
 
   it('bounds close by the caller deadline and preserves a failed close', async () => {
-    const candidate = await startServer((payload) => payload);
+    const candidate = await startServer(async (payload) => {
+      await delay(100);
+      return payload;
+    });
     if (process.platform === 'win32') {
-      await candidate.server.close({ timeoutMs: 0 });
+      const response = requestHttpIpcResponse(candidate.endpoint, Buffer.from('x'));
+      try {
+        await delay(10);
+        await expect(candidate.server.close({ timeoutMs: 0 })).rejects.toMatchObject({
+          name: 'PhaseDeadlineExceededError',
+          phase: 'close',
+        });
+      } finally {
+        // The zero-timeout close has already forced the server/resources; observe
+        // the response rejection and retry, then remove the server from shared cleanup.
+        await response.catch(() => undefined);
+        await candidate.server.close({ timeoutMs: 500 }).catch(() => undefined);
+        const index = runningServers.indexOf(candidate.server);
+        if (index >= 0) {
+          runningServers.splice(index, 1);
+        }
+        await delay(25);
+      }
       return;
     }
 

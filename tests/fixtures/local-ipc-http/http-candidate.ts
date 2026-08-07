@@ -210,16 +210,45 @@ async function withEndpointOperationLock<T>(
     } catch {
       completion = undefined;
     }
-    void Promise.allSettled([
-      predecessor ?? Promise.resolve(),
-      completion ?? Promise.resolve(),
-    ]).then(() => {
+    // A detached probe/startup completion must not strand this lock forever. The
+    // completion remains part of ownership until it settles, while the absolute
+    // deadline provides a terminal release point after the resource was forced to
+    // close by the timed-out operation.
+    const releasePredecessor =
+      predecessor === undefined
+        ? Promise.resolve()
+        : settleLockCompletion(predecessor, lockOptions.deadline);
+    const releaseCompletion = settleLockCompletion(completion, lockOptions.deadline);
+    void Promise.all([releasePredecessor, releaseCompletion]).then(() => {
       release();
       if (endpointOperationLocks.get(endpoint) === current) {
         endpointOperationLocks.delete(endpoint);
       }
     });
   }
+}
+
+function settleLockCompletion(
+  completion: PromiseLike<unknown> | undefined,
+  deadline: ReturnType<typeof createPhaseDeadline> | undefined,
+): Promise<void> {
+  if (completion === undefined) {
+    return Promise.resolve();
+  }
+  const observed = Promise.resolve(completion);
+  if (deadline === undefined) {
+    return observed.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+  // Do not pass the caller signal here: cancellation stops the operation, but the
+  // endpoint lock remains owned until detached work settles or its absolute
+  // deadline is reached.
+  return withDeadline(observed, deadline).then(
+    () => undefined,
+    () => undefined,
+  );
 }
 
 interface EndpointCleanupTracker {
@@ -937,6 +966,7 @@ async function hasLiveUnixListener(
   let probe: Socket | undefined;
   let removeAbort = (): void => undefined;
   let cleanupProbeListeners = (): void => undefined;
+  let removeCloseListener = (): void => undefined;
   const completion = new Promise<UnixListenerProbeResult>((resolve) => {
     let settled = false;
     let result: UnixListenerProbeResult | undefined;
@@ -962,6 +992,7 @@ async function hasLiveUnixListener(
     };
     const onClose = (): void => {
       finish(result ?? 'unknown');
+      removeCloseListener();
     };
 
     try {
@@ -973,9 +1004,14 @@ async function hasLiveUnixListener(
       finish('unknown');
     }
 
+    // Keep the close observer until the destroyed probe has emitted close. A
+    // timeout/abort may settle the outer deadline first, but the close event is
+    // the completion that releases the endpoint-operation ownership.
     cleanupProbeListeners = (): void => {
       probe?.off('connect', onConnect);
       probe?.off('error', onError);
+    };
+    removeCloseListener = (): void => {
       probe?.off('close', onClose);
     };
   });
@@ -998,6 +1034,8 @@ async function hasLiveUnixListener(
     removeAbort();
     destroyProbe();
     cleanupProbeListeners();
+    // Do not remove the close listener here: timeout and abort paths must observe
+    // the forced socket completion before releasing endpoint ownership.
   }
 }
 
@@ -1005,82 +1043,75 @@ async function restoreQuarantinedUnixSocket(
   endpoint: string,
   quarantine: string,
   identity: UnixSocketIdentity,
-  deadline: ReturnType<typeof createPhaseDeadline>,
-  signal: AbortSignal,
   tracker: EndpointCleanupTracker,
 ): Promise<void> {
-  throwIfAborted(signal);
   let quarantinedStat: BigIntStats;
   try {
-    quarantinedStat = await withDeadline(
-      tracker.track(lstat(quarantine, { bigint: true })),
-      deadline,
-      { signal },
-    );
+    quarantinedStat = await tracker.track(lstat(quarantine, { bigint: true }));
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return;
     }
     throw error;
   }
-  throwIfAborted(signal);
-
-  const quarantinedIsOwned =
-    quarantinedStat.isSocket() && sameUnixSocketObjectIdentity(quarantinedStat, identity);
-  if (quarantinedIsOwned) {
+  if (!quarantinedStat.isSocket()) {
+    throw new HttpIpcProtocolError('HTTP IPC endpoint quarantine is not a Unix socket');
+  }
+  const quarantinedIsOwned = sameUnixSocketObjectIdentity(quarantinedStat, identity);
+  const quarantineKind = quarantinedIsOwned ? 'owned' : 'replacement';
+  // The quarantine path was created by our rename. Even if the inode changed
+  // between the ownership probe and rename, restore that exact moved entry only
+  // when the endpoint is vacant; never overwrite a replacement endpoint.
+  let operationError: unknown;
+  try {
     let endpointStat: BigIntStats | undefined;
     try {
-      endpointStat = await withDeadline(
-        tracker.track(lstat(endpoint, { bigint: true })),
-        deadline,
-        { signal },
-      );
+      endpointStat = await tracker.track(lstat(endpoint, { bigint: true }));
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw error;
       }
     }
-    throwIfAborted(signal);
     if (endpointStat === undefined) {
       try {
-        await withDeadline(tracker.track(link(quarantine, endpoint)), deadline, { signal });
+        await tracker.track(link(quarantine, endpoint));
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           throw error;
         }
       }
     }
-    await withDeadline(tracker.track(unlink(quarantine)), deadline, { signal }).catch(
-      (error: unknown) => {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw error;
-        }
-      },
-    );
-    return;
-  }
-
-  // A different inode was moved by the race. Restore it only if the endpoint
-  // is still vacant; never overwrite or unlink a replacement listener.
-  try {
-    await withDeadline(tracker.track(link(quarantine, endpoint)), deadline, { signal });
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new HttpIpcProtocolError(
-        'HTTP IPC endpoint quarantine contains a replacement-owned socket',
-      );
-    }
-    throw error;
+    operationError = error;
   }
-  await withDeadline(tracker.track(unlink(quarantine)), deadline, { signal }).catch(
-    (error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw error;
-      }
-    },
-  );
+  let unlinkError: unknown;
+  try {
+    const finalQuarantineStat = await tracker.track(lstat(quarantine, { bigint: true }));
+    if (
+      !finalQuarantineStat.isSocket() ||
+      !sameUnixSocketObjectIdentity(finalQuarantineStat, quarantinedStat)
+    ) {
+      throw new HttpIpcProtocolError('HTTP IPC endpoint quarantine ownership changed');
+    }
+    await tracker.track(unlink(quarantine));
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      unlinkError = error;
+    }
+  }
+  if (operationError !== undefined && unlinkError !== undefined) {
+    throw new AggregateError(
+      [operationError, unlinkError],
+      `HTTP IPC ${quarantineKind} quarantine recovery failed`,
+    );
+  }
+  if (operationError !== undefined) {
+    throw operationError;
+  }
+  if (unlinkError !== undefined) {
+    throw unlinkError;
+  }
 }
-
 async function removeOwnedUnixSocketWithinDeadline(
   endpoint: string,
   identity: UnixSocketIdentity,
@@ -1137,22 +1168,55 @@ async function removeOwnedUnixSocketWithinDeadline(
   }
   throwIfAborted(signal);
 
-  // Quarantine the exact entry atomically before unlinking it. Every operation
-  // after rename is recovered on abort/error so cleanup cannot strand the entry.
+  // Quarantine the exact entry atomically before unlinking it. A rename that is
+  // still in flight remains owned by this transaction and gets a detached recovery
+  // continuation if the caller aborts or the absolute deadline expires.
   const quarantine = `${endpoint}.cleanup-${randomUUID()}`;
   let quarantineCreated = false;
+  let renamePromise: Promise<void> | undefined;
+  let renameObserved: Promise<void> | undefined;
+  let recoveryPromise: Promise<void> | undefined;
+  const scheduleRecovery = (): void => {
+    if (recoveryPromise !== undefined || renameObserved === undefined) {
+      return;
+    }
+    recoveryPromise = tracker.track(
+      renameObserved.then(async () => {
+        if (!quarantineCreated) {
+          return;
+        }
+        await restoreQuarantinedUnixSocket(endpoint, quarantine, identity, tracker);
+        quarantineCreated = false;
+      }),
+    );
+    // The primary deadline has already won. Keep recovery observed and let the
+    // endpoint lock wait for it when it settles, without rethrowing asynchronously.
+    void recoveryPromise.catch(() => undefined);
+  };
   try {
+    quarantineCreated = true;
+    renamePromise = tracker.track(rename(endpoint, quarantine));
+    renameObserved = tracker.track(
+      renamePromise.then(
+        () => {
+          quarantineCreated = true;
+        },
+        () => {
+          quarantineCreated = false;
+        },
+      ),
+    );
     try {
-      await withDeadline(tracker.track(rename(endpoint, quarantine)), deadline, { signal });
+      await withDeadline(renamePromise, deadline, { signal });
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        quarantineCreated = false;
         return;
       }
+      scheduleRecovery();
       throw error;
     }
     quarantineCreated = true;
-    // This check intentionally lives inside the recovery scope: if cancellation
-    // races with rename, restoreQuarantinedUnixSocket releases the quarantine.
     throwIfAborted(signal);
     const quarantinedStat = await withDeadline(
       tracker.track(lstat(quarantine, { bigint: true })),
@@ -1179,7 +1243,7 @@ async function removeOwnedUnixSocketWithinDeadline(
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         throw new HttpIpcProtocolError(
-          'HTTP IPC endpoint replacement owns the path; quarantine was retained',
+          'HTTP IPC endpoint replacement owns the path; quarantine will be released',
         );
       }
       throw error;
@@ -1193,21 +1257,15 @@ async function removeOwnedUnixSocketWithinDeadline(
     );
     quarantineCreated = false;
   } catch (error: unknown) {
-    if (quarantineCreated) {
+    if (quarantineCreated || renamePromise !== undefined) {
+      scheduleRecovery();
+    }
+    if (recoveryPromise !== undefined && !signal.aborted && Date.now() < deadline.at) {
       try {
-        await restoreQuarantinedUnixSocket(
-          endpoint,
-          quarantine,
-          identity,
-          deadline,
-          signal,
-          tracker,
-        );
-      } catch (recoveryError: unknown) {
-        throw new AggregateError(
-          [error, recoveryError],
-          'HTTP IPC endpoint quarantine recovery failed',
-        );
+        await withDeadline(recoveryPromise, deadline);
+      } catch {
+        // Preserve the primary lifecycle failure; recovery remains tracked for the
+        // endpoint lock and its eventual result is observed there.
       }
     }
     throw error;
@@ -1265,6 +1323,30 @@ async function removeOwnedUnixSocket(
       },
     },
   );
+}
+
+/** Test-only stale endpoint cleanup seam used to exercise HTTP ownership recovery. */
+export async function __removeStaleHttpIpcEndpointForTest(
+  endpoint: string,
+  options: { readonly timeoutMs?: number; readonly signal?: AbortSignal } = {},
+): Promise<void> {
+  if (process.platform === 'win32' || endpointKind(endpoint) !== 'unix-socket') {
+    return;
+  }
+  const timeoutMs = normalizeTimeout(
+    options.timeoutMs,
+    DEFAULT_HTTP_CLOSE_TIMEOUT_MS,
+    'endpointCleanupTimeoutMs',
+  );
+  const deadline = createPhaseDeadline('endpoint-cleanup', timeoutMs);
+  const signal = options.signal ?? new AbortController().signal;
+  const tracker = createEndpointCleanupTracker();
+  const identity = await captureOwnedUnixSocket(endpoint, deadline, signal, tracker);
+  tracker.finish();
+  if (identity === undefined) {
+    return;
+  }
+  await removeOwnedUnixSocket(endpoint, identity, timeoutMs, signal, deadline);
 }
 
 function forceCloseServer(server: Server, sockets: Set<Socket>): void {
@@ -1550,7 +1632,9 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
   const startupDeadline = createPhaseDeadline('endpoint-startup', DEFAULT_HTTP_CLOSE_TIMEOUT_MS);
   const startupTracker = createEndpointCleanupTracker();
   let startupPromise: Promise<void> | undefined;
+  let settleListening: ((error?: unknown) => void) | undefined;
   const abortStartup = (): void => {
+    settleListening?.(new AbortError('HTTP IPC endpoint startup was aborted'));
     try {
       server.close(() => undefined);
     } catch {
@@ -1564,17 +1648,36 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
         startupPromise = withDeadline(
           async (startupSignal) => {
             const listening = new Promise<void>((resolve, reject) => {
-              const onListening = (): void => {
+              let settled = false;
+              const settle = (error?: unknown): void => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                server.off('listening', onListening);
                 server.off('error', onError);
-                resolve();
+                if (error === undefined) {
+                  resolve();
+                } else {
+                  reject(error);
+                }
+              };
+              const onListening = (): void => {
+                settle();
               };
               const onError = (error: Error): void => {
-                server.off('listening', onListening);
-                reject(error);
+                settle(error);
+              };
+              settleListening = (error?: unknown): void => {
+                settle(error ?? new AbortError('HTTP IPC endpoint startup was aborted'));
               };
               server.once('listening', onListening);
               server.once('error', onError);
-              server.listen(normalized.endpoint);
+              try {
+                server.listen(normalized.endpoint);
+              } catch (error: unknown) {
+                settle(error);
+              }
             });
             await withDeadline(startupTracker.track(listening), startupDeadline, {
               signal: startupSignal,
