@@ -1040,10 +1040,15 @@ async function restoreQuarantinedUnixEntry(
   quarantine: string,
   identity: UnixSocketIdentity,
   tracker: EndpointCleanupTracker,
+  deadline = createPhaseDeadline('endpoint-quarantine-recovery', DEFAULT_HTTP_CLOSE_TIMEOUT_MS),
+  beforeRelink?: () => void | PromiseLike<void>,
 ): Promise<void> {
   let quarantinedStat: BigIntStats;
   try {
-    quarantinedStat = await tracker.track(lstat(quarantine, { bigint: true }));
+    quarantinedStat = await withDeadline(
+      tracker.track(lstat(quarantine, { bigint: true })),
+      deadline,
+    );
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return;
@@ -1056,22 +1061,31 @@ async function restoreQuarantinedUnixEntry(
   // between the ownership probe and rename, restore that exact moved entry only
   // when the endpoint is vacant; never overwrite a replacement endpoint.
   let operationError: unknown;
+  let relinkSawEexist = false;
   try {
     let endpointStat: BigIntStats | undefined;
     try {
-      endpointStat = await tracker.track(lstat(endpoint, { bigint: true }));
+      endpointStat = await withDeadline(tracker.track(lstat(endpoint, { bigint: true })), deadline);
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw error;
       }
     }
     if (endpointStat === undefined) {
+      if (beforeRelink !== undefined) {
+        await withDeadline(Promise.resolve().then(beforeRelink), deadline);
+      }
       try {
-        await tracker.track(link(quarantine, endpoint));
+        await withDeadline(tracker.track(link(quarantine, endpoint)), deadline);
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           throw error;
         }
+        relinkSawEexist = true;
+        endpointStat = await withDeadline(
+          tracker.track(lstat(endpoint, { bigint: true })),
+          deadline,
+        );
       }
     }
   } catch (error: unknown) {
@@ -1079,11 +1093,35 @@ async function restoreQuarantinedUnixEntry(
   }
   let unlinkError: unknown;
   try {
-    const finalQuarantineStat = await tracker.track(lstat(quarantine, { bigint: true }));
+    const finalQuarantineStat = await withDeadline(
+      tracker.track(lstat(quarantine, { bigint: true })),
+      deadline,
+    );
     if (!sameUnixObjectIdentity(finalQuarantineStat, quarantinedStat)) {
       throw new HttpIpcProtocolError('HTTP IPC endpoint quarantine ownership changed');
     }
-    await tracker.track(unlink(quarantine));
+    let finalEndpointStat: BigIntStats | undefined;
+    try {
+      finalEndpointStat = await withDeadline(
+        tracker.track(lstat(endpoint, { bigint: true })),
+        deadline,
+      );
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    const endpointSharesQuarantine =
+      finalEndpointStat !== undefined &&
+      sameUnixObjectIdentity(finalEndpointStat, finalQuarantineStat);
+    // An EEXIST relink means another owner has claimed the endpoint. Preserve
+    // a non-owned quarantine entry even when it is unchanged: it may be the
+    // only pathname for a live listener moved by the racing rename. Only an
+    // unchanged moved entry can be removed, and owned residuals are removable
+    // even when the replacement owns the endpoint.
+    if (quarantinedIsOwned || (!relinkSawEexist && endpointSharesQuarantine)) {
+      await withDeadline(tracker.track(unlink(quarantine)), deadline);
+    }
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       unlinkError = error;
@@ -1175,7 +1213,7 @@ async function removeOwnedUnixSocketWithinDeadline(
         if (!quarantineCreated) {
           return;
         }
-        await restoreQuarantinedUnixEntry(endpoint, quarantine, identity, tracker);
+        await restoreQuarantinedUnixEntry(endpoint, quarantine, identity, tracker, deadline);
         quarantineCreated = false;
       }),
     );
@@ -1344,13 +1382,21 @@ export async function __recoverHttpIpcEndpointQuarantineForTest(
   endpoint: string,
   quarantine: string,
   identity: UnixSocketIdentity,
+  beforeRelink?: () => void | PromiseLike<void>,
 ): Promise<void> {
   if (process.platform === 'win32' || endpointKind(endpoint) !== 'unix-socket') {
     return;
   }
   const tracker = createEndpointCleanupTracker();
   try {
-    await restoreQuarantinedUnixEntry(endpoint, quarantine, identity, tracker);
+    await restoreQuarantinedUnixEntry(
+      endpoint,
+      quarantine,
+      identity,
+      tracker,
+      undefined,
+      beforeRelink,
+    );
   } finally {
     tracker.finish();
   }

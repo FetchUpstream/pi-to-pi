@@ -11,8 +11,8 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { basename, dirname } from 'node:path';
-import { createConnection } from 'node:net';
-import type { Socket } from 'node:net';
+import { createConnection, createServer } from 'node:net';
+import type { Server, Socket } from 'node:net';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -119,6 +119,37 @@ async function startServer(
   const server = await bindHttpIpc({ endpoint, handler, ...options });
   runningServers.push(server);
   return { endpoint, server };
+}
+
+async function listenRawSocketServer(server: Server, endpoint: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const onListening = (): void => {
+      server.off('error', onError);
+      resolve();
+    };
+    const onError = (error: Error): void => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    server.once('listening', onListening);
+    server.once('error', onError);
+    server.listen(endpoint);
+  });
+}
+
+async function closeRawSocketServer(server: Server): Promise<void> {
+  if (!server.listening) {
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    server.close((error?: Error) => {
+      if (error !== undefined) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
 }
 
 function assertWindowsHttpLimitation(limitation: string): void {
@@ -648,7 +679,46 @@ describe('HTTP over local IPC comparison candidate', () => {
       }
     },
   );
-
+  it('preserves a live moved replacement when the endpoint is claimed before relink', async () => {
+    if (process.platform === 'win32') {
+      assertWindowsHttpLimitation(
+        'POSIX quarantine replacement behavior requires a Linux or macOS runner',
+      );
+      return;
+    }
+    const endpoint = createHttpIpcEndpoint();
+    const quarantine = `${endpoint}.cleanup-live-replacement`;
+    const original = createServer((socket) => socket.resume());
+    const quarantined = createServer((socket) => socket.resume());
+    const replacement = createServer((socket) => socket.resume());
+    try {
+      await listenRawSocketServer(original, endpoint);
+      const identity = await lstat(endpoint, { bigint: true });
+      expect(identity.isSocket()).toBe(true);
+      await closeRawSocketServer(original);
+      await unlinkIfPresent(endpoint);
+      await listenRawSocketServer(quarantined, endpoint);
+      await rename(endpoint, quarantine);
+      await __recoverHttpIpcEndpointQuarantineForTest(endpoint, quarantine, identity, async () => {
+        await listenRawSocketServer(replacement, endpoint);
+      });
+      expect(replacement.listening).toBe(true);
+      expect(quarantined.listening).toBe(true);
+      expect(existsSync(endpoint)).toBe(true);
+      expect(existsSync(quarantine)).toBe(true);
+      const endpointStat = await lstat(endpoint, { bigint: true });
+      const quarantineStat = await lstat(quarantine, { bigint: true });
+      expect(endpointStat.isSocket()).toBe(true);
+      expect(quarantineStat.isSocket()).toBe(true);
+      expect(endpointStat.ino).not.toBe(quarantineStat.ino);
+    } finally {
+      await closeRawSocketServer(replacement).catch(() => undefined);
+      await closeRawSocketServer(quarantined).catch(() => undefined);
+      await closeRawSocketServer(original).catch(() => undefined);
+      await unlinkIfPresent(endpoint);
+      await unlinkIfPresent(quarantine);
+    }
+  });
   it('bounds close by the caller deadline and preserves a failed close', async () => {
     const candidate = await startServer(async (payload) => {
       await delay(100);
