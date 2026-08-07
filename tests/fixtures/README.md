@@ -52,3 +52,31 @@ intentionally waits 25 ms after `exited` before asserting that no later diagnost
 These fixtures support the mandatory Node harness suite only. Future real-Pi lifecycle tests are a
 separate integration concern under `tests/integration/` and must not be confused with, or required
 by, the portable fixtures.
+
+## Pi lifecycle fixtures
+
+The following in-process fixtures are specific to the P2P-006 lifecycle spike and remain separate
+from the portable process harness above:
+
+- `pi-runtime.ts` exports the in-process runtime factory backed by `createAgentSessionRuntime()`,
+  `createAgentSessionServices()`, `SessionManager`, `SettingsManager`, and a registered
+  `fauxProvider()`.
+- `pi-probe.ts` exports the inline lifecycle/custom-message probe and `bindPiProbe()` rebinding
+  helper.
+- `persisted-session.ts` exports isolated temporary-directory helpers for reload, resume, fork,
+  and clone scenarios. Persisted clones copy the selected branch only; pass `sourceLeafId` when
+  a live `session_tree` selection is not represented by the file's last entry.
+- `task-state.ts` exports the body-free append-only `p2p.task` metadata schema, latest-state
+  folding/recovery helpers, and the runtime/session-bound lifecycle that resets on shutdown,
+  re-scopes on `session_tree`, and supersedes inherited fork/clone records before destination
+  delivery. `runtimeId` is an adapter-assigned writer identity; Pi does not mint it.
+- `index.ts` is the import barrel for follow-on tests.
+
+## Inbound-delivery invariants
+
+The [inbound-delivery integration test](../integration/inbound-delivery.test.ts) and its correlation helper enforce these additional fixture invariants:
+
+- Reply transitions reject while the matching delivery is in flight; stale session/runtime attempts cannot emit `replied` or `delivered` correlation events.
+- Accepted requests capture the runtime object, exact session object, and session ID; every transition also verifies that the accepted runtime still exposes that exact session and identity. A replacement during a send rejects the stale delivery and leaves the request accepted but undelivered.
+- Busy `steer` and `followUp` calls emit an `enqueued` observation but keep the in-flight guard until their custom message has been processed and `agent_settled` has fired; `delivered` is emitted only then. The contract establishes queueing with explicit correlation events, preserves steering-before-follow-up ordering, and rejects duplicate IDs while queued or settled.
+- The correlation helper intentionally does not offer `deliverAs: "nextTurn"`; inbound delivery must either trigger an idle turn or use busy steering/follow-up processing.
