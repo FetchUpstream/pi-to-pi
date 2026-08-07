@@ -176,6 +176,8 @@ describe('Pi-to-Pi extension bootstrap', () => {
     lifecycle.onSessionStart(startEvent('startup'), context);
     const before = lifecycle.current();
     expect(before).toBeDefined();
+    expect(before?.config.name).toBe('planner');
+    expect(before?.config.nameSource).toBe('session-name');
 
     const renamedEvent: SessionInfoChangedEvent = {
       type: 'session_info_changed',
