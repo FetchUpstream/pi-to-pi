@@ -48,8 +48,8 @@ function validateProtocolConfig(config: ProtocolConfig): ProtocolConfig {
     const value = config[name];
     const ceiling = V1_LIMIT_CEILINGS[name];
 
-    if (!Number.isFinite(value) || value <= 0) {
-      throw new RangeError(`${name} must be a finite positive number`);
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new RangeError(`${name} must be a positive safe integer`);
     }
 
     if (value > ceiling) {

@@ -86,7 +86,7 @@ export const MAX_PROTOCOL_ERROR_MESSAGE_LENGTH = 512;
 
 const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const RFC3339_UTC_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/u;
-const SCHEMA_ANCHOR_PATTERN = /^[A-Za-z][A-Za-z0-9._-]*$/u;
+const SCHEMA_ANCHOR_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]*$/u;
 const JSON_SCHEMA_TYPES = new Set([
   'null',
   'boolean',
@@ -96,6 +96,74 @@ const JSON_SCHEMA_TYPES = new Set([
   'integer',
   'string',
 ]);
+const SUPPORTED_SCHEMA_KEYWORDS = new Set([
+  '$schema',
+  '$ref',
+  '$anchor',
+  '$vocabulary',
+  '$comment',
+  'type',
+  'const',
+  'enum',
+  'multipleOf',
+  'maximum',
+  'exclusiveMaximum',
+  'minimum',
+  'exclusiveMinimum',
+  'maxLength',
+  'minLength',
+  'pattern',
+  'format',
+  'contentEncoding',
+  'contentMediaType',
+  'maxItems',
+  'minItems',
+  'uniqueItems',
+  'contains',
+  'maxContains',
+  'minContains',
+  'prefixItems',
+  'items',
+  'maxProperties',
+  'minProperties',
+  'required',
+  'properties',
+  'patternProperties',
+  'additionalProperties',
+  'dependentRequired',
+  'dependentSchemas',
+  'propertyNames',
+  'allOf',
+  'anyOf',
+  'oneOf',
+  'not',
+  'if',
+  'then',
+  'else',
+  '$defs',
+  'definitions',
+  'title',
+  'description',
+  'default',
+  'deprecated',
+  'readOnly',
+  'writeOnly',
+  'examples',
+]);
+const UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
+  '$id',
+  '$dynamicRef',
+  '$dynamicAnchor',
+  '$recursiveRef',
+  '$recursiveAnchor',
+  'unevaluatedItems',
+  'unevaluatedProperties',
+  'additionalItems',
+  'dependencies',
+  'contentSchema',
+]);
+const SCHEMA_STRING_METADATA_KEYWORDS = new Set(['$comment', 'title', 'description']);
+const SCHEMA_BOOLEAN_METADATA_KEYWORDS = new Set(['deprecated', 'readOnly', 'writeOnly']);
 const FORMAT_ASSERTION_VOCABULARY = 'https://json-schema.org/draft/2020-12/vocab/format-assertion';
 const SUPPORTED_REQUIRED_VOCABULARIES = new Set([
   'https://json-schema.org/draft/2020-12/vocab/core',
@@ -160,6 +228,7 @@ interface SchemaIndex {
   readonly refs: ReadonlyMap<string, JsonSchema>;
   readonly anchors: ReadonlyMap<string, JsonSchema>;
   readonly references: readonly { readonly ref: string; readonly path: string }[];
+  readonly anchorIssue?: InternalIssue;
 }
 
 interface EvaluationBudget {
@@ -178,6 +247,7 @@ interface SchemaValidationResult {
   readonly valid: boolean;
   readonly path?: string;
   readonly reason?: string;
+  readonly resourceLimit?: boolean;
 }
 
 function hasOwn(value: UnknownRecord, key: string): boolean {
@@ -309,33 +379,54 @@ function resolveLimits(options: ValidationOptions): ResolvedLimits {
   };
 }
 
-function resolveNow(value: ValidationOptions['now']): number {
+const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
+interface ParsedUtcTimestamp {
+  readonly epochNanoseconds: bigint;
+  readonly epochMilliseconds: number;
+}
+function timestampFromMilliseconds(value: number): ParsedUtcTimestamp {
+  if (!Number.isFinite(value) || !Number.isSafeInteger(Math.trunc(value))) {
+    throw new RangeError('now must be a finite safe number');
+  }
+  let wholeMilliseconds = Math.trunc(value);
+  let fractionalNanoseconds = Math.round(
+    (value - wholeMilliseconds) * Number(NANOSECONDS_PER_MILLISECOND),
+  );
+  if (fractionalNanoseconds >= Number(NANOSECONDS_PER_MILLISECOND)) {
+    wholeMilliseconds += 1;
+    fractionalNanoseconds -= Number(NANOSECONDS_PER_MILLISECOND);
+  } else if (fractionalNanoseconds <= -Number(NANOSECONDS_PER_MILLISECOND)) {
+    wholeMilliseconds -= 1;
+    fractionalNanoseconds += Number(NANOSECONDS_PER_MILLISECOND);
+  }
+  const epochNanoseconds =
+    BigInt(wholeMilliseconds) * NANOSECONDS_PER_MILLISECOND + BigInt(fractionalNanoseconds);
+  return {
+    epochNanoseconds,
+    epochMilliseconds:
+      wholeMilliseconds + fractionalNanoseconds / Number(NANOSECONDS_PER_MILLISECOND),
+  };
+}
+function resolveNowTimestamp(value: ValidationOptions['now']): ParsedUtcTimestamp {
   if (value === undefined) {
-    return Date.now();
+    return timestampFromMilliseconds(Date.now());
   }
-
   if (typeof value === 'number') {
-    if (!Number.isSafeInteger(value)) {
-      throw new RangeError('now must be a finite safe integer');
-    }
-    return value;
+    return timestampFromMilliseconds(value);
   }
-
   if (value instanceof Date) {
     const milliseconds = value.getTime();
     if (!Number.isSafeInteger(milliseconds)) {
       throw new RangeError('now must be a valid Date');
     }
-    return milliseconds;
+    return timestampFromMilliseconds(milliseconds);
   }
-
-  const milliseconds = parseUtcTimestamp(value);
-  if (milliseconds === undefined) {
+  const timestamp = parseUtcTimestampExact(value);
+  if (timestamp === undefined) {
     throw new RangeError('now must be a valid RFC 3339 UTC timestamp');
   }
-  return milliseconds;
+  return timestamp;
 }
-
 function isUuidV4Value(value: unknown): value is string {
   return canonicalIsUuidV4(value);
 }
@@ -344,21 +435,27 @@ function isUuidV4Value(value: unknown): value is string {
 export const isUUIDv4 = isUuidV4Value;
 export const isUuidV4 = isUuidV4Value;
 
-function parseUtcTimestamp(value: unknown): number | undefined {
+function parseUtcTimestampExact(value: unknown): ParsedUtcTimestamp | undefined {
   if (typeof value !== 'string') {
     return undefined;
   }
-
   const match = RFC3339_UTC_PATTERN.exec(value);
   if (match === null) {
     return undefined;
   }
-
-  const milliseconds = Date.parse(value);
+  const fraction = match[7] ?? '';
+  // JavaScript numbers cannot retain arbitrary RFC 3339 precision.  The v1
+  // validator supports nanosecond precision and rejects anything finer rather
+  // than silently changing the ordering or deadline of a valid timestamp.
+  if (fraction.length > 9) {
+    return undefined;
+  }
+  const [, year, month, day, hour, minute, second] = match;
+  const normalizedInput = `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
+  const milliseconds = Date.parse(normalizedInput);
   if (!Number.isFinite(milliseconds)) {
     return undefined;
   }
-
   const date = new Date(milliseconds);
   let iso: string;
   try {
@@ -366,11 +463,21 @@ function parseUtcTimestamp(value: unknown): number | undefined {
   } catch {
     return undefined;
   }
-
-  const [, year, month, day, hour, minute, second] = match;
-  const normalizedInput = `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
   const normalizedOutput = iso.replace(/\.\d{3}Z$/u, 'Z');
-  return normalizedInput === normalizedOutput ? milliseconds : undefined;
+  if (normalizedInput !== normalizedOutput) {
+    return undefined;
+  }
+  const fractionNanoseconds = BigInt(fraction.padEnd(9, '0') || '0');
+  const epochNanoseconds = BigInt(milliseconds) * NANOSECONDS_PER_MILLISECOND + fractionNanoseconds;
+  return {
+    epochNanoseconds,
+    epochMilliseconds:
+      milliseconds + Number(fractionNanoseconds) / Number(NANOSECONDS_PER_MILLISECOND),
+  };
+}
+
+function parseUtcTimestamp(value: unknown): number | undefined {
+  return parseUtcTimestampExact(value)?.epochMilliseconds;
 }
 
 /** Return the epoch milliseconds for an RFC 3339 UTC timestamp, if valid. */
@@ -569,12 +676,13 @@ function validateJsonValueInternal(
   path: string,
   options: ValidationOptions,
 ): InternalIssue | undefined {
-  const measured = measureJsonBytes(value, Number.MAX_SAFE_INTEGER, options);
+  const limits = resolveLimits(options);
+  const measured = measureJsonBytes(value, limits.maxEnvelopeBytes, options);
   if (measured.kind === 'invalid') {
     return issue('malformed', measured.path, measured.reason);
   }
   if (measured.kind === 'too_large') {
-    return issue('oversized', path, 'JSON value exceeds the validation complexity bound');
+    return issue('oversized', path, 'JSON value exceeds the configured byte limit');
   }
   return undefined;
 }
@@ -582,6 +690,22 @@ function validateJsonValueInternal(
 /** Return whether a value is representable as protocol JSON. */
 export function isJsonValue(value: unknown, options: ValidationOptions = {}): value is JsonValue {
   return validateJsonValueInternal(value, '$', options) === undefined;
+}
+
+function validateContentSizeInternal(
+  value: unknown,
+  path: string,
+  options: ValidationOptions,
+): InternalIssue | undefined {
+  const limits = resolveLimits(options);
+  const measured = measureJsonBytes(value, limits.maxEnvelopeBytes, options);
+  if (measured.kind === 'too_large') {
+    return issue('oversized', path, 'content exceeds the configured byte limit');
+  }
+  if (measured.kind === 'invalid') {
+    return issue('invalid_content', measured.path, measured.reason);
+  }
+  return undefined;
 }
 
 function validateTypedContentInternal(
@@ -600,7 +724,7 @@ function validateTypedContentInternal(
     if (!hasOwn(value, 'text') || typeof value.text !== 'string') {
       return issue('invalid_content', `${path}.text`, 'text content requires a string text value');
     }
-    return undefined;
+    return validateContentSizeInternal(value, path, options);
   }
 
   if (value.type === 'json') {
@@ -609,7 +733,7 @@ function validateTypedContentInternal(
     }
     const jsonIssue = validateJsonValueInternal(value.value, `${path}.value`, options);
     if (jsonIssue === undefined) {
-      return undefined;
+      return validateContentSizeInternal(value, path, options);
     }
     return jsonIssue.code === 'oversized'
       ? issue('oversized', `${path}.value`, jsonIssue.reason, jsonIssue.keyword)
@@ -839,7 +963,12 @@ function consumeEvaluationBudget(budget: EvaluationBudget, cost = 1): boolean {
 }
 
 function budgetFailure(path: string): SchemaValidationResult {
-  return { valid: false, path, reason: 'schema evaluation budget exceeded' };
+  return {
+    valid: false,
+    path,
+    reason: 'schema evaluation budget exceeded',
+    resourceLimit: true,
+  };
 }
 
 function schemaRegex(context: SchemaContext, pattern: string): RegExp | undefined {
@@ -888,6 +1017,75 @@ function validateSchemaShape(
     return issue('malformed', path, 'cyclic schema objects are not permitted');
   }
   seen.add(value);
+  for (const key of Object.keys(value)) {
+    if (!SUPPORTED_SCHEMA_KEYWORDS.has(key) && !UNSUPPORTED_SCHEMA_KEYWORDS.has(key)) {
+      seen.delete(value);
+      return issue(
+        'incompatible',
+        `${path}.${key}`,
+        'schema keyword is not supported by the bounded validator',
+        key,
+      );
+    }
+  }
+  for (const key of SCHEMA_STRING_METADATA_KEYWORDS) {
+    if (hasOwn(value, key) && typeof value[key] !== 'string') {
+      seen.delete(value);
+      return issue('malformed', `${path}.${key}`, `${key} must be a string`, key);
+    }
+  }
+  for (const key of SCHEMA_BOOLEAN_METADATA_KEYWORDS) {
+    if (hasOwn(value, key) && typeof value[key] !== 'boolean') {
+      seen.delete(value);
+      return issue('malformed', `${path}.${key}`, `${key} must be boolean`, key);
+    }
+  }
+  if (hasOwn(value, 'examples') && !Array.isArray(value.examples)) {
+    seen.delete(value);
+    return issue('malformed', `${path}.examples`, 'examples must be an array', 'examples');
+  }
+  if (hasOwn(value, '$id')) {
+    if (typeof value.$id !== 'string') {
+      seen.delete(value);
+      return issue('malformed', `${path}.$id`, '$id must be a string', '$id');
+    }
+    seen.delete(value);
+    return issue('incompatible', `${path}.$id`, '$id is not supported', '$id');
+  }
+  if (hasOwn(value, 'contentSchema')) {
+    if (!isSchemaValue(value.contentSchema)) {
+      seen.delete(value);
+      return issue(
+        'malformed',
+        `${path}.contentSchema`,
+        'contentSchema must be a schema',
+        'contentSchema',
+      );
+    }
+    const contentSchemaIssue = validateSchemaShape(
+      value.contentSchema,
+      `${path}.contentSchema`,
+      seen,
+      references,
+    );
+    if (contentSchemaIssue !== undefined) {
+      seen.delete(value);
+      return contentSchemaIssue;
+    }
+    seen.delete(value);
+    return issue(
+      'incompatible',
+      `${path}.contentSchema`,
+      'contentSchema is not supported by the bounded validator',
+      'contentSchema',
+    );
+  }
+  for (const key of UNSUPPORTED_SCHEMA_KEYWORDS) {
+    if (hasOwn(value, key)) {
+      seen.delete(value);
+      return issue('incompatible', `${path}.${key}`, `${key} is not supported`, key);
+    }
+  }
 
   if (hasOwn(value, '$schema')) {
     if (typeof value.$schema !== 'string') {
@@ -1258,17 +1456,23 @@ function pointerDecode(value: string): string[] | undefined {
   if (!value.startsWith('#/')) {
     return undefined;
   }
-
-  let fragment: string;
-  try {
-    fragment = decodeURIComponent(value.slice(1));
-  } catch {
-    return undefined;
+  const encodedTokens = value.slice(2).split('/');
+  const tokens: string[] = [];
+  for (const encodedToken of encodedTokens) {
+    let token: string;
+    try {
+      token = decodeURIComponent(encodedToken);
+    } catch {
+      return undefined;
+    }
+    // RFC 6901 permits only ~0 and ~1 escapes; accepting other forms can
+    // make an invalid reference resolve to an unrelated schema property.
+    if (/~(?![01])/u.test(token)) {
+      return undefined;
+    }
+    tokens.push(token.replace(/~1/g, '/').replace(/~0/g, '~'));
   }
-  return fragment
-    .slice(1)
-    .split('/')
-    .map((token) => token.replace(/~1/g, '/').replace(/~0/g, '~'));
+  return tokens;
 }
 
 function resolveSchemaReference(index: SchemaIndex, reference: string): JsonSchema | undefined {
@@ -1301,6 +1505,7 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
   const anchors = new Map<string, JsonSchema>();
   const references: { readonly ref: string; readonly path: string }[] = [];
   const seen = new Set<object>();
+  let anchorIssue: InternalIssue | undefined;
 
   const collect = (value: JsonSchema, path: string): void => {
     refs.set(path, value);
@@ -1312,7 +1517,16 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
     }
     seen.add(value);
     if (typeof value.$anchor === 'string') {
-      anchors.set(value.$anchor, value);
+      if (anchors.has(value.$anchor) && anchorIssue === undefined) {
+        anchorIssue = issue(
+          'malformed',
+          `${path}.$anchor`,
+          'schema anchor must be unique within the bounded registry',
+          '$anchor',
+        );
+      } else {
+        anchors.set(value.$anchor, value);
+      }
     }
     if (typeof value.$dynamicAnchor === 'string') {
       anchors.set(value.$dynamicAnchor, value);
@@ -1363,7 +1577,7 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
   };
 
   collect(root, '$');
-  return { root, refs, anchors, references };
+  return { root, refs, anchors, references, ...(anchorIssue === undefined ? {} : { anchorIssue }) };
 }
 
 function validateSchemaReferences(index: SchemaIndex): InternalIssue | undefined {
@@ -1419,6 +1633,9 @@ export function validateJsonSchema(
   }
 
   const index = collectSchemaIndex(schema);
+  if (index.anchorIssue !== undefined) {
+    return internalIssueFailure(index.anchorIssue);
+  }
   const referenceIssue = validateSchemaReferences({ ...index, references });
   if (referenceIssue !== undefined) {
     return internalIssueFailure(referenceIssue);
@@ -1437,7 +1654,15 @@ function validateExpectedResponseInternal(
   if (!isPlainObject(value)) {
     return issue('malformed', path, 'expected response must be an object');
   }
-  if (!hasOwn(value, 'contentType') || value.contentType !== 'json') {
+  if (!hasOwn(value, 'contentType') || typeof value.contentType !== 'string') {
+    return issue(
+      'malformed',
+      `${path}.contentType`,
+      'expected response contentType must be a string',
+      'contentType',
+    );
+  }
+  if (value.contentType !== 'json') {
     return issue(
       'incompatible',
       `${path}.contentType`,
@@ -1892,8 +2117,8 @@ export function validateEnvelope(
     );
   }
 
-  const createdAt = parseUtcTimestamp(value.createdAt);
-  const expiresAt = parseUtcTimestamp(value.expiresAt);
+  const createdAt = parseUtcTimestampExact(value.createdAt);
+  const expiresAt = parseUtcTimestampExact(value.expiresAt);
   if (createdAt === undefined) {
     return validationFailure(
       'malformed',
@@ -1910,7 +2135,7 @@ export function validateEnvelope(
       'expiresAt must be an RFC 3339 UTC timestamp',
     );
   }
-  if (expiresAt <= createdAt) {
+  if (expiresAt.epochNanoseconds <= createdAt.epochNanoseconds) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -1923,7 +2148,10 @@ export function validateEnvelope(
     operation === 'peer.describe' || operation === 'task.status' || operation === 'task.cancel'
       ? limits.maxControlTtlMs
       : limits.maxRequestTtlMs;
-  if (expiresAt - createdAt > deadlineLimit) {
+  if (
+    expiresAt.epochNanoseconds - createdAt.epochNanoseconds >
+    BigInt(deadlineLimit) * NANOSECONDS_PER_MILLISECOND
+  ) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -1932,8 +2160,11 @@ export function validateEnvelope(
     );
   }
 
-  const now = resolveNow(options.now);
-  if (createdAt > now + MAX_CLOCK_SKEW_MS) {
+  const now = resolveNowTimestamp(options.now);
+  if (
+    createdAt.epochNanoseconds >
+    now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND
+  ) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -1941,7 +2172,7 @@ export function validateEnvelope(
       'createdAt is too far in the future',
     );
   }
-  if (expiresAt <= now) {
+  if (expiresAt.epochNanoseconds <= now.epochNanoseconds) {
     return validationFailure(
       'expired',
       'protocol operation has expired',
@@ -2203,18 +2434,20 @@ function validateTaskSnapshotInternal(
   }
   const state = value.state as TaskState;
   const timestampFields = ['createdAt', 'updatedAt', 'expiresAt'] as const;
-  const timestamps = new Map<string, number>();
+  const timestamps = new Map<string, ParsedUtcTimestamp>();
   for (const field of timestampFields) {
     if (!hasOwn(value, field)) {
       return issue('malformed', `${path}.${field}`, 'task snapshot timestamp is required', field);
     }
-    const timestamp = parseUtcTimestamp(value[field]);
+    const timestamp = parseUtcTimestampExact(value[field]);
     if (timestamp === undefined) {
       return issue('malformed', `${path}.${field}`, 'task snapshot timestamp is invalid', field);
     }
     timestamps.set(field, timestamp);
   }
-  if (timestamps.get('updatedAt')! < timestamps.get('createdAt')!) {
+  if (
+    timestamps.get('updatedAt')!.epochNanoseconds < timestamps.get('createdAt')!.epochNanoseconds
+  ) {
     return issue(
       'malformed',
       `${path}.updatedAt`,
@@ -2222,7 +2455,9 @@ function validateTaskSnapshotInternal(
       'updatedAt',
     );
   }
-  if (timestamps.get('expiresAt')! <= timestamps.get('createdAt')!) {
+  if (
+    timestamps.get('expiresAt')!.epochNanoseconds <= timestamps.get('createdAt')!.epochNanoseconds
+  ) {
     return issue(
       'malformed',
       `${path}.expiresAt`,
@@ -2234,8 +2469,11 @@ function validateTaskSnapshotInternal(
   const updatedAt = timestamps.get('updatedAt')!;
   const expiresAt = timestamps.get('expiresAt')!;
   const limits = resolveLimits(options);
-  const now = resolveNow(options.now);
-  if (expiresAt - createdAt > limits.maxRequestTtlMs) {
+  const now = resolveNowTimestamp(options.now);
+  if (
+    expiresAt.epochNanoseconds - createdAt.epochNanoseconds >
+    BigInt(limits.maxRequestTtlMs) * NANOSECONDS_PER_MILLISECOND
+  ) {
     return issue(
       'malformed',
       `${path}.expiresAt`,
@@ -2243,7 +2481,10 @@ function validateTaskSnapshotInternal(
       'expiresAt',
     );
   }
-  if (createdAt > now + MAX_CLOCK_SKEW_MS) {
+  if (
+    createdAt.epochNanoseconds >
+    now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND
+  ) {
     return issue(
       'malformed',
       `${path}.createdAt`,
@@ -2251,7 +2492,10 @@ function validateTaskSnapshotInternal(
       'createdAt',
     );
   }
-  if (updatedAt > now + MAX_CLOCK_SKEW_MS) {
+  if (
+    updatedAt.epochNanoseconds >
+    now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND
+  ) {
     return issue(
       'malformed',
       `${path}.updatedAt`,
@@ -2259,10 +2503,10 @@ function validateTaskSnapshotInternal(
       'updatedAt',
     );
   }
-  if (expiresAt <= now) {
+  if (expiresAt.epochNanoseconds <= now.epochNanoseconds) {
     return issue('expired', `${path}.expiresAt`, 'task snapshot deadline has passed', 'expiresAt');
   }
-  if (updatedAt > expiresAt && state !== 'expired') {
+  if (updatedAt.epochNanoseconds > expiresAt.epochNanoseconds && state !== 'expired') {
     return issue(
       'malformed',
       `${path}.updatedAt`,
@@ -2302,7 +2546,7 @@ function validateTaskSnapshotInternal(
     }
     if (
       hasOwn(value.cancellation, 'requestedAt') &&
-      parseUtcTimestamp(value.cancellation.requestedAt) === undefined
+      parseUtcTimestampExact(value.cancellation.requestedAt) === undefined
     ) {
       return issue(
         'malformed',
@@ -2312,11 +2556,14 @@ function validateTaskSnapshotInternal(
       );
     }
     const requestedAt = hasOwn(value.cancellation, 'requestedAt')
-      ? parseUtcTimestamp(value.cancellation.requestedAt)
+      ? parseUtcTimestampExact(value.cancellation.requestedAt)
       : undefined;
     if (
       requestedAt !== undefined &&
-      (requestedAt < createdAt || requestedAt > now + MAX_CLOCK_SKEW_MS || requestedAt > expiresAt)
+      (requestedAt.epochNanoseconds < createdAt.epochNanoseconds ||
+        requestedAt.epochNanoseconds >
+          now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND ||
+        requestedAt.epochNanoseconds > expiresAt.epochNanoseconds)
     ) {
       return issue(
         'malformed',
@@ -2693,7 +2940,12 @@ function matchesSchema(
     return budgetFailure(path);
   }
   if (depth > context.maxDepth) {
-    return { valid: false, path, reason: 'maximum schema evaluation depth exceeded' };
+    return {
+      valid: false,
+      path,
+      reason: 'maximum schema evaluation depth exceeded',
+      resourceLimit: true,
+    };
   }
   if (typeof schema === 'boolean') {
     return schema ? { valid: true } : { valid: false, path, reason: 'boolean schema is false' };
@@ -2703,7 +2955,12 @@ function matchesSchema(
   if (reference !== undefined) {
     const referenceDepth = activeRefs.get(reference) ?? 0;
     if (referenceDepth >= context.maxDepth) {
-      return { valid: false, path, reason: 'maximum schema reference depth exceeded' };
+      return {
+        valid: false,
+        path,
+        reason: 'maximum schema reference depth exceeded',
+        resourceLimit: true,
+      };
     }
     const target = resolveSchemaReference(context, reference);
     if (target === undefined) {
@@ -2883,6 +3140,9 @@ function matchesSchema(
           depth + 1,
           new Map(activeRefs),
         );
+        if (childResult.resourceLimit) {
+          return childResult;
+        }
         if (childResult.valid) {
           matching += 1;
         }
@@ -3091,6 +3351,9 @@ function matchesSchema(
         depth + 1,
         new Map(activeRefs),
       );
+      if (childResult.resourceLimit) {
+        return childResult;
+      }
       if (childResult.valid) {
         matched = true;
         break;
@@ -3114,6 +3377,9 @@ function matchesSchema(
         depth + 1,
         new Map(activeRefs),
       );
+      if (childResult.resourceLimit) {
+        return childResult;
+      }
       if (childResult.valid) {
         matches += 1;
       }
@@ -3134,6 +3400,9 @@ function matchesSchema(
       depth + 1,
       new Map(activeRefs),
     );
+    if (notResult.resourceLimit) {
+      return notResult;
+    }
     if (context.budget.exhausted) {
       return budgetFailure(path);
     }
@@ -3150,6 +3419,9 @@ function matchesSchema(
       depth + 1,
       new Map(activeRefs),
     );
+    if (conditionResult.resourceLimit) {
+      return conditionResult;
+    }
     if (context.budget.exhausted) {
       return budgetFailure(path);
     }
@@ -3217,6 +3489,14 @@ export function validateJsonValueAgainstSchema(
     0,
     new Map<string, number>(),
   );
+  if (match.resourceLimit) {
+    return validationFailure(
+      'oversized',
+      'JSON response content exceeds the schema evaluation resource limit',
+      match.path ?? '$',
+      match.reason ?? 'schema validation resource limit exceeded',
+    );
+  }
   if (!match.valid) {
     return validationFailure(
       'invalid_content',
@@ -3452,11 +3732,27 @@ export function validateReplyContent(
 ): ValidationResult<Content> {
   const contentResult = validateContent(content, options);
   if (!contentResult.ok) {
-    return contentResult;
+    if (contentResult.error.code === 'oversized') {
+      return contentResult;
+    }
+    return {
+      ok: false,
+      error: createProtocolError('invalid_reply', 'reply content is invalid', {
+        details: contentResult.error.details,
+      }),
+    };
   }
   const expectedResult = validateExpectedResponse(expectedResponse, options);
   if (!expectedResult.ok) {
-    return expectedResult as ValidationResult<Content>;
+    if (expectedResult.error.code === 'oversized') {
+      return expectedResult as ValidationResult<Content>;
+    }
+    return {
+      ok: false,
+      error: createProtocolError('invalid_reply', 'reply expected-response schema is invalid', {
+        details: expectedResult.error.details,
+      }),
+    };
   }
   if (contentResult.value.type !== 'json') {
     return validationFailure(
