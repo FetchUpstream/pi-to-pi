@@ -1,7 +1,12 @@
 import { stat } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 
-import { createTestWorkspace, testWorkspaceExists, withTestWorkspace } from './workspace.js';
+import {
+  createTestWorkspace,
+  removeTestWorkspace,
+  testWorkspaceExists,
+  withTestWorkspace,
+} from './workspace.js';
 
 describe('test workspace support', () => {
   it('creates unique runtime and room paths without changing process state', async () => {
@@ -64,5 +69,17 @@ describe('test workspace support', () => {
         error.errors[1] === cleanupFailure
       );
     });
+  });
+  it('keeps the workspace when an owner cleanup hook fails', async () => {
+    const workspace = await createTestWorkspace();
+    const terminationFailure = new Error('child termination failed');
+    workspace.registerBeforeCleanup(() => {
+      throw terminationFailure;
+    });
+
+    await expect(workspace.cleanup()).rejects.toBe(terminationFailure);
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(true);
+
+    await removeTestWorkspace(workspace.rootPath);
   });
 });

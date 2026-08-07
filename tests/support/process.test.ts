@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   createManagedProcess,
   createManagedProcessGroup,
   LIFECYCLE_FIXTURE_PATH,
   ManagedProcessClosedError,
+  ManagedProcessCommandTimeoutError,
   ManagedProcessTimeoutError,
 } from './process.js';
 import { testWorkspaceExists, withTestWorkspace } from './workspace.js';
@@ -45,6 +46,9 @@ describe('managed process support', () => {
         expect(result.stdout).toContain('stdout diagnostic');
         expect(result.stderr).toContain('stderr diagnostic');
         expect(managed.formatDiagnostics('clean fixture')).toContain('diagnostic fixture');
+        expect(managed.stdout.listenerCount('data')).toBe(0);
+        expect(managed.stderr.listenerCount('data')).toBe(0);
+        expect(managed.stdin.listenerCount('error')).toBe(0);
       } finally {
         await managed.cleanup();
       }
@@ -59,12 +63,20 @@ describe('managed process support', () => {
         await managed.sendCommand({ command: 'hang' });
         await managed.waitForEvent((event) => event.event === 'hanging');
 
-        await expect(
-          managed.waitForEvent((event) => event.event === 'never', {
-            description: 'a deliberately absent event',
-            timeoutMs: 100,
-          }),
-        ).rejects.toBeInstanceOf(ManagedProcessTimeoutError);
+        const timeoutResult = managed.waitForEvent((event) => event.event === 'never', {
+          description: 'a deliberately absent event',
+          timeoutMs: 100,
+        });
+        await expect(timeoutResult).rejects.toBeInstanceOf(ManagedProcessTimeoutError);
+        try {
+          await timeoutResult;
+        } catch (error) {
+          expect(error).toBeInstanceOf(ManagedProcessTimeoutError);
+          expect((error as ManagedProcessTimeoutError).diagnostics.output?.stdout).toContain(
+            'hanging',
+          );
+          expect((error as ManagedProcessTimeoutError).diagnostics.state).not.toBe('closed');
+        }
 
         const result = await managed.waitForClose();
         expect(result.code !== 0 || result.signal !== null).toBe(true);
@@ -125,5 +137,51 @@ describe('managed process support', () => {
         await managed.cleanup();
       }
     });
+  });
+  it('bounds command size before writing to fixture stdin', async () => {
+    await withTestWorkspace(async (workspace) => {
+      const managed = createManagedProcess({
+        maxCommandBytes: 32,
+        workspace,
+      });
+      try {
+        await managed.waitForReady();
+        await expect(
+          managed.sendCommand({ command: 'diagnostic', message: 'x'.repeat(100) }),
+        ).rejects.toThrow(/exceeds 32 UTF-8 bytes/);
+      } finally {
+        await managed.cleanup();
+      }
+    });
+  });
+
+  it('times out a command write and removes its pending listeners', async () => {
+    await withTestWorkspace(async (workspace) => {
+      const managed = createManagedProcess({
+        commandTimeoutMs: 25,
+        workspace,
+      });
+      const write = vi.spyOn(managed.stdin, 'write').mockImplementation(() => true);
+      try {
+        await managed.waitForReady();
+        await expect(managed.sendCommand({ command: 'hang' })).rejects.toBeInstanceOf(
+          ManagedProcessCommandTimeoutError,
+        );
+      } finally {
+        write.mockRestore();
+        await managed.cleanup();
+      }
+    });
+  });
+
+  it('rejects process additions after group teardown and cleans the late child', async () => {
+    const group = createManagedProcessGroup();
+    await group.teardown();
+    expect(() => group.spawn()).toThrow(/after group teardown started/);
+
+    const late = createManagedProcess();
+    expect(() => group.add(late)).toThrow(/after managed process group teardown started/);
+    await late.cleanup();
+    expect(late.state).toBe('closed');
   });
 });

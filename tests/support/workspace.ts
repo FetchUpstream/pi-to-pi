@@ -138,22 +138,12 @@ export async function createTestWorkspace(
       }
     }
     cleanupHooks.clear();
-    try {
-      await removeTestWorkspace(rootPath, cleanupOptions);
-    } catch (error) {
-      errors.push(error);
+    // Never remove the workspace while an owner reports that its child resources
+    // could not be released; the original hook diagnostics must remain observable.
+    if (errors.length > 0) {
+      throwCleanupErrors(rootPath, errors);
     }
-    if (errors.length === 1) {
-      throw errors[0];
-    }
-    if (errors.length > 1) {
-      throw new AggregateError(
-        errors,
-        `Unable to clean up test workspace "${rootPath}"; ${errors
-          .map((error) => (error instanceof Error ? error.message : String(error)))
-          .join('; ')}`,
-      );
-    }
+    await removeTestWorkspace(rootPath, cleanupOptions);
   };
   const cleanup = (): Promise<void> => {
     cleanupPromise ??= runCleanup();
@@ -256,6 +246,17 @@ export async function withTestWorkspace<T>(
   }
   return callbackResult;
 }
+function throwCleanupErrors(rootPath: string, errors: readonly unknown[]): never {
+  if (errors.length === 1) {
+    throw errors[0];
+  }
+  throw new AggregateError(
+    errors,
+    `Unable to clean up test workspace "${rootPath}"; ${errors
+      .map((error) => (error instanceof Error ? error.message : String(error)))
+      .join('; ')}`,
+  );
+}
 
 function validateNonNegativeInteger(value: number, label: string): number {
   if (!Number.isInteger(value) || value < 0) {
@@ -263,7 +264,6 @@ function validateNonNegativeInteger(value: number, label: string): number {
   }
   return value;
 }
-
 function isRetryableRemovalError(error: unknown): boolean {
   if (!isNodeError(error)) {
     return false;

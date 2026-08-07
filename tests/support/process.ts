@@ -6,6 +6,7 @@ import {
   BoundedOutput,
   type BoundedOutputOptions,
   type CapturedOutput,
+  DEFAULT_MAX_JSON_LINE_BYTES,
   formatProcessDiagnostics,
   type ProcessDiagnostics,
   type ProcessIdentity,
@@ -24,8 +25,9 @@ export const DEFAULT_LIFECYCLE_FIXTURE_PATH = LIFECYCLE_FIXTURE_PATH;
 
 export const DEFAULT_MANAGED_PROCESS_TIMEOUT_MS = 5_000;
 export const DEFAULT_MANAGED_PROCESS_KILL_TIMEOUT_MS = 2_000;
+export const DEFAULT_MANAGED_PROCESS_COMMAND_TIMEOUT_MS = 5_000;
+export const DEFAULT_MAX_MANAGED_PROCESS_COMMAND_BYTES = DEFAULT_MAX_JSON_LINE_BYTES;
 export const DEFAULT_MAX_MANAGED_PROCESS_EVENTS = 1_024;
-
 export type ManagedProcessEvent = Record<string, unknown>;
 
 export type ManagedProcessState = 'starting' | 'running' | 'exited' | 'closed' | 'failed';
@@ -79,6 +81,10 @@ export interface ManagedProcessOptions {
   readonly maxEvents?: number;
   /** Default wait deadline for readiness, event, exit, and close observations. */
   readonly timeoutMs?: number;
+  /** Deadline for one command write to complete. */
+  readonly commandTimeoutMs?: number;
+  /** Maximum UTF-8 bytes in one JSON command, excluding its newline. */
+  readonly maxCommandBytes?: number;
   /** Default deadline for abrupt termination. */
   readonly killTimeoutMs?: number;
   /** Registers teardown before workspace removal when supplied. */
@@ -115,7 +121,7 @@ export class ManagedProcessTimeoutError extends Error {
 }
 
 export class ManagedProcessClosedError extends Error {
-  readonly code = 'ERR_MANAGED_PROCESS_CLOSED';
+  readonly code: string = 'ERR_MANAGED_PROCESS_CLOSED';
   readonly identity: ProcessIdentity;
   readonly diagnostics: ProcessDiagnostics;
 
@@ -123,11 +129,14 @@ export class ManagedProcessClosedError extends Error {
     readonly identity: ProcessIdentity;
     readonly diagnostics: ProcessDiagnostics;
     readonly description: string;
+    readonly message?: string;
   }) {
     super(
-      `${options.description} before the expected lifecycle observation.\n${formatProcessDiagnostics(
-        options.diagnostics,
-      )}`,
+      options.message ??
+        `${options.description} before the expected lifecycle observation.\n${formatProcessDiagnostics(
+          options.diagnostics,
+        )}`,
+      { cause: options.diagnostics.spawnError },
     );
     this.name = 'ManagedProcessClosedError';
     this.identity = options.identity;
@@ -135,10 +144,8 @@ export class ManagedProcessClosedError extends Error {
   }
 }
 
-export class ManagedProcessSpawnError extends Error {
+export class ManagedProcessSpawnError extends ManagedProcessClosedError {
   readonly code = 'ERR_MANAGED_PROCESS_SPAWN';
-  readonly identity: ProcessIdentity;
-  readonly diagnostics: ProcessDiagnostics;
   readonly spawnError: unknown;
 
   constructor(options: {
@@ -146,16 +153,39 @@ export class ManagedProcessSpawnError extends Error {
     readonly diagnostics: ProcessDiagnostics;
     readonly spawnError: unknown;
   }) {
-    super(
-      `Unable to start ${formatIdentity(options.identity)}.\n${formatProcessDiagnostics(
+    super({
+      description: 'The fixture failed to spawn',
+      diagnostics: options.diagnostics,
+      identity: options.identity,
+      message: `Unable to start ${formatIdentity(options.identity)}.\n${formatProcessDiagnostics(
         options.diagnostics,
       )}`,
-      { cause: options.spawnError },
-    );
+    });
     this.name = 'ManagedProcessSpawnError';
+    this.spawnError = options.spawnError;
+  }
+}
+
+export class ManagedProcessCommandTimeoutError extends Error {
+  readonly code = 'ERR_MANAGED_PROCESS_COMMAND_TIMEOUT';
+  readonly timeoutMs: number;
+  readonly identity: ProcessIdentity;
+  readonly diagnostics: ProcessDiagnostics;
+
+  constructor(options: {
+    readonly identity: ProcessIdentity;
+    readonly diagnostics: ProcessDiagnostics;
+    readonly timeoutMs: number;
+  }) {
+    super(
+      `Timed out sending a command to ${formatIdentity(options.identity)} after ${options.timeoutMs}ms.\n${formatProcessDiagnostics(
+        options.diagnostics,
+      )}`,
+    );
+    this.name = 'ManagedProcessCommandTimeoutError';
+    this.timeoutMs = options.timeoutMs;
     this.identity = options.identity;
     this.diagnostics = options.diagnostics;
-    this.spawnError = options.spawnError;
   }
 }
 
@@ -163,6 +193,10 @@ interface EventWaiter<TEvent> {
   readonly predicate: (event: TEvent) => boolean;
   readonly resolve: (event: TEvent) => void;
   readonly reject: (error: unknown) => void;
+}
+
+interface PendingCommandWrite {
+  readonly cancel: (error: unknown) => void;
 }
 
 interface NormalizedWaitOptions {
@@ -184,11 +218,14 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
 
   private readonly label: string;
   private readonly defaultTimeoutMs: number;
+  private readonly defaultCommandTimeoutMs: number;
+  private readonly maxCommandBytes: number;
   private readonly defaultKillTimeoutMs: number;
   private readonly maxEvents: number;
   private readonly eventParser: JsonLinesParser<TEvent>;
   private readonly eventHistory: TEvent[] = [];
   private readonly eventWaiters = new Set<EventWaiter<TEvent>>();
+  private readonly pendingCommandWrites = new Set<PendingCommandWrite>();
   private readonly exitPromise: Promise<ManagedProcessExit>;
   private readonly closePromise: Promise<ManagedProcessExit>;
   private resolveExit!: (result: ManagedProcessExit) => void;
@@ -198,9 +235,38 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
   private processError: unknown;
   private parserError: JsonLinesParseError | undefined;
   private lifecycleState: ManagedProcessState = 'starting';
+  private teardownStarted = false;
+  private resourcesDetached = false;
   private workspaceUnregister: (() => void) | undefined;
   private killPromise: Promise<ManagedProcessExit> | undefined;
   private cleanupPromise: Promise<ManagedProcessExit> | undefined;
+  private readonly stdoutListener = (chunk: Buffer | string): void => {
+    this.handleStdout(chunk);
+  };
+  private readonly stderrListener = (chunk: Buffer | string): void => {
+    this.outputBuffer.appendStderr(chunk);
+  };
+  private readonly stdinErrorListener = (): void => {};
+  private readonly childErrorListener = (error: unknown): void => {
+    this.handleChildError(error);
+  };
+  private readonly childExitListener = (
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void => {
+    this.handleChildExit(code, signal);
+  };
+  private readonly childCloseListener = (
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void => {
+    this.handleChildClose(code, signal);
+  };
+  private readonly childSpawnListener = (): void => {
+    if (this.lifecycleState === 'starting') {
+      this.lifecycleState = 'running';
+    }
+  };
 
   constructor(options: ManagedProcessOptions = {}) {
     const fixturePath = options.fixturePath ?? LIFECYCLE_FIXTURE_PATH;
@@ -214,6 +280,14 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     this.defaultTimeoutMs = validateDuration(
       options.timeoutMs ?? DEFAULT_MANAGED_PROCESS_TIMEOUT_MS,
       'managed process timeout',
+    );
+    this.defaultCommandTimeoutMs = validateDuration(
+      options.commandTimeoutMs ?? options.timeoutMs ?? DEFAULT_MANAGED_PROCESS_COMMAND_TIMEOUT_MS,
+      'managed process command timeout',
+    );
+    this.maxCommandBytes = validatePositiveInteger(
+      options.maxCommandBytes ?? DEFAULT_MAX_MANAGED_PROCESS_COMMAND_BYTES,
+      'maximum managed process command bytes',
     );
     this.defaultKillTimeoutMs = validateDuration(
       options.killTimeoutMs ?? DEFAULT_MANAGED_PROCESS_KILL_TIMEOUT_MS,
@@ -247,9 +321,16 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
 
     this.attachListeners();
     if (options.workspace) {
-      this.workspaceUnregister = options.workspace.registerBeforeCleanup(async () => {
-        await this.cleanup();
-      });
+      try {
+        this.workspaceUnregister = options.workspace.registerBeforeCleanup(() =>
+          this.cleanup().then(() => undefined),
+        );
+      } catch (error) {
+        // Registration is the ownership hand-off. If it fails, terminate the child
+        // immediately rather than returning an unowned process to the caller.
+        void this.cleanup().catch(() => undefined);
+        throw error;
+      }
     }
   }
 
@@ -385,14 +466,16 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
         if (settled) {
           return;
         }
+        const timeoutDiagnostics = this.getDiagnostics();
+        const timeoutError = this.createTimeoutError(normalized, timeoutDiagnostics);
         settled = true;
         this.eventWaiters.delete(waiter);
         void this.terminateAfterTimeout().then(
-          () => reject(this.createTimeoutError(normalized)),
+          () => reject(timeoutError),
           (terminationError: unknown) => {
             reject(
               new AggregateError(
-                [this.createTimeoutError(normalized), terminationError],
+                [timeoutError, terminationError],
                 `Timed out ${normalized.description} and failed to terminate ${formatIdentity(
                   this.identity,
                 )}`,
@@ -426,9 +509,14 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     });
   }
 
-  /** Sends one JSON command line to the fixture stdin. */
+  /** Sends one bounded JSON command line to the fixture stdin. */
   async sendCommand(command: unknown): Promise<void> {
-    if (this.closeResult || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
+    if (
+      this.teardownStarted ||
+      this.closeResult ||
+      this.child.stdin.destroyed ||
+      this.child.stdin.writableEnded
+    ) {
       throw new ManagedProcessClosedError({
         description: 'Cannot send a command',
         diagnostics: this.getDiagnostics(),
@@ -442,8 +530,20 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       if (encoded === undefined) {
         throw new TypeError('command must be JSON serializable');
       }
+      const encodedBytes = Buffer.byteLength(encoded, 'utf8');
+      if (encodedBytes > this.maxCommandBytes) {
+        throw new RangeError(
+          `managed process command exceeds ${this.maxCommandBytes} UTF-8 bytes; received ${encodedBytes}`,
+        );
+      }
       line = `${encoded}\n`;
     } catch (error) {
+      if (
+        error instanceof RangeError &&
+        error.message.includes('managed process command exceeds')
+      ) {
+        throw error;
+      }
       throw new TypeError(
         `Unable to encode managed process command: ${error instanceof Error ? error.message : String(error)}`,
         { cause: error },
@@ -453,8 +553,12 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const cleanup = (): void => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         this.child.stdin.removeListener('error', onError);
         this.child.stdin.removeListener('close', onClose);
+        this.pendingCommandWrites.delete(pending);
       };
       const finish = (error?: unknown): void => {
         if (settled) {
@@ -468,6 +572,7 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
           reject(error);
         }
       };
+      const pending: PendingCommandWrite = { cancel: (error) => finish(error) };
       const onError = (error: unknown): void => {
         finish(
           new Error(
@@ -485,8 +590,28 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
           }),
         );
       };
+      this.pendingCommandWrites.add(pending);
       this.child.stdin.once('error', onError);
       this.child.stdin.once('close', onClose);
+      const timer = setTimeout(() => {
+        finish(
+          new ManagedProcessCommandTimeoutError({
+            diagnostics: this.getDiagnostics(),
+            identity: this.identity,
+            timeoutMs: this.defaultCommandTimeoutMs,
+          }),
+        );
+      }, this.defaultCommandTimeoutMs);
+      if (this.teardownStarted) {
+        finish(
+          new ManagedProcessClosedError({
+            description: 'Command delivery was interrupted during teardown',
+            diagnostics: this.getDiagnostics(),
+            identity: this.identity,
+          }),
+        );
+        return;
+      }
       try {
         this.child.stdin.write(line, 'utf8', () => finish());
       } catch (error) {
@@ -528,6 +653,8 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
    * Repeated and concurrent calls share one promise and never mask the original exit result.
    */
   killAbruptly(options: KillAbruptlyOptions = {}): Promise<ManagedProcessExit> {
+    this.teardownStarted = true;
+    this.cancelPendingCommandWrites();
     if (this.closeResult) {
       return Promise.resolve(this.closeResult);
     }
@@ -561,66 +688,110 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
   }
 
   private attachListeners(): void {
-    this.child.stdout.on('data', (chunk: Buffer | string) => {
-      this.outputBuffer.appendStdout(chunk);
-      try {
-        for (const event of this.eventParser.push(chunk)) {
-          this.recordEvent(event);
-        }
-      } catch (error) {
-        if (error instanceof JsonLinesParseError) {
-          this.parserError = error;
-        }
-        this.rejectEventWaiters(error);
-      }
-    });
-    this.child.stderr.on('data', (chunk: Buffer | string) => {
-      this.outputBuffer.appendStderr(chunk);
-    });
-    this.child.stdin.on('error', () => {});
-    this.child.once('error', (error: unknown) => {
-      this.processError ??= error;
-      if (this.lifecycleState === 'starting' || this.lifecycleState === 'running') {
-        this.lifecycleState = 'failed';
-      }
-      this.rejectEventWaiters(this.createSpawnError());
-    });
-    this.child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
-      this.lifecycleState = 'exited';
-      this.exitResult = this.makeExitResult(code, signal);
-      this.resolveExit(this.exitResult);
-    });
-    this.child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
-      try {
-        for (const event of this.eventParser.end()) {
-          this.recordEvent(event);
-        }
-      } catch (error) {
-        if (error instanceof JsonLinesParseError) {
-          this.parserError = error;
-        }
-      }
-      this.lifecycleState = 'closed';
-      if (!this.exitResult) {
-        this.exitResult = this.makeExitResult(code, signal);
-        this.resolveExit(this.exitResult);
-      }
-      this.closeResult = this.makeExitResult(code, signal);
-      this.resolveClose(this.closeResult);
-      if (this.parserError) {
-        this.rejectEventWaiters(this.parserError);
-      } else {
-        this.rejectEventWaiters(this.createClosedError('The fixture closed'));
-      }
-    });
+    this.child.stdout.on('data', this.stdoutListener);
+    this.child.stderr.on('data', this.stderrListener);
+    this.child.stdin.on('error', this.stdinErrorListener);
+    this.child.once('error', this.childErrorListener);
+    this.child.once('exit', this.childExitListener);
+    this.child.once('close', this.childCloseListener);
+    // `spawn()` emits before fixture output; keep it separate so startup failures
+    // retain their failed state until close observation.
+    this.child.once('spawn', this.childSpawnListener);
+  }
 
-    // `spawn()` emits `spawn` before any user-visible fixture output. Keep this listener
-    // separate from `exit` so startup failures retain a useful failed state.
-    this.child.once('spawn', () => {
-      if (this.lifecycleState === 'starting') {
-        this.lifecycleState = 'running';
+  private handleStdout(chunk: Buffer | string): void {
+    this.outputBuffer.appendStdout(chunk);
+    try {
+      for (const event of this.eventParser.push(chunk)) {
+        this.recordEvent(event);
       }
-    });
+    } catch (error) {
+      if (error instanceof JsonLinesParseError) {
+        this.parserError = error;
+      }
+      this.rejectEventWaiters(error);
+    }
+  }
+
+  private handleChildError(error: unknown): void {
+    this.processError ??= error;
+    if (this.lifecycleState === 'starting' || this.lifecycleState === 'running') {
+      this.lifecycleState = 'failed';
+    }
+    this.rejectEventWaiters(this.createSpawnError());
+  }
+
+  private handleChildExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.exitResult) {
+      return;
+    }
+    if (this.lifecycleState !== 'failed') {
+      this.lifecycleState = 'exited';
+    }
+    this.exitResult = this.makeExitResult(code, signal);
+    this.resolveExit(this.exitResult);
+  }
+
+  private handleChildClose(code: number | null, signal: NodeJS.Signals | null): void {
+    try {
+      for (const event of this.eventParser.end()) {
+        this.recordEvent(event);
+      }
+    } catch (error) {
+      if (error instanceof JsonLinesParseError) {
+        this.parserError = error;
+        if (this.lifecycleState !== 'failed' && this.lifecycleState !== 'exited') {
+          this.lifecycleState = 'failed';
+        }
+      }
+    }
+
+    if (this.lifecycleState !== 'failed') {
+      this.lifecycleState = 'closed';
+    }
+    const finalCode = this.exitResult?.code ?? code;
+    const finalSignal = this.exitResult?.signal ?? signal;
+    if (!this.exitResult) {
+      this.exitResult = this.makeExitResult(finalCode, finalSignal);
+      this.resolveExit(this.exitResult);
+    } else {
+      const finalResult = this.makeExitResult(finalCode, finalSignal);
+      const exitState = this.exitResult.state;
+      Object.assign(this.exitResult, finalResult, { state: exitState });
+    }
+    this.closeResult = this.makeExitResult(finalCode, finalSignal);
+    this.resolveClose(this.closeResult);
+    this.cancelPendingCommandWrites();
+    if (this.parserError) {
+      this.rejectEventWaiters(this.parserError);
+    } else {
+      this.rejectEventWaiters(this.createClosedError('The fixture closed'));
+    }
+    this.detachChildResources();
+  }
+
+  private detachChildResources(): void {
+    if (this.resourcesDetached) {
+      return;
+    }
+    this.resourcesDetached = true;
+    this.child.stdout.removeListener('data', this.stdoutListener);
+    this.child.stderr.removeListener('data', this.stderrListener);
+    this.child.stdin.removeListener('error', this.stdinErrorListener);
+    this.child.removeListener('error', this.childErrorListener);
+    this.child.removeListener('exit', this.childExitListener);
+    this.child.removeListener('close', this.childCloseListener);
+    this.child.removeListener('spawn', this.childSpawnListener);
+  }
+
+  private cancelPendingCommandWrites(): void {
+    if (this.pendingCommandWrites.size === 0) {
+      return;
+    }
+    const error = this.createClosedError('Command delivery was interrupted during teardown');
+    for (const pending of [...this.pendingCommandWrites]) {
+      pending.cancel(error);
+    }
   }
 
   private recordEvent(event: TEvent): void {
@@ -658,13 +829,15 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
         if (settled) {
           return;
         }
+        const timeoutDiagnostics = this.getDiagnostics();
+        const timeoutError = this.createTimeoutError(options, timeoutDiagnostics);
         settled = true;
         void this.terminateAfterTimeout().then(
-          () => reject(this.createTimeoutError(options)),
+          () => reject(timeoutError),
           (terminationError: unknown) => {
             reject(
               new AggregateError(
-                [this.createTimeoutError(options), terminationError],
+                [timeoutError, terminationError],
                 `Timed out ${options.description} and failed to terminate ${formatIdentity(
                   this.identity,
                 )}`,
@@ -708,14 +881,40 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       if (process.platform === 'win32') {
         try {
           await terminateWindowsProcessTree(pid, timeoutMs);
-        } catch {
-          // A process can exit between observation and taskkill. Fall back to the direct
-          // child handle so teardown still has one deterministic path to closure.
-          try {
-            this.child.kill();
-          } catch {
-            // The close observation below remains authoritative when the process raced exit.
+        } catch (error) {
+          if (isAlreadyClosedTerminationError(error)) {
+            try {
+              return await this.waitForCloseWithin(timeoutMs);
+            } catch (closeError) {
+              throw new AggregateError(
+                [error, closeError],
+                `The managed process ${formatIdentity(this.identity)} was already closed but close observation failed`,
+              );
+            }
           }
+          // A genuine taskkill failure remains observable. A direct child kill is only a
+          // best-effort fallback to prevent a live child leak and never replaces the error.
+          const fallbackError = this.tryDirectKill();
+          try {
+            await this.waitForCloseWithin(timeoutMs);
+          } catch (closeError) {
+            const errors = [error];
+            if (fallbackError !== undefined) {
+              errors.push(fallbackError);
+            }
+            errors.push(closeError);
+            throw new AggregateError(
+              errors,
+              `Unable to terminate ${formatIdentity(this.identity)} after taskkill failed`,
+            );
+          }
+          if (fallbackError !== undefined) {
+            throw new AggregateError(
+              [error, fallbackError],
+              `Unable to terminate ${formatIdentity(this.identity)} after taskkill failed`,
+            );
+          }
+          throw error;
         }
       } else {
         try {
@@ -729,6 +928,15 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     }
 
     return this.waitForCloseWithin(timeoutMs);
+  }
+
+  private tryDirectKill(): unknown {
+    try {
+      this.child.kill();
+      return undefined;
+    } catch (error) {
+      return error;
+    }
   }
 
   private waitForCloseWithin(timeoutMs: number): Promise<ManagedProcessExit> {
@@ -785,10 +993,13 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     };
   }
 
-  private createTimeoutError(options: NormalizedWaitOptions): ManagedProcessTimeoutError {
+  private createTimeoutError(
+    options: NormalizedWaitOptions,
+    diagnostics: ProcessDiagnostics = this.getDiagnostics(),
+  ): ManagedProcessTimeoutError {
     return new ManagedProcessTimeoutError({
       description: options.description,
-      diagnostics: this.getDiagnostics(),
+      diagnostics,
       timeoutMs: options.timeoutMs,
     });
   }
@@ -827,6 +1038,7 @@ export { ManagedProcess as ManagedChildProcess };
 export class ManagedProcessGroup {
   private readonly managedProcesses = new Set<ManagedProcess>();
   private teardownPromise: Promise<void> | undefined;
+  private teardownStarted = false;
   private workspaceUnregister: (() => void) | undefined;
 
   constructor(options: ManagedProcessGroupOptions = {}) {
@@ -840,19 +1052,34 @@ export class ManagedProcessGroup {
   }
 
   add<TEvent>(process: ManagedProcess<TEvent>): ManagedProcess<TEvent> {
+    if (this.teardownStarted) {
+      void process.cleanup().catch(() => undefined);
+      throw new Error(
+        `Cannot add ${formatIdentity(process.identity)} after managed process group teardown started`,
+      );
+    }
     this.managedProcesses.add(process as ManagedProcess);
     return process;
   }
 
   spawn<TEvent = ManagedProcessEvent>(options: ManagedProcessOptions = {}): ManagedProcess<TEvent> {
+    if (this.teardownStarted) {
+      throw new Error('Cannot spawn a managed process after group teardown started');
+    }
     const process = createManagedProcess<TEvent>({ ...options, workspace: undefined });
-    return this.add(process);
+    try {
+      return this.add(process);
+    } catch (error) {
+      void process.cleanup().catch(() => undefined);
+      throw error;
+    }
   }
 
   async teardown(): Promise<void> {
     if (this.teardownPromise) {
       return this.teardownPromise;
     }
+    this.teardownStarted = true;
     this.teardownPromise = this.runTeardown();
     return this.teardownPromise;
   }
@@ -920,6 +1147,12 @@ function validateNonNegativeInteger(value: number, label: string): number {
   }
   return value;
 }
+function validatePositiveInteger(value: number, label: string): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new RangeError(`${label} must be a positive integer; received ${value}`);
+  }
+  return value;
+}
 
 function formatIdentity(identity: ProcessIdentity): string {
   if (typeof identity === 'string') {
@@ -937,7 +1170,29 @@ function isAlreadyExitedError(error: unknown): boolean {
     return false;
   }
   const code = (error as NodeJS.ErrnoException).code;
-  return code === 'ESRCH' || code === 'EINVAL' || code === 'EPERM';
+  return code === 'ESRCH' || code === 'EINVAL';
+}
+
+class WindowsProcessTreeTerminationError extends Error {
+  readonly code = 'ERR_MANAGED_PROCESS_TREE_TERMINATION';
+  readonly alreadyClosed: boolean;
+  readonly pid: number;
+
+  constructor(options: {
+    readonly pid: number;
+    readonly message: string;
+    readonly alreadyClosed?: boolean;
+    readonly cause?: unknown;
+  }) {
+    super(options.message, { cause: options.cause });
+    this.name = 'WindowsProcessTreeTerminationError';
+    this.pid = options.pid;
+    this.alreadyClosed = options.alreadyClosed ?? false;
+  }
+}
+
+function isAlreadyClosedTerminationError(error: unknown): boolean {
+  return error instanceof WindowsProcessTreeTerminationError && error.alreadyClosed;
 }
 
 function terminateWindowsProcessTree(pid: number, timeoutMs: number): Promise<void> {
@@ -948,44 +1203,86 @@ function terminateWindowsProcessTree(pid: number, timeoutMs: number): Promise<vo
       windowsHide: true,
     });
     let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      try {
-        taskkill.kill();
-      } catch {
-        // The command may already have exited while the timer callback ran.
-      }
-      reject(new Error(`taskkill did not finish within ${timeoutMs}ms for pid ${pid}`));
-    }, timeoutMs);
+
     const cleanup = (): void => {
-      clearTimeout(timer);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
       taskkill.removeListener('error', onError);
       taskkill.removeListener('close', onClose);
     };
-    const onError = (error: unknown): void => {
-      if (settled) {
-        return;
+    const stopCommand = (): void => {
+      const onLateError = (): void => {
+        taskkill.removeListener('error', onLateError);
+        taskkill.removeListener('close', onLateClose);
+      };
+      const onLateClose = (): void => {
+        taskkill.removeListener('error', onLateError);
+        taskkill.removeListener('close', onLateClose);
+      };
+      taskkill.once('error', onLateError);
+      taskkill.once('close', onLateClose);
+      try {
+        const killed = taskkill.kill();
+        if (!killed || taskkill.exitCode !== null || taskkill.signalCode !== null) {
+          onLateClose();
+        }
+      } catch {
+        onLateClose();
       }
-      settled = true;
-      cleanup();
-      reject(error);
+      taskkill.unref();
     };
-    const onClose = (code: number | null): void => {
+    const settle = (error?: unknown, stop = false): void => {
       if (settled) {
         return;
       }
       settled = true;
       cleanup();
-      if (code === 0 || code === 128) {
+      if (stop) {
+        stopCommand();
+      }
+      if (error === undefined) {
         resolve();
       } else {
-        reject(new Error(`taskkill exited with code ${code ?? 'null'} for pid ${pid}`));
+        reject(error);
       }
+    };
+    const onError = (error: unknown): void => {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      settle(
+        new WindowsProcessTreeTerminationError({
+          alreadyClosed: code === 'ESRCH' || code === 'EINVAL',
+          cause: error,
+          message: `Unable to run taskkill for pid ${pid}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          pid,
+        }),
+      );
+    };
+    const onClose = (code: number | null): void => {
+      if (code === 0) {
+        settle();
+        return;
+      }
+      settle(
+        new WindowsProcessTreeTerminationError({
+          alreadyClosed: code === 128,
+          message: `taskkill exited with code ${code ?? 'null'} for pid ${pid}`,
+          pid,
+        }),
+      );
     };
     taskkill.once('error', onError);
     taskkill.once('close', onClose);
+    const timer = setTimeout(() => {
+      settle(
+        new WindowsProcessTreeTerminationError({
+          message: `taskkill did not finish within ${timeoutMs}ms for pid ${pid}`,
+          pid,
+        }),
+        true,
+      );
+    }, timeoutMs);
   });
 }
