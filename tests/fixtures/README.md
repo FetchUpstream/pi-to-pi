@@ -66,3 +66,10 @@ from the portable process harness above:
 - `persisted-session.ts` exports isolated temporary-directory helpers for reload, resume, fork,
   and clone scenarios.
 - `index.ts` is the import barrel for follow-on tests.
+
+## Inbound-delivery invariants
+
+The [inbound-delivery integration test](../integration/inbound-delivery.test.ts) and its correlation helper enforce these additional fixture invariants:
+
+- Accepted requests capture the runtime object, exact session object, and session ID; delivery checks all three before sending and again after the asynchronous send. A session replacement during a send rejects the stale delivery and leaves the request accepted but undelivered.
+- Busy delivery establishes an `agent_start` barrier, queues steering and follow-up messages, and waits on explicit custom-message start events for both queued requests. It does not use timing delays, `setImmediate`, busy polling, or pending-queue counts to establish processing order.

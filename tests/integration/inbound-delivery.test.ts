@@ -34,6 +34,30 @@ function waitForSessionEvent(
   });
 }
 
+function hasRequestId(details: unknown, requestId: string): boolean {
+  if (typeof details !== 'object' || details === null || !('requestId' in details)) {
+    return false;
+  }
+  return details.requestId === requestId;
+}
+
+function isCustomMessageStart(event: AgentSessionEvent, requestId: string): boolean {
+  return (
+    event.type === 'message_start' &&
+    event.message.role === 'custom' &&
+    event.message.customType === INBOUND_TYPE &&
+    hasRequestId(event.message.details, requestId)
+  );
+}
+
+function waitForCustomMessageStart(
+  fixture: PersistedFixture,
+  requestId: string,
+  timeoutMs = 2_000,
+): Promise<AgentSessionEvent> {
+  return waitForSessionEvent(fixture, (event) => isCustomMessageStart(event, requestId), timeoutMs);
+}
+
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -127,6 +151,8 @@ describe('correlated inbound delivery', () => {
       });
       await waitForSessionEvent(fixture, (event) => event.type === 'agent_start');
       expect(fixture.session.isStreaming).toBe(true);
+      const steerStarted = waitForCustomMessageStart(fixture, steerId);
+      const followUpStarted = waitForCustomMessageStart(fixture, followUpId);
 
       await expect(
         correlation.deliver(fixture, initialId, 'duplicate initial request body', {
@@ -147,7 +173,7 @@ describe('correlated inbound delivery', () => {
       ]);
 
       firstResponse.resolve(fauxAssistantMessage('initial response'));
-      await initialDelivery;
+      await Promise.all([initialDelivery, steerStarted, followUpStarted]);
 
       const customStarts = fixture.probe.byType('custom_message_start');
       expect(customStarts.map((observation) => observation.details)).toEqual([
@@ -247,6 +273,58 @@ describe('correlated inbound delivery', () => {
       expect(correlation.state(requestId)).toBe('accepted');
     } finally {
       await disposeFixture(fixture);
+    }
+  });
+
+  it('rejects an in-flight delivery after session replacement', async () => {
+    const fixture = await createPersistedPiSessionFixture();
+    const correlation = createRequestCorrelation();
+    const requestId = 'opaque/request-in-flight-replacement';
+    const originalSession = fixture.session;
+    const originalSendCustomMessage = originalSession.sendCustomMessage.bind(originalSession);
+    const sendStarted = deferred<void>();
+    const releaseSend = deferred<void>();
+    const barrierSession = new Proxy(originalSession, {
+      get(target, property, receiver) {
+        if (property !== 'sendCustomMessage') {
+          return Reflect.get(target, property, receiver);
+        }
+        return async (...args: Parameters<typeof originalSession.sendCustomMessage>) => {
+          await originalSendCustomMessage(...args);
+          sendStarted.resolve();
+          await releaseSend.promise;
+        };
+      },
+    });
+    let activeSession = barrierSession;
+    const deliveryFixture = {
+      runtime: fixture.runtime,
+      get session() {
+        return activeSession;
+      },
+      get sessionId() {
+        return activeSession.sessionId;
+      },
+    } as unknown as PersistedFixture;
+    correlation.accept(deliveryFixture, requestId);
+    let delivery: Promise<void> | undefined;
+
+    try {
+      delivery = correlation.deliver(deliveryFixture, requestId, 'in-flight request body');
+      await sendStarted.promise;
+      const originalSessionId = fixture.sessionId;
+      await fixture.newSession();
+      expect(fixture.sessionId).not.toBe(originalSessionId);
+      activeSession = fixture.session;
+      releaseSend.resolve();
+      await expect(delivery).rejects.toThrow(
+        'Request ID belongs to another Pi session/runtime: opaque/request-in-flight-replacement',
+      );
+      expect(correlation.events).toEqual([{ type: 'registered', requestId }]);
+      expect(correlation.state(requestId)).toBe('accepted');
+    } finally {
+      releaseSend.resolve();
+      await disposeFixture(fixture, delivery);
     }
   });
 

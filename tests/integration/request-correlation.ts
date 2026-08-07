@@ -11,6 +11,7 @@ type RequestRecord = {
   state: RequestState;
   delivered: boolean;
   readonly runtime: PiRuntimeFixture['runtime'];
+  readonly session: PiRuntimeFixture['session'];
   readonly sessionId: string;
 };
 
@@ -41,7 +42,11 @@ function assertRequestBelongsToFixture(
   request: RequestRecord,
   fixture: PiRuntimeFixture,
 ): void {
-  if (request.runtime !== fixture.runtime || request.sessionId !== fixture.sessionId) {
+  if (
+    request.runtime !== fixture.runtime ||
+    request.session !== fixture.session ||
+    request.sessionId !== fixture.sessionId
+  ) {
     throw new Error(`Request ID belongs to another Pi session/runtime: ${requestId}`);
   }
 }
@@ -62,6 +67,7 @@ export function createRequestCorrelation(): RequestCorrelation {
         state: 'accepted',
         delivered: false,
         runtime: fixture.runtime,
+        session: fixture.session,
         sessionId: fixture.sessionId,
       });
       events.push({ type: 'registered', requestId });
@@ -84,9 +90,10 @@ export function createRequestCorrelation(): RequestCorrelation {
         throw new Error(`Request ID is already being delivered: ${requestId}`);
       }
 
+      const session = fixture.session;
       deliveriesInFlight.add(requestId);
       try {
-        await fixture.session.sendCustomMessage(
+        await session.sendCustomMessage(
           {
             customType: 'p2p.inbound',
             content,
@@ -95,12 +102,16 @@ export function createRequestCorrelation(): RequestCorrelation {
           },
           options,
         );
+        assertRequestBelongsToFixture(requestId, request, fixture);
         request.delivered = true;
         events.push({
           type: 'delivered',
           requestId,
           stateAtDelivery: request.state,
         });
+      } catch (error) {
+        assertRequestBelongsToFixture(requestId, request, fixture);
+        throw error;
       } finally {
         deliveriesInFlight.delete(requestId);
       }

@@ -16,3 +16,7 @@ composed protocol, registry, transport, routing, or Pi behavior. Those tests are
 portable Node fixture suite, may have different environment requirements, and must not be treated as
 required by the baseline process harness. They should retain the same explicit workspace ownership
 and bounded cleanup/diagnostic expectations where the generic support applies.
+
+The in-process Pi lifecycle spike exercises the replacement-identity and busy-queue barriers in
+`inbound-delivery.test.ts`; see the fixture-level inbound-delivery invariants in
+[`../fixtures/README.md`](../fixtures/README.md).
