@@ -1525,6 +1525,8 @@ export class RuntimeRegistry {
   private readonly cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
   private pendingRenewal: Promise<void> = Promise.resolve();
+  /** Serialize name changes so each queued publication commits its own staged name. */
+  private pendingNetworkNameUpdate: Promise<void> = Promise.resolve();
   private shutdownRequested = false;
   private shutdownPromise: Promise<boolean> | undefined;
 
@@ -1638,14 +1640,21 @@ export class RuntimeRegistry {
       );
     }
 
-    const previousNetworkName = this.networkName;
-    this.currentNetworkName = canonical;
-    try {
-      await this.renew();
-    } catch (error) {
-      this.currentNetworkName = previousNetworkName;
-      throw error;
-    }
+    const operation = this.pendingNetworkNameUpdate.then(async () => {
+      const previousNetworkName = this.networkName;
+      this.currentNetworkName = canonical;
+      try {
+        await this.renew();
+      } catch (error) {
+        this.currentNetworkName = previousNetworkName;
+        throw error;
+      }
+    });
+    this.pendingNetworkNameUpdate = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   /** Alias for lifecycle callers that describe the operation as a rename. */
@@ -1676,6 +1685,7 @@ export class RuntimeRegistry {
       this.shutdownRequested = true;
       this.shutdownPromise = (async () => {
         await this.lease.stop();
+        await this.pendingNetworkNameUpdate;
         await this.pendingRenewal;
         // A rename stages the mutable name before its queued publication commits;
         // remove the exact record that was last committed to disk instead.

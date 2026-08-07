@@ -13,7 +13,11 @@ import type {
 
 import registerPiToPi, { createPiToPiLifecycle } from '../../src/index.js';
 import { type LeaseScheduler } from '../../src/discovery/lease.js';
-import { listRuntimeRecords } from '../../src/discovery/registry.js';
+import {
+  RuntimeRegistry,
+  listRuntimeRecords,
+  readRuntimeRecord,
+} from '../../src/discovery/registry.js';
 
 function createFlags(options: { name?: string; project?: string } = {}) {
   return vi.fn<ExtensionAPI['getFlag']>((name) => {
@@ -79,6 +83,21 @@ function createLifecycle(flags: { name?: string; project?: string } = {}) {
       },
     },
   );
+}
+
+class FailingFirstRenameRegistry extends RuntimeRegistry {
+  private renewalCount = 0;
+
+  public override renew(): Promise<void> {
+    this.renewalCount += 1;
+    const renewal = super.renew();
+    if (this.renewalCount !== 2) {
+      return renewal;
+    }
+    return renewal.then(() => {
+      throw new Error('first overlapping rename fails');
+    });
+  }
 }
 
 const replacementScenarios: ReadonlyArray<{
@@ -287,6 +306,49 @@ describe('Pi-to-Pi extension lifecycle integration', () => {
     expect(await listRuntimeRecords(before!.room.roomId, { rootDirectory: registryRoot })).toEqual(
       [],
     );
+  });
+
+  it('keeps overlapping native renames consistent after an earlier publication fails', async () => {
+    let registry: FailingFirstRenameRegistry | undefined;
+    const lifecycle = createPiToPiLifecycle(
+      { getFlag: createFlags() },
+      {
+        registryOptions: {
+          rootDirectory: registryRoot,
+          renewalIntervalMs: 60_000,
+        },
+        createRegistry: (options) => {
+          registry = new FailingFirstRenameRegistry(options);
+          return registry;
+        },
+      },
+    );
+    const context = createContext('native-session-id', 'Planner');
+
+    await lifecycle.onSessionStart(startEvent('startup'), context);
+    const firstRename = lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'First' },
+      context,
+    );
+    const secondRename = lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'Second' },
+      context,
+    );
+
+    await expect(firstRename).rejects.toThrow('first overlapping rename fails');
+    await expect(secondRename).resolves.toBeUndefined();
+
+    const runtime = lifecycle.current();
+    expect(runtime?.config.name).toBe('second');
+    expect(registry?.networkName).toBe(runtime?.publishedName.networkName);
+    expect(registry?.current()?.networkName).toBe(runtime?.publishedName.networkName);
+    expect(
+      await readRuntimeRecord(runtime!.room.roomId, runtime!.identity.runtimeId, {
+        rootDirectory: registryRoot,
+      }),
+    ).toEqual(registry?.current());
+
+    await lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
   });
 
   it('keeps an explicit P2P name and project when native session metadata changes', async () => {
