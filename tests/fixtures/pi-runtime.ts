@@ -23,7 +23,7 @@ import {
   type RegisterFauxProviderOptions,
 } from '@earendil-works/pi-ai';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import {
   bindPiProbe,
@@ -51,6 +51,26 @@ export interface CreatePiRuntimeFixtureOptions {
   model?: Model<string>;
   settingsManager?: SettingsManager;
   modelRuntime?: ModelRuntime;
+}
+
+function assertSessionManagerPaths(options: CreatePiRuntimeFixtureOptions): void {
+  const sessionManager = options.sessionManager;
+  if (!sessionManager) {
+    return;
+  }
+  if (resolve(options.cwd) !== resolve(sessionManager.getCwd())) {
+    throw new Error(
+      `Injected SessionManager cwd ${sessionManager.getCwd()} conflicts with fixture cwd ${options.cwd}`,
+    );
+  }
+  if (
+    options.sessionDir !== undefined &&
+    resolve(options.sessionDir) !== resolve(sessionManager.getSessionDir())
+  ) {
+    throw new Error(
+      `Injected SessionManager session directory ${sessionManager.getSessionDir()} conflicts with fixture session directory ${options.sessionDir}`,
+    );
+  }
 }
 
 export interface PiRuntimeFixture {
@@ -98,6 +118,48 @@ function modelFromRuntime(
   return model;
 }
 
+function registerFauxProvider(
+  modelRuntime: ModelRuntime,
+  faux: FauxProviderHandle,
+  providerId: string,
+  modelId: string,
+): boolean {
+  const fauxModel = faux.getModel(modelId);
+  if (!fauxModel) {
+    throw new Error(
+      `Faux fixture model ${providerId}/${modelId} was not provided by the faux handle`,
+    );
+  }
+
+  const registeredProvider = modelRuntime.getRegisteredNativeProvider(providerId);
+  const runtimeProvider = modelRuntime.getProvider(providerId);
+  const runtimeModel = modelRuntime.getModel(providerId, modelId);
+  if (registeredProvider && registeredProvider !== faux.provider) {
+    throw new Error(
+      `Faux fixture provider ${providerId} is already registered by another provider`,
+    );
+  }
+  if (!registeredProvider && runtimeProvider) {
+    throw new Error(
+      `Faux fixture provider ${providerId} conflicts with an existing model runtime provider`,
+    );
+  }
+  if (registeredProvider && runtimeModel !== fauxModel) {
+    throw new Error(`Faux fixture model ${providerId}/${modelId} belongs to another provider`);
+  }
+  if (!registeredProvider && runtimeModel) {
+    throw new Error(
+      `Faux fixture model ${providerId}/${modelId} conflicts with an existing model runtime model`,
+    );
+  }
+  if (registeredProvider) {
+    return false;
+  }
+
+  modelRuntime.registerNativeProvider(faux.provider);
+  return true;
+}
+
 function defaultFauxOptions(
   options: CreatePiRuntimeFixtureOptions,
   providerId: string,
@@ -133,6 +195,7 @@ function defaultSettings(): SettingsManager {
 export async function createPiRuntimeFixture(
   options: CreatePiRuntimeFixtureOptions,
 ): Promise<PiRuntimeFixture> {
+  assertSessionManagerPaths(options);
   const probe = options.probe ?? createPiProbe();
   const faux =
     options.faux ??
@@ -145,10 +208,19 @@ export async function createPiRuntimeFixture(
     );
   const providerId = options.providerId ?? faux.provider.id;
   const modelId = options.modelId ?? faux.getModel().id;
+  if (providerId !== faux.provider.id) {
+    throw new Error(
+      `Faux fixture providerId ${providerId} does not match faux provider ${faux.provider.id}`,
+    );
+  }
+  if (!faux.getModel(modelId)) {
+    throw new Error(
+      `Faux fixture model ${providerId}/${modelId} was not provided by the faux handle`,
+    );
+  }
   if (options.responses) {
     faux.setResponses(options.responses);
   }
-
   const settingsManager = options.settingsManager ?? defaultSettings();
   const modelRuntime =
     options.modelRuntime ??
@@ -158,9 +230,16 @@ export async function createPiRuntimeFixture(
       allowModelNetwork: false,
       refreshOnCreate: false,
     }));
-  if (!modelRuntime.getModel(providerId, modelId)) {
-    modelRuntime.registerNativeProvider(faux.provider);
-  }
+  let registeredFauxProvider = registerFauxProvider(modelRuntime, faux, providerId, modelId);
+  const unregisterInjectedFauxProvider = (): void => {
+    if (!registeredFauxProvider || !options.modelRuntime) {
+      return;
+    }
+    if (modelRuntime.getRegisteredNativeProvider(providerId) === faux.provider) {
+      modelRuntime.unregisterProvider(providerId);
+    }
+    registeredFauxProvider = false;
+  };
 
   const sessionManager = options.sessionManager ?? PiSessionManager.inMemory(options.cwd);
   const extension = createInlineProbeExtension(probe);
@@ -198,12 +277,7 @@ export async function createPiRuntimeFixture(
     };
   };
 
-  const runtime = await createAgentSessionRuntime(createRuntime, {
-    cwd: options.cwd,
-    agentDir: options.agentDir,
-    sessionManager,
-  });
-
+  let runtime!: AgentSessionRuntime;
   let unsubscribe: (() => void) | undefined;
   let disposed = false;
   const bindCurrentSession = async (): Promise<void> => {
@@ -214,10 +288,28 @@ export async function createPiRuntimeFixture(
     });
   };
 
-  runtime.setRebindSession(async () => {
+  try {
+    runtime = await createAgentSessionRuntime(createRuntime, {
+      cwd: options.cwd,
+      agentDir: options.agentDir,
+      sessionManager,
+    });
+
+    runtime.setRebindSession(async () => {
+      await bindCurrentSession();
+    });
     await bindCurrentSession();
-  });
-  await bindCurrentSession();
+  } catch (error) {
+    unsubscribe?.();
+    unsubscribe = undefined;
+    try {
+      await runtime?.dispose();
+    } catch {
+      // Preserve the original construction error; disposal is retried by the caller when available.
+    }
+    unregisterInjectedFauxProvider();
+    throw error;
+  }
 
   const fixture: PiRuntimeFixture = {
     runtime,
@@ -269,10 +361,18 @@ export async function createPiRuntimeFixture(
       if (disposed) {
         return;
       }
-      disposed = true;
-      await runtime.dispose();
-      unsubscribe?.();
-      unsubscribe = undefined;
+      let runtimeDisposed = false;
+      try {
+        await runtime.dispose();
+        runtimeDisposed = true;
+      } finally {
+        unsubscribe?.();
+        unsubscribe = undefined;
+        if (runtimeDisposed) {
+          unregisterInjectedFauxProvider();
+        }
+      }
+      disposed = runtimeDisposed;
     },
   };
 

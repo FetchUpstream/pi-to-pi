@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { fauxAssistantMessage } from '@earendil-works/pi-ai';
-import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai';
+import { ModelRuntime, SessionManager } from '@earendil-works/pi-coding-agent';
 
 import {
   createPersistedPiSessionFixture,
@@ -152,16 +152,131 @@ describe('persisted replacement helpers', () => {
       expect(fixture.probe.latest('session_start')?.reason).toBe('new');
       expect(fixture.probe.latest('session_start')?.previousSessionFile).toBe(originalFile);
 
-      await fixture.resume(originalFile!);
+      await fixture.resumeSession(originalFile!);
       expect(fixture.sessionId).toBe(originalId);
       expect(fixture.probe.latest('session_start')?.reason).toBe('resume');
 
-      await fixture.fork(forkEntry!.id, { position: 'at' });
+      await fixture.forkSession(forkEntry!.id, { position: 'at' });
       expect(fixture.sessionId).not.toBe(originalId);
       expect(fixture.probe.latest('session_start')?.reason).toBe('fork');
       expect(fixture.probe.latest('session_start')?.previousSessionFile).toBe(originalFile);
     } finally {
       await fixture.dispose();
+    }
+  });
+});
+
+describe('fixture ownership and cleanup', () => {
+  it('rejects an injected runtime that owns an unrelated faux provider', async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), 'pi-p2p-runtime-conflict-'));
+    const agentDir = join(rootDir, 'agent');
+    await mkdir(agentDir, { recursive: true });
+    const providerId = 'pi-p2p-review-conflict-provider';
+    const modelId = 'pi-p2p-review-conflict-model';
+    const modelRuntime = await ModelRuntime.create({
+      authPath: join(agentDir, 'auth.json'),
+      modelsPath: null,
+      allowModelNetwork: false,
+      refreshOnCreate: false,
+    });
+    const unrelated = fauxProvider({
+      provider: providerId,
+      models: [{ id: modelId }],
+    });
+    modelRuntime.registerNativeProvider(unrelated.provider);
+
+    try {
+      await expect(
+        createPiRuntimeFixture({
+          cwd: join(rootDir, 'workspace'),
+          agentDir,
+          providerId,
+          modelId,
+          modelRuntime,
+        }),
+      ).rejects.toThrow(/another provider|existing model runtime provider/u);
+      expect(modelRuntime.getRegisteredNativeProvider(providerId)).toBe(unrelated.provider);
+    } finally {
+      modelRuntime.unregisterProvider(providerId);
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a caller-owned clone root during cleanup', async () => {
+    const fixture = await temporaryRuntime();
+    fixture.faux.setResponses([defaultFauxResponse('clone source')]);
+    await fixture.session.sendCustomMessage(
+      {
+        customType: 'p2p.clone-source',
+        content: 'clone source',
+        display: false,
+      },
+      { triggerTurn: true },
+    );
+    const callerRoot = await mkdtemp(join(tmpdir(), 'pi-p2p-caller-root-'));
+    let clone: Awaited<ReturnType<typeof fixture.cloneSession>> | undefined;
+    try {
+      clone = await fixture.cloneSession({ rootDir: callerRoot });
+      await clone.cleanup();
+      expect(existsSync(callerRoot)).toBe(true);
+    } finally {
+      await clone?.cleanup();
+      await fixture.dispose();
+      await rm(callerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('removes owned roots before retrying a failed runtime dispose', async () => {
+    const fixture = await temporaryRuntime();
+    const rootDir = fixture.rootDir;
+    const originalDispose = fixture.runtime.dispose.bind(fixture.runtime);
+    let attempts = 0;
+    fixture.runtime.dispose = async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('simulated runtime dispose failure');
+      }
+      await originalDispose();
+    };
+
+    try {
+      await expect(fixture.dispose()).rejects.toThrow('simulated runtime dispose failure');
+      expect(existsSync(rootDir)).toBe(false);
+      await fixture.dispose();
+      expect(attempts).toBe(2);
+    } finally {
+      await fixture.dispose().catch(() => undefined);
+    }
+  });
+
+  it('derives injected session paths and rejects conflicting overrides', async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), 'pi-p2p-session-paths-'));
+    const managerCwd = join(rootDir, 'manager-workspace');
+    const managerSessionDir = join(rootDir, 'manager-sessions');
+    const sessionManager = SessionManager.create(managerCwd, managerSessionDir);
+    const fixtureRoot = join(rootDir, 'fixture-root');
+    let fixture: Awaited<ReturnType<typeof createPersistedPiSessionFixture>> | undefined;
+
+    try {
+      fixture = await createPersistedPiSessionFixture({
+        rootDir: fixtureRoot,
+        sessionManager,
+      });
+      expect(fixture.cwd).toBe(sessionManager.getCwd());
+      expect(fixture.sessionDir).toBe(sessionManager.getSessionDir());
+
+      const conflictingRoot = join(rootDir, 'conflicting-root');
+      await expect(
+        createPersistedPiSessionFixture({
+          rootDir: conflictingRoot,
+          cwd: join(rootDir, 'other-workspace'),
+          sessionManager,
+        }),
+      ).rejects.toThrow(/conflicts with fixture cwd/u);
+      expect(existsSync(conflictingRoot)).toBe(false);
+    } finally {
+      await fixture?.dispose();
+      await rm(rootDir, { recursive: true, force: true });
     }
   });
 });
