@@ -4,9 +4,10 @@ import {
   createManagedProcess,
   LIFECYCLE_FIXTURE_PATH,
   ManagedProcessTimeoutError,
-} from '../support/process.js';
-import { waitForPredicate } from '../support/wait.js';
-import { testWorkspaceExists, withTestWorkspace } from '../support/workspace.js';
+  testWorkspaceExists,
+  waitForPredicate,
+  withTestWorkspace,
+} from '../support/index.js';
 
 type LifecycleEvent = {
   readonly event?: string;
