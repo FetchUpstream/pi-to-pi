@@ -134,6 +134,39 @@ export function remainingMs(deadline: Deadline, now = Date.now()): number {
   return Math.min(MAX_TIMER_DELAY_MS, Math.ceil(remaining));
 }
 
+/** Schedule an absolute deadline without exceeding Node's maximum timer delay. */
+function scheduleDeadlineTimer(deadline: PhaseDeadline, onTimeout: () => void): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+
+  const schedule = (): void => {
+    if (cancelled) {
+      return;
+    }
+
+    const delay = remainingMs(deadline);
+    if (delay === 0) {
+      onTimeout();
+      return;
+    }
+
+    timer = setTimeout(() => {
+      timer = undefined;
+      schedule();
+    }, delay);
+  };
+
+  schedule();
+
+  return () => {
+    cancelled = true;
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+}
+
 export function deadlinePhase(deadline: Deadline): string {
   return resolveDeadline(deadline).phase;
 }
@@ -315,9 +348,10 @@ export function withDeadline<T>(
       return;
     }
 
-    const timeoutHandle = setTimeout(rejectForTimeout, timeoutMs);
-    cancelTimer = (): void => clearTimeout(timeoutHandle);
-
+    cancelTimer = scheduleDeadlineTimer(resolvedDeadline, rejectForTimeout);
+    if (settled) {
+      return;
+    }
     let operationResult: Promise<T>;
     try {
       const result =
@@ -360,20 +394,6 @@ function childExitState(child: ChildProcess): ChildExit | undefined {
   return undefined;
 }
 
-function childStdioClosed(child: ChildProcess): boolean {
-  return [child.stdin, child.stdout, child.stderr].every((stream) => {
-    if (stream === null) {
-      return true;
-    }
-    const state = stream as {
-      readonly destroyed?: boolean;
-      readonly readableEnded?: boolean;
-      readonly writableEnded?: boolean;
-    };
-    return state.destroyed === true || state.readableEnded === true || state.writableEnded === true;
-  });
-}
-
 const childCloseStates = new WeakMap<ChildProcess, ChildExit>();
 
 /** Wait for child close using one absolute, bounded deadline. */
@@ -385,10 +405,6 @@ export function waitForChildExit(
   const closed = childCloseStates.get(child);
   if (closed !== undefined) {
     return Promise.resolve(closed);
-  }
-  const exited = childExitState(child);
-  if (exited !== undefined && childStdioClosed(child)) {
-    return Promise.resolve(exited);
   }
 
   // `exit` fires before `close`; always wait for close so piped stdio is drained.
@@ -429,7 +445,14 @@ export interface ChildCleanupOptions {
 }
 
 function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (childExitState(child) !== undefined) {
+  const cachedClose = childCloseStates.get(child);
+  const currentExit = childExitState(child);
+  const closeMatchesExit =
+    cachedClose !== undefined &&
+    currentExit !== undefined &&
+    cachedClose.code === currentExit.code &&
+    cachedClose.signal === currentExit.signal;
+  if (closeMatchesExit || currentExit?.signal === signal) {
     return;
   }
   try {

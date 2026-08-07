@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   AbortError,
+  MAX_TIMER_DELAY_MS,
   PhaseDeadlineExceededError,
   captureChildDiagnostics,
   cleanupChildProcess,
@@ -14,6 +15,7 @@ import {
   raceWithAbort,
   remainingMs,
   waitForChildExit,
+  withDeadline,
   withPhaseDeadline,
 } from './test-helpers.js';
 
@@ -35,6 +37,14 @@ class HangingChild extends EventEmitter {
     }
     return true;
   }
+}
+
+class NullStdioExitedChild extends EventEmitter {
+  exitCode: number | null = 3;
+  signalCode: NodeJS.Signals | null = null;
+  stdin = null;
+  stdout = null;
+  stderr = null;
 }
 
 describe('local IPC spike test helpers', () => {
@@ -65,6 +75,31 @@ describe('local IPC spike test helpers', () => {
     expect(operationSignal?.reason).toBeInstanceOf(PhaseDeadlineExceededError);
   });
 
+  it('chains timer delays for absolute deadlines beyond Node timer limits', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const deadline = MAX_TIMER_DELAY_MS + 100;
+    const pending = withDeadline(new Promise<never>(() => undefined), deadline);
+    let settled = false;
+    pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(MAX_TIMER_DELAY_MS);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).rejects.toMatchObject({
+      name: 'PhaseDeadlineExceededError',
+      deadline,
+    });
+  });
   it('rejects promptly when the caller aborts an operation', async () => {
     const controller = new AbortController();
     const pending = withPhaseDeadline('connect', 1_000, () => new Promise<never>(() => undefined), {
@@ -117,6 +152,24 @@ describe('local IPC spike test helpers', () => {
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   }, 5_000);
 
+  it('waits for close with null stdio after exit metadata is available', async () => {
+    const child = new NullStdioExitedChild();
+    const pending = waitForChildExit(
+      child as unknown as ChildProcess,
+      createPhaseDeadline('child-exit', 100),
+    );
+    let settled = false;
+    pending.then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    child.emit('close', 3, null);
+    await expect(pending).resolves.toEqual({ code: 3, signal: null });
+  });
+
   it('waits for close after exit before cleanup returns', async () => {
     const child = new HangingChild();
     child.exitCode = 3;
@@ -134,6 +187,25 @@ describe('local IPC spike test helpers', () => {
 
     child.emit('close', 3, null);
     await expect(pending).resolves.toEqual({ code: 3, signal: null });
+    expect(child.signals).toEqual(['SIGTERM']);
+  });
+
+  it('does not signal a child after a matching close is observed', async () => {
+    const child = new HangingChild();
+    child.exitCode = 3;
+    const observed = waitForChildExit(
+      child as unknown as ChildProcess,
+      createPhaseDeadline('child-exit', 100),
+    );
+
+    child.emit('close', 3, null);
+    await expect(observed).resolves.toEqual({ code: 3, signal: null });
+    await expect(
+      cleanupChildProcess(child as unknown as ChildProcess, {
+        timeoutMs: 100,
+        forceWaitMs: 10,
+      }),
+    ).resolves.toEqual({ code: 3, signal: null });
     expect(child.signals).toEqual([]);
   });
 
