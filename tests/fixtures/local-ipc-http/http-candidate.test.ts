@@ -1,11 +1,21 @@
 import { existsSync } from 'node:fs';
 import { createConnection } from 'node:net';
+import type { Socket } from 'node:net';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { AbortError, PhaseDeadlineExceededError } from '../local-ipc-spike/test-helpers.js';
+import {
+  AbortError,
+  PhaseDeadlineExceededError,
+  onAbort,
+  withPhaseDeadline,
+} from '../local-ipc-spike/test-helpers.js';
 import {
   bindHttpIpc,
+  DEFAULT_HTTP_CONNECT_TIMEOUT_MS,
+  DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+  DEFAULT_HTTP_READ_TIMEOUT_MS,
+  DEFAULT_HTTP_WRITE_TIMEOUT_MS,
   createHttpIpcEndpoint,
   getHttpIpcEndpointKind,
   getHttpIpcPlatformSupport,
@@ -38,30 +48,231 @@ async function startServer(
   return { endpoint, server };
 }
 
-function sendRawHttp(endpoint: string, chunks: readonly string[]): Promise<Buffer> {
-  return new Promise<Buffer>((resolve, reject) => {
-    const socket = createConnection(endpoint);
-    const responseChunks: Buffer[] = [];
-    let index = 0;
+interface RawHttpRequestOptions {
+  readonly connectTimeoutMs?: number;
+  readonly writeTimeoutMs?: number;
+  readonly readTimeoutMs?: number;
+  readonly maxResponseBytes?: number;
+  readonly signal?: AbortSignal;
+}
 
-    socket.once('connect', () => {
-      const writeNext = (): void => {
-        const chunk = chunks[index];
-        index += 1;
-        if (chunk === undefined) {
-          socket.end();
-          return;
-        }
-        socket.write(chunk, () => {
-          setTimeout(writeNext, 2);
-        });
-      };
-      writeNext();
-    });
-    socket.on('data', (chunk: Buffer) => responseChunks.push(chunk));
-    socket.once('error', reject);
-    socket.once('end', () => resolve(Buffer.concat(responseChunks)));
+function normalizeRawResponseLimit(value: number | undefined): number {
+  const limit = value ?? DEFAULT_HTTP_MAX_RESPONSE_BYTES;
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw new RangeError('raw HTTP maxResponseBytes must be a non-negative safe integer');
+  }
+  return limit;
+}
+
+function waitForSocketConnect(socket: Socket, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let removeAbortListener = (): void => undefined;
+
+    const onConnect = (): void => settle(resolve);
+    const onError = (error: Error): void => settle(() => reject(error));
+    const cleanup = (): void => {
+      socket.removeListener('connect', onConnect);
+      socket.removeListener('error', onError);
+      removeAbortListener();
+    };
+    const settle = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    socket.once('connect', onConnect);
+    socket.once('error', onError);
+    removeAbortListener = onAbort(signal, (error) => settle(() => reject(error)));
   });
+}
+
+function writeSocketChunk(socket: Socket, chunk: string, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let removeAbortListener = (): void => undefined;
+
+    const onError = (error: Error): void => settle(() => reject(error));
+    const onWrite = (error?: Error | null): void => {
+      if (error === undefined || error === null) {
+        settle(resolve);
+      } else {
+        settle(() => reject(error));
+      }
+    };
+    const cleanup = (): void => {
+      socket.removeListener('error', onError);
+      removeAbortListener();
+    };
+    const settle = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    socket.once('error', onError);
+    removeAbortListener = onAbort(signal, (error) => settle(() => reject(error)));
+    if (settled) {
+      return;
+    }
+
+    try {
+      socket.write(chunk, onWrite);
+    } catch (error: unknown) {
+      settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+    }
+  });
+}
+
+function endSocket(socket: Socket, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let removeAbortListener = (): void => undefined;
+
+    const onFinish = (): void => settle(resolve);
+    const onError = (error: Error): void => settle(() => reject(error));
+    const cleanup = (): void => {
+      socket.removeListener('finish', onFinish);
+      socket.removeListener('error', onError);
+      removeAbortListener();
+    };
+    const settle = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    socket.once('finish', onFinish);
+    socket.once('error', onError);
+    removeAbortListener = onAbort(signal, (error) => settle(() => reject(error)));
+    if (settled) {
+      return;
+    }
+
+    try {
+      socket.end();
+    } catch (error: unknown) {
+      settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+    }
+  });
+}
+
+async function writeRawHttp(
+  socket: Socket,
+  chunks: readonly string[],
+  signal: AbortSignal,
+): Promise<void> {
+  for (const chunk of chunks) {
+    await writeSocketChunk(socket, chunk, signal);
+  }
+  await endSocket(socket, signal);
+}
+
+function readRawHttp(
+  socket: Socket,
+  maxResponseBytes: number,
+  signal: AbortSignal,
+): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const responseChunks: Buffer[] = [];
+    let receivedBytes = 0;
+    let ended = false;
+    let settled = false;
+    let removeAbortListener = (): void => undefined;
+
+    const onData = (chunk: Buffer | string): void => {
+      if (settled) {
+        return;
+      }
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      receivedBytes += bytes.byteLength;
+      if (receivedBytes > maxResponseBytes) {
+        const error = new Error(
+          `raw HTTP response reached ${receivedBytes} bytes; maximum is ${maxResponseBytes} bytes`,
+        );
+        settle(() => reject(error));
+        socket.destroy(error);
+        return;
+      }
+      responseChunks.push(bytes);
+    };
+    const onEnd = (): void => {
+      ended = true;
+      settle(() => resolve(Buffer.concat(responseChunks, receivedBytes)));
+    };
+    const onClose = (): void => {
+      if (!ended) {
+        settle(() => reject(new Error('raw HTTP socket closed before the response ended')));
+      }
+    };
+    const onError = (error: Error): void => settle(() => reject(error));
+    const cleanup = (): void => {
+      socket.removeListener('data', onData);
+      socket.removeListener('end', onEnd);
+      socket.removeListener('close', onClose);
+      socket.removeListener('error', onError);
+      removeAbortListener();
+    };
+    const settle = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    socket.on('data', onData);
+    socket.once('end', onEnd);
+    socket.once('close', onClose);
+    socket.once('error', onError);
+    removeAbortListener = onAbort(signal, (error) => settle(() => reject(error)));
+    if (settled) {
+      return;
+    }
+  });
+}
+
+async function sendRawHttp(
+  endpoint: string,
+  chunks: readonly string[],
+  options: RawHttpRequestOptions = {},
+): Promise<Buffer> {
+  const maxResponseBytes = normalizeRawResponseLimit(options.maxResponseBytes);
+  const socket = createConnection(endpoint);
+  socket.on('error', () => undefined);
+  try {
+    await withPhaseDeadline(
+      'connect',
+      options.connectTimeoutMs ?? DEFAULT_HTTP_CONNECT_TIMEOUT_MS,
+      (signal) => waitForSocketConnect(socket, signal),
+      { signal: options.signal, onTimeout: () => socket.destroy() },
+    );
+    await withPhaseDeadline(
+      'write',
+      options.writeTimeoutMs ?? DEFAULT_HTTP_WRITE_TIMEOUT_MS,
+      (signal) => writeRawHttp(socket, chunks, signal),
+      { signal: options.signal, onTimeout: () => socket.destroy() },
+    );
+    return await withPhaseDeadline(
+      'read',
+      options.readTimeoutMs ?? DEFAULT_HTTP_READ_TIMEOUT_MS,
+      (signal) => readRawHttp(socket, maxResponseBytes, signal),
+      { signal: options.signal, onTimeout: () => socket.destroy() },
+    );
+  } finally {
+    socket.destroy();
+  }
 }
 
 afterEach(async () => {
@@ -107,6 +318,17 @@ describe('HTTP over local IPC comparison candidate', () => {
     await expect(
       requestHttpIpc(endpoint, Buffer.from('request'), { maxResponseBytes: 8 }),
     ).rejects.toBeInstanceOf(HttpIpcBodyLimitError);
+  });
+
+  it('bounds raw HTTP response capture', async () => {
+    const responseCandidate = await startServer(() => Buffer.alloc(64, 0x41));
+    await expect(
+      sendRawHttp(
+        responseCandidate.endpoint,
+        ['POST / HTTP/1.1\r\nHost: local\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx'],
+        { maxResponseBytes: 32 },
+      ),
+    ).rejects.toThrow(/raw HTTP response reached/);
   });
 
   it('applies finite connect, write, and read phase deadlines', async () => {
@@ -157,8 +379,9 @@ describe('HTTP over local IPC comparison candidate', () => {
     });
 
     const response = await sendRawHttp(candidate.endpoint, [
-      'POST / HTTP/1.1\r\nHost: local\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhel',
-      'lo world',
+      'POST / HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n',
+      '5\r\nhello\r\n',
+      '6\r\n world\r\n0\r\n\r\n',
     ]);
     expect(response.toString('utf8')).toContain('200 OK');
     expect(payloads.map((payload) => payload.toString('utf8'))).toEqual(['hello world']);

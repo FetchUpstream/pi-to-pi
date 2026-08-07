@@ -31,20 +31,20 @@ Implementation candidate/test commit: `f30e4ca6e2eadc5342c6c22d53ca20b6732f8e5b`
 
 The focused suite is `tests/fixtures/local-ipc-http/http-candidate.test.ts`.
 On this Linux runner (`node v25.0.0`, repository minimum `node >=22.19.0`),
-all 9 tests passed. The checks cover:
+all 10 tests passed. The checks cover:
 
-| Behavior               | Evidence                                                                                                                      | Linux result |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| Normal operation       | Native Unix socket round trip with opaque bytes                                                                               | PASS         |
-| Request body limit     | `Content-Length` is rejected with HTTP 413 before the handler is called; chunked input is bounded while accumulating          | PASS         |
-| Response body limit    | Client rejects `HttpIpcBodyLimitError` before retaining a response over its configured limit                                  | PASS         |
-| Connect deadline/error | Unavailable generated endpoint fails with a finite connect deadline                                                           | PASS         |
-| Write deadline         | A zero-millisecond write phase rejects with `PhaseDeadlineExceededError` before sending the body                              | PASS         |
-| Read deadline          | Delayed handler response exceeds an absolute read deadline; a trickle cannot reset the timer                                  | PASS         |
-| Cancellation           | Caller `AbortSignal` rejects with `AbortError` and destroys the request/socket                                                | PASS         |
-| HTTP parser/framing    | Split header/body input is parsed; malformed input receives 400; truncated `Content-Length` input does not invoke the handler | PASS         |
-| Concurrent requests    | Three independent connections complete concurrently with response association preserved                                       | PASS         |
-| Cleanup/keep-alive     | `Connection: close`, disabled keep-alive, tracked active sockets, bounded close, and POSIX socket removal                     | PASS         |
+| Behavior               | Evidence                                                                                                                                                       | Linux result |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| Normal operation       | Native Unix socket round trip with opaque bytes                                                                                                                | PASS         |
+| Request body limit     | `Content-Length` is rejected with HTTP 413 before the handler is called; a split chunked body is parsed and delivered to the handler                           | PASS         |
+| Response body limit    | Client rejects `HttpIpcBodyLimitError` before retaining a response over its configured limit; raw capture rejects once its configured response cap is exceeded | PASS         |
+| Connect deadline/error | Unavailable generated endpoint fails with a finite connect deadline                                                                                            | PASS         |
+| Write deadline         | A zero-millisecond write phase rejects with `PhaseDeadlineExceededError` before sending the body                                                               | PASS         |
+| Read deadline          | Delayed handler response exceeds an absolute read deadline; no slow-drip response peer was exercised                                                           | PASS         |
+| Cancellation           | Caller `AbortSignal` rejects with `AbortError` and destroys the request/socket                                                                                 | PASS         |
+| HTTP parser/framing    | Split header/body and chunked input are parsed; malformed input receives 400; truncated `Content-Length` input does not invoke the handler                     | PASS         |
+| Concurrent requests    | Three independent connections complete concurrently with response association preserved                                                                        | PASS         |
+| Cleanup/keep-alive     | `Connection: close`, disabled keep-alive, tracked active sockets, bounded close, and POSIX socket removal                                                      | PASS         |
 
 The candidate exposes `startupMs`, measured from the `listen()` call until the
 `listening` event. A separate 10-run Linux sample over fresh endpoints recorded
@@ -66,17 +66,21 @@ chunking and coalescing. This removes custom frame-codec code but makes the
 wire contract larger and dependent on HTTP parser behavior.
 
 The server performs a numeric `Content-Length` check before retaining a body and
-retains at most the configured request limit while consuming chunked input. The
-client similarly bounds response accumulation. Node's parser rejects malformed
-HTTP syntax and emits `clientError`; an incomplete body emits an aborted request
-or response and is treated as failure. Node's built-in header/parser limits are
-additional HTTP behavior, not part of the raw transport contract, and the
-candidate does not claim a separate server-side slow-header deadline.
+bounds chunked accumulation at the configured request limit. The focused suite
+verifies the `Content-Length` rejection and parses a split chunked request; it
+does not independently stress an oversized chunked body. The client similarly
+bounds response accumulation. Node's parser rejects malformed HTTP syntax and
+emits `clientError`; an incomplete body emits an aborted request or response
+and is treated as failure. Node's built-in header/parser limits are additional
+HTTP behavior, not part of the raw transport contract, and the candidate does
+not claim a separate server-side slow-header deadline.
 
 ### Deadline, cancellation, and cleanup lifecycle
 
 The client arms one absolute timer for each connect, write, and read phase. The
-read timer starts after the request is flushed and is not reset by response
+focused suite verifies a delayed handler response exceeds the read deadline; it
+does not exercise a slow-drip response peer, so no trickle result is claimed.
+The read timer starts after the request is flushed and is not reset by response
 data. The abort listener destroys the `ClientRequest` and socket. The server
 tracks accepted sockets, stops accepting on `close()`, destroys remaining
 connections after the finite close deadline, and removes only the owned POSIX

@@ -1,3 +1,4 @@
+import { dirname } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -23,7 +24,7 @@ describe('local IPC endpoint fixture', () => {
       ),
     );
     expect(utf8ByteLength(endpoint)).toBeLessThanOrEqual(DEFAULT_POSIX_ENDPOINT_MAX_BYTES);
-    expect(endpoint).not.toContain(process.cwd());
+    expect(dirname(endpoint)).toBe(DEFAULT_POSIX_ENDPOINT_ROOT);
   });
 
   it('generates a named-pipe namespace value on Windows', () => {
