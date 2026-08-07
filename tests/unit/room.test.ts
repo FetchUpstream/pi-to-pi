@@ -103,6 +103,8 @@ describe('deterministic room ids', () => {
 
     expect(hashRoomId('explicit', 'frontend')).toBe(`r1-${expectedDigest}`);
     expect(deriveExplicitRoomId(' FRONTEND ')).toBe(`r1-${expectedDigest}`);
+    expect(deriveExplicitRoomId('ＦＲＯＮＴＥＮＤ')).toBe(deriveExplicitRoomId('frontend'));
+    expect(deriveExplicitRoomId('backend')).not.toBe(deriveExplicitRoomId('frontend'));
     expect(hashRoomId('explicit', 'frontend')).not.toBe(hashRoomId('cwd', 'frontend'));
     expect(isValidRoomId(`r1-${expectedDigest}`)).toBe(true);
     expect(isValidRoomId(`r1-${expectedDigest.toUpperCase()}`)).toBe(false);
@@ -176,6 +178,17 @@ describe('Git and cwd room derivation', () => {
     expect(resolved.value).toBe(canonicalizeDirectory(directory));
     expect(resolved.roomId).toBe(deriveRoomId('cwd', resolved.value));
     expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['', '\u0000'])('falls back when Git returns malformed output (%j)', (output) => {
+    const directory = temporaryDirectory();
+    const runner = vi.fn(() => output);
+
+    const resolved = resolveRoom({ cwd: directory, gitRunner: runner });
+
+    expect(resolved.source).toBe('cwd');
+    expect(resolved.value).toBe(canonicalizeDirectory(directory));
+    expect(resolved.roomId).toBe(deriveRoomId('cwd', directory));
   });
 
   it('canonicalizes direct path derivation inputs and rejects NUL paths', () => {

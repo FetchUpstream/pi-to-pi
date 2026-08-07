@@ -12,6 +12,7 @@ import {
   asNormalizedName,
   asRuntimeId,
   asSessionId,
+  createCanonicalPeerAddress,
   createRuntimeLifecycle,
   createRuntimeLifecycleForTesting,
   isSessionId,
@@ -30,6 +31,28 @@ describe('P2P identity and configuration foundations', () => {
     expect(replacement.sessionId).toBe('session-id');
     expect(replacement.runtimeId).not.toBe(first.runtimeId);
     expect(lifecycle.current()).toBe(replacement);
+  });
+
+  it('keeps session identity stable on reload and distinct across new or forked sessions', () => {
+    const runtimeIds = [
+      '11111111-1111-4111-8111-111111111111',
+      '22222222-2222-4222-8222-222222222222',
+      '33333333-3333-4333-8333-333333333333',
+      '44444444-4444-4444-8444-444444444444',
+    ];
+    const lifecycle = createRuntimeLifecycleForTesting(() => runtimeIds.shift()!);
+
+    const started = lifecycle.start('resumed-session');
+    const reloaded = lifecycle.start('resumed-session');
+    const newSession = lifecycle.start('new-session');
+    const forked = lifecycle.start('forked-session');
+
+    expect(reloaded.sessionId).toBe(started.sessionId);
+    expect(newSession.sessionId).not.toBe(started.sessionId);
+    expect(forked.sessionId).not.toBe(started.sessionId);
+    expect(
+      new Set([started.runtimeId, reloaded.runtimeId, newSession.runtimeId, forked.runtimeId]),
+    ).toHaveLength(4);
   });
 
   it('requires full UUID runtime syntax and keeps deterministic injection test-only', () => {
@@ -60,6 +83,19 @@ describe('P2P identity and configuration foundations', () => {
     expect(() => asNormalizedName('planner\uFEFF')).toThrow();
   });
 
+  it('constructs machine-actionable addresses from a full runtime ID and exact room', () => {
+    const roomId = asRoomId(`r1-${'a'.repeat(32)}`);
+    const address = createCanonicalPeerAddress('11111111-1111-4111-8111-111111111111', roomId);
+
+    expect(address).toEqual({
+      runtimeId: '11111111-1111-4111-8111-111111111111',
+      roomId,
+    });
+    expect(() => createCanonicalPeerAddress('runtime-1', roomId)).toThrow('full UUID');
+    expect(() =>
+      createCanonicalPeerAddress('11111111-1111-4111-8111-111111111111', 'not-a-room'),
+    ).toThrow('Invalid room ID');
+  });
   it('keys shutdown to the owning runtime and tolerates repeated cleanup', () => {
     const uuids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
     const lifecycle = createRuntimeLifecycleForTesting(() => uuids.shift() ?? uuids[0]!);
@@ -111,6 +147,10 @@ describe('P2P identity and configuration foundations', () => {
   it('falls back from native session name to agent when no name exists', () => {
     expect(resolveP2PConfig({ sessionName: 'Native' }).name).toBe('native');
     expect(resolveP2PConfig().name).toBe('agent');
+    expect(resolveP2PConfig({ sessionName: '---' })).toMatchObject({
+      name: 'agent',
+      nameSource: 'fallback',
+    });
   });
 
   it('rejects invalid explicit flag values with option-specific errors', () => {
