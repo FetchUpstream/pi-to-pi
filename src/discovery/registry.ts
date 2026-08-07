@@ -377,10 +377,10 @@ function validateAuthenticatedEnvelope(value: unknown): ProtocolEnvelope {
   }
   return result.value;
 }
-const MAX_AUTHENTICATED_SNAPSHOT_DEPTH = 32;
-const MAX_AUTHENTICATED_SNAPSHOT_NODES = 4_096;
-const MAX_AUTHENTICATED_SNAPSHOT_KEYS = 256;
-const MAX_AUTHENTICATED_SNAPSHOT_BYTES = 64 * 1024;
+const MAX_AUTHENTICATED_SNAPSHOT_DEPTH = 128;
+const MAX_AUTHENTICATED_SNAPSHOT_NODES = DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes;
+const MAX_AUTHENTICATED_SNAPSHOT_KEYS = DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes;
+const MAX_AUTHENTICATED_SNAPSHOT_BYTES = DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes;
 
 interface AuthenticatedSnapshotBudget {
   nodes: number;
@@ -397,9 +397,9 @@ interface CanonicalEnvelopeValidationBudget {
   bytes: number;
 }
 
-const MAX_CANONICAL_ENVELOPE_VALIDATION_DEPTH = 32;
-const MAX_CANONICAL_ENVELOPE_VALIDATION_NODES = 4_096;
-const MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS = 256;
+const MAX_CANONICAL_ENVELOPE_VALIDATION_DEPTH = 128;
+const MAX_CANONICAL_ENVELOPE_VALIDATION_NODES = DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes;
+const MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS = DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes;
 const MAX_CANONICAL_ENVELOPE_VALIDATION_BYTES = DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes;
 const INVALID_CANONICAL_ENVELOPE_VALUE = Symbol('invalid-canonical-envelope-value');
 
@@ -899,6 +899,7 @@ const BUILTIN_DATE = Date;
 const BUILTIN_DATE_GET_TIME = Date.prototype.getTime;
 const BUILTIN_DATE_TO_ISO_STRING = Date.prototype.toISOString;
 const BUILTIN_DATE_PARSE = Date.parse;
+const MAX_LEASE_EXPIRY_STRING_LENGTH = 256;
 
 function dateMilliseconds(value: unknown): number | undefined {
   if (typeof value !== 'object' || value === null) {
@@ -939,6 +940,10 @@ function parseExpiry(value: string | number | Date, label: string): number {
   if (typeof value === 'number') {
     result = value;
   } else if (typeof value === 'string') {
+    result = undefined;
+    if (value.length > MAX_LEASE_EXPIRY_STRING_LENGTH) {
+      throw new AgentCardRegistryError('malformed', `${label} must be a bounded timestamp`);
+    }
     try {
       result = BUILTIN_DATE_PARSE(value);
     } catch {
@@ -1459,6 +1464,12 @@ function extractPublication(input: AgentCardPublication | AgentCard): Publicatio
   ) {
     throw new AgentCardRegistryError('malformed', 'leaseExpiresAt must be a timestamp');
   }
+  if (
+    typeof leaseExpiresAt === 'string' &&
+    leaseExpiresAt.length > MAX_LEASE_EXPIRY_STRING_LENGTH
+  ) {
+    throw new AgentCardRegistryError('malformed', 'leaseExpiresAt must be a bounded timestamp');
+  }
   const rawTtl = publicationField(raw, 'leaseTtlMs');
   const nestedTtl =
     nestedCard === undefined
@@ -1556,46 +1567,86 @@ function safeError(code: 'unauthorized' | 'cross_room'): ProtocolError {
   );
 }
 
+const UNREADABLE_INBOUND_VALUE = Symbol('unreadable-inbound-value');
+function inboundProperty(value: unknown, key: string): unknown {
+  try {
+    if (!isRecord(value)) {
+      return UNREADABLE_INBOUND_VALUE;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !('value' in descriptor)) {
+      return UNREADABLE_INBOUND_VALUE;
+    }
+    return descriptor.value;
+  } catch {
+    return UNREADABLE_INBOUND_VALUE;
+  }
+}
+
 function isTargetedOperation(value: unknown): value is ProtocolEnvelope {
-  if (!isRecord(value) || !isRecord(value.sender)) {
+  try {
+    if (!isRecord(value)) {
+      return false;
+    }
+    const sender = inboundProperty(value, 'sender');
+    const recipientRuntimeId = inboundProperty(value, 'recipientRuntimeId');
+    const roomId = inboundProperty(value, 'roomId');
+    return (
+      sender !== UNREADABLE_INBOUND_VALUE &&
+      isCanonicalIdentity(sender) &&
+      recipientRuntimeId !== UNREADABLE_INBOUND_VALUE &&
+      isUuidV4(recipientRuntimeId) &&
+      roomId !== UNREADABLE_INBOUND_VALUE &&
+      isRoomId(roomId)
+    );
+  } catch {
     return false;
   }
-  return (
-    isCanonicalIdentity(value.sender) &&
-    isUuidV4(value.recipientRuntimeId) &&
-    isRoomId(value.roomId)
-  );
 }
 
 function unwrapInbound<Envelope extends ProtocolEnvelope>(
   input: AuthenticatedOperation<Envelope>,
-): { envelope: Envelope; metadata: BindingMetadata | undefined } | undefined {
+): { envelope: unknown; metadata: BindingMetadata | undefined } | undefined {
   if (!isRecord(input) || !trustedAuthenticatedOperations.has(input)) {
     return undefined;
   }
-  const validated = validateEnvelope(input.envelope, {
-    maxEnvelopeBytes: DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes,
-  });
-  if (!validated.ok || !isTargetedOperation(validated.value)) {
+  const envelope = inboundProperty(input, 'envelope');
+  if (envelope === UNREADABLE_INBOUND_VALUE) {
     return undefined;
   }
-  const metadata = (input.bindingMetadata ?? input.metadata) as BindingMetadata | undefined;
-  return { envelope: validated.value as Envelope, metadata };
+  const bindingMetadata = inboundProperty(input, 'bindingMetadata');
+  const aliasMetadata = inboundProperty(input, 'metadata');
+  const rawMetadata =
+    bindingMetadata !== UNREADABLE_INBOUND_VALUE && bindingMetadata !== undefined
+      ? bindingMetadata
+      : aliasMetadata;
+  const metadata =
+    rawMetadata === UNREADABLE_INBOUND_VALUE || rawMetadata === undefined
+      ? undefined
+      : isRecord(rawMetadata)
+        ? (rawMetadata as BindingMetadata)
+        : undefined;
+  return { envelope, metadata };
 }
 
 function authenticatedIdentity(value: unknown): SessionRuntimeIdentity | undefined {
-  if (
-    !isRecord(value) ||
-    value.authenticated !== true ||
-    !isRecord(value.identity) ||
-    !isCanonicalIdentity(value.identity)
-  ) {
+  try {
+    const authenticated = inboundProperty(value, 'authenticated');
+    const identity = inboundProperty(value, 'identity');
+    if (
+      authenticated !== true ||
+      identity === UNREADABLE_INBOUND_VALUE ||
+      !isCanonicalIdentity(identity)
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      sessionId: identity.sessionId,
+      runtimeId: identity.runtimeId,
+    });
+  } catch {
     return undefined;
   }
-  return Object.freeze({
-    sessionId: value.identity.sessionId,
-    runtimeId: value.identity.runtimeId,
-  });
 }
 
 async function authenticateBinding(
@@ -1603,20 +1654,95 @@ async function authenticateBinding(
   metadata: BindingMetadata | undefined,
   context: BindingAuthenticationContext,
 ): Promise<SessionRuntimeIdentity | undefined> {
-  const method = authenticator.authenticate ?? authenticator.verify;
-  if (method === undefined) {
-    return undefined;
-  }
   try {
+    const method = authenticator.authenticate ?? authenticator.verify;
+    if (typeof method !== 'function') {
+      return undefined;
+    }
     const result = await method.call(authenticator, metadata, context);
-    if (!isRecord(result) || result.authenticated !== true) {
+    if (!isRecord(result) || inboundProperty(result, 'authenticated') !== true) {
       return undefined;
     }
     return authenticatedIdentity(result);
   } catch {
-    // Binding failures are intentionally collapsed to the safe unauthorized
-    // result; no binding detail is allowed to reach an application response.
+    // Binding failures, including accessor/proxy failures while discovering
+    // the verifier, are intentionally collapsed to safe unauthorized state.
     return undefined;
+  }
+}
+interface InboundTargetSnapshot {
+  readonly sender?: SessionRuntimeIdentity;
+  readonly recipientRuntimeId?: RuntimeId;
+  readonly roomId?: RoomId;
+}
+
+function readInboundTarget(value: unknown): InboundTargetSnapshot {
+  try {
+    const rawSender = inboundProperty(value, 'sender');
+    const sessionId =
+      rawSender === UNREADABLE_INBOUND_VALUE
+        ? UNREADABLE_INBOUND_VALUE
+        : inboundProperty(rawSender, 'sessionId');
+    const runtimeId =
+      rawSender === UNREADABLE_INBOUND_VALUE
+        ? UNREADABLE_INBOUND_VALUE
+        : inboundProperty(rawSender, 'runtimeId');
+    const senderCandidate = { sessionId, runtimeId };
+    const sender =
+      sessionId !== UNREADABLE_INBOUND_VALUE &&
+      runtimeId !== UNREADABLE_INBOUND_VALUE &&
+      isCanonicalIdentity(senderCandidate)
+        ? Object.freeze({
+            sessionId: senderCandidate.sessionId,
+            runtimeId: senderCandidate.runtimeId,
+          })
+        : undefined;
+    const rawRecipientRuntimeId = inboundProperty(value, 'recipientRuntimeId');
+    const recipientRuntimeId =
+      rawRecipientRuntimeId !== UNREADABLE_INBOUND_VALUE && isUuidV4(rawRecipientRuntimeId)
+        ? rawRecipientRuntimeId
+        : undefined;
+    const rawRoomId = inboundProperty(value, 'roomId');
+    const roomId =
+      rawRoomId !== UNREADABLE_INBOUND_VALUE && isRoomId(rawRoomId) ? rawRoomId : undefined;
+    return {
+      ...(sender === undefined ? {} : { sender }),
+      ...(recipientRuntimeId === undefined ? {} : { recipientRuntimeId }),
+      ...(roomId === undefined ? {} : { roomId }),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function malformedInboundResult(
+  message = 'authenticated envelope is malformed',
+): TargetVerificationFailure {
+  return Object.freeze({
+    ok: false,
+    error: createProtocolError('malformed', message),
+  });
+}
+
+function validateInboundAfterAuthentication(
+  value: unknown,
+): { readonly ok: true; readonly envelope: ProtocolEnvelope } | TargetVerificationFailure {
+  try {
+    const validationView = createCanonicalEnvelopeValidationView(value);
+    const envelope = validateAuthenticatedEnvelope(validationView);
+    const snapshot = cloneFrozenSnapshot(envelope);
+    if (!isTargetedOperation(snapshot)) {
+      return malformedInboundResult();
+    }
+    return { ok: true, envelope: snapshot as ProtocolEnvelope };
+  } catch (error: unknown) {
+    if (error instanceof AgentCardRegistryError && error.code === 'expired') {
+      return Object.freeze({
+        ok: false,
+        error: createProtocolError('expired', 'authenticated envelope has expired'),
+      });
+    }
+    return malformedInboundResult();
   }
 }
 
@@ -1640,42 +1766,75 @@ export async function verifyAuthenticatedTarget<Envelope extends ProtocolEnvelop
   authenticator: BindingAuthenticator,
   target: VerificationTarget,
 ): Promise<TargetVerificationResult<Envelope>> {
-  const unwrapped = unwrapInbound(input);
-  if (unwrapped === undefined) {
+  try {
+    const unwrapped = unwrapInbound(input);
+    if (unwrapped === undefined) {
+      return unauthorizedResult();
+    }
+    const localRuntimeId = target.runtimeId;
+    const localRoomId = target.roomId;
+    if (!isUuidV4(localRuntimeId) || !isRoomId(localRoomId)) {
+      return unauthorizedResult();
+    }
+    const preliminary = readInboundTarget(unwrapped.envelope);
+    const fallbackSender: SenderIdentity = Object.freeze({
+      sessionId: '' as SessionId,
+      runtimeId: localRuntimeId,
+    });
+    const context: BindingAuthenticationContext = Object.freeze({
+      claimedSender: preliminary.sender ?? fallbackSender,
+      recipientRuntimeId: preliminary.recipientRuntimeId ?? localRuntimeId,
+      roomId: preliminary.roomId ?? localRoomId,
+      localRuntimeId,
+      localRoomId,
+    });
+    // Authentication intentionally precedes canonical envelope validation so
+    // malformed or adversarial input cannot probe validation/task state. The
+    // authenticator boundary also collapses getter/proxy failures safely.
+    const authenticated = await authenticateBinding(authenticator, unwrapped.metadata, context);
+    if (
+      authenticated === undefined ||
+      preliminary.sender === undefined ||
+      !runtimeIdentitiesEqual(authenticated, preliminary.sender)
+    ) {
+      return unauthorizedResult();
+    }
+    if (preliminary.roomId !== undefined && !roomsEqual(preliminary.roomId, localRoomId)) {
+      return crossRoomResult();
+    }
+    if (
+      preliminary.recipientRuntimeId !== undefined &&
+      preliminary.recipientRuntimeId !== localRuntimeId
+    ) {
+      return unauthorizedResult();
+    }
+    const validated = validateInboundAfterAuthentication(unwrapped.envelope);
+    if (!validated.ok) {
+      return validated;
+    }
+    const envelope = validated.envelope;
+    if (!isTargetedOperation(envelope)) {
+      return malformedInboundResult();
+    }
+    if (!runtimeIdentitiesEqual(authenticated, envelope.sender)) {
+      return unauthorizedResult();
+    }
+    if (!roomsEqual(envelope.roomId, localRoomId)) {
+      return crossRoomResult();
+    }
+    if (envelope.recipientRuntimeId !== localRuntimeId) {
+      return unauthorizedResult();
+    }
+    return Object.freeze({
+      ok: true,
+      envelope: envelope as Envelope,
+      sender: authenticated,
+      recipientRuntimeId: envelope.recipientRuntimeId,
+      roomId: envelope.roomId,
+    });
+  } catch {
     return unauthorizedResult();
   }
-  const { envelope, metadata } = unwrapped;
-  if (!isTargetedOperation(envelope) || !isUuidV4(target.runtimeId) || !isRoomId(target.roomId)) {
-    return unauthorizedResult();
-  }
-  const context: BindingAuthenticationContext = Object.freeze({
-    claimedSender: envelope.sender,
-    recipientRuntimeId: envelope.recipientRuntimeId,
-    roomId: envelope.roomId,
-    localRuntimeId: target.runtimeId,
-    localRoomId: target.roomId,
-  });
-  const authenticated = await authenticateBinding(authenticator, metadata, context);
-  if (authenticated === undefined || !runtimeIdentitiesEqual(authenticated, envelope.sender)) {
-    return unauthorizedResult();
-  }
-
-  // Room mismatch is deliberately distinguishable only after authentication.
-  // No task, request, or dedupe identifier is inspected on either failure path.
-  if (!roomsEqual(envelope.roomId, target.roomId)) {
-    return crossRoomResult();
-  }
-  if (envelope.recipientRuntimeId !== target.runtimeId) {
-    return unauthorizedResult();
-  }
-
-  return Object.freeze({
-    ok: true,
-    envelope: envelope as Envelope,
-    sender: authenticated,
-    recipientRuntimeId: envelope.recipientRuntimeId,
-    roomId: envelope.roomId,
-  });
 }
 
 export const verifyAuthenticatedSender = verifyAuthenticatedTarget;
@@ -2231,7 +2390,10 @@ export class AgentCardRegistry {
       let callbackFailed = false;
       try {
         if (committedOwner !== undefined && registrationGeneration !== undefined) {
-          this.unregisterExact(committedOwner, registrationGeneration);
+          const removed = this.unregisterExact(committedOwner, registrationGeneration);
+          if (!removed) {
+            this.ensureStoppedLeaseTombstone(committedOwner, registrationGeneration);
+          }
           registrationGeneration = undefined;
           committedOwner = undefined;
         }
@@ -2388,9 +2550,13 @@ export class AgentCardRegistry {
     ) {
       throw new AgentCardRegistryError('expired', 'Agent Card lease has expired');
     }
-    // Direct registration always starts a fresh lease from this call's clock;
-    // caller metadata can never extend that effective TTL.
-    const expiresAtMs = Math.min(overrides.expiresAtMs ?? freshDeadline, freshDeadline);
+    // A supplied source expiry is authoritative when it is earlier than the
+    // configured/requested lease deadline; source metadata must never be extended.
+    const expiresAtMs = Math.min(
+      overrides.expiresAtMs ?? freshDeadline,
+      freshDeadline,
+      suppliedExpiry ?? Number.POSITIVE_INFINITY,
+    );
     if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now) {
       throw new AgentCardRegistryError('expired', 'Agent Card lease has expired');
     }
@@ -2550,6 +2716,56 @@ export class AgentCardRegistry {
     this.records.delete(owner.runtimeId);
     this.pruneRetired(retiredAtMs);
     return true;
+  }
+  private ensureStoppedLeaseTombstone(owner: SessionRuntimeIdentity, generation: number): void {
+    const current = this.records.get(owner.runtimeId);
+    const existingTombstone = this.retiredIds.get(owner.runtimeId);
+    if (current === undefined) {
+      if (existingTombstone !== undefined && existingTombstone.generation >= generation) {
+        return;
+      }
+      throw new AgentCardRegistryError(
+        'not_found',
+        'stopped runtime advertisement was not tombstoned',
+      );
+    }
+    if (current.generation !== generation || !runtimeIdentitiesEqual(current.owner, owner)) {
+      throw new AgentCardRegistryAuthorizationError(
+        'runtime advertisement owner generation changed before tombstone cleanup',
+      );
+    }
+    const retiredAtMs = this.clock();
+    const currentAfterClock = this.records.get(owner.runtimeId);
+    if (
+      currentAfterClock === undefined ||
+      currentAfterClock.generation !== generation ||
+      !runtimeIdentitiesEqual(currentAfterClock.owner, owner)
+    ) {
+      throw new AgentCardRegistryAuthorizationError(
+        'runtime advertisement owner generation changed before tombstone cleanup',
+      );
+    }
+    if (!this.retireRecord(currentAfterClock, retiredAtMs)) {
+      throw new AgentCardRegistryError(
+        'busy',
+        'stopped runtime advertisement tombstone could not be retained',
+      );
+    }
+    const currentBeforeDelete = this.records.get(owner.runtimeId);
+    if (
+      currentBeforeDelete !== undefined &&
+      currentBeforeDelete.generation === generation &&
+      runtimeIdentitiesEqual(currentBeforeDelete.owner, owner)
+    ) {
+      this.records.delete(owner.runtimeId);
+      return;
+    }
+    const tombstone = this.retiredIds.get(owner.runtimeId);
+    if (tombstone === undefined || tombstone.generation < generation) {
+      throw new AgentCardRegistryAuthorizationError(
+        'runtime advertisement owner generation changed before tombstone cleanup',
+      );
+    }
   }
 
   private renewExact(
