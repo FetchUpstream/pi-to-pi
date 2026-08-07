@@ -413,7 +413,16 @@ function observedChildCloseState(child: ChildProcess): ChildExit | undefined {
     return undefined;
   }
   const currentExit = childExitState(child);
-  if (currentExit === undefined || !sameChildExit(cachedClose, currentExit)) {
+  // A close event can legitimately report (null, null) before ChildProcess exit
+  // metadata is populated; preserve that close-gated state for diagnostics and cleanup.
+  if (currentExit === undefined) {
+    if (cachedClose.code === null && cachedClose.signal === null) {
+      return cachedClose;
+    }
+    childCloseStates.delete(child);
+    return undefined;
+  }
+  if (!sameChildExit(cachedClose, currentExit)) {
     childCloseStates.delete(child);
     return undefined;
   }

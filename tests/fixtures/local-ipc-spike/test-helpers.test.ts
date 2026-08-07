@@ -48,6 +48,20 @@ class NullStdioExitedChild extends EventEmitter {
   stderr = null;
 }
 
+class NullCloseStateChild extends EventEmitter {
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  stdin = null;
+  stdout = null;
+  stderr = null;
+  readonly signals: NodeJS.Signals[] = [];
+
+  kill(signal: NodeJS.Signals): boolean {
+    this.signals.push(signal);
+    return true;
+  }
+}
+
 describe('local IPC spike test helpers', () => {
   it('represents phase deadlines as finite absolute timestamps', () => {
     const deadline = createPhaseDeadline('read', 100, 1_000);
@@ -228,6 +242,44 @@ describe('local IPC spike test helpers', () => {
     child.emit('close', 3, null);
     expect(capture.snapshot().exit).toEqual({ code: 3, signal: null });
     capture.dispose();
+  });
+  it('retains null/null close state and gates diagnostics until close', async () => {
+    const child = new NullCloseStateChild();
+    const capture = captureChildDiagnostics(child as unknown as ChildProcess);
+    const pending = waitForChildWithDiagnostics(
+      child as unknown as ChildProcess,
+      createPhaseDeadline('child-diagnostics', 100),
+    );
+
+    expect(capture.snapshot().exit).toBeUndefined();
+    child.emit('error', new Error('child failed before close'));
+    await Promise.resolve();
+    expect(capture.snapshot().exit).toBeUndefined();
+
+    child.emit('close', null, null);
+    await expect(pending).rejects.toMatchObject({
+      name: 'ChildDiagnosticError',
+      message: expect.stringContaining('code: null'),
+    });
+    expect(capture.snapshot().exit).toEqual({ code: null, signal: null });
+    capture.dispose();
+  });
+  it('returns null/null close state and skips cleanup after close is observed', async () => {
+    const child = new NullCloseStateChild();
+    const observed = waitForChildExit(
+      child as unknown as ChildProcess,
+      createPhaseDeadline('child-exit', 100),
+    );
+    child.emit('close', null, null);
+    await expect(observed).resolves.toEqual({ code: null, signal: null });
+
+    await expect(
+      cleanupChildProcess(child as unknown as ChildProcess, {
+        timeoutMs: 100,
+        forceWaitMs: 10,
+      }),
+    ).resolves.toEqual({ code: null, signal: null });
+    expect(child.signals).toEqual([]);
   });
   it('defers child errors until close so diagnostics include close state', async () => {
     const child = new NullStdioExitedChild();

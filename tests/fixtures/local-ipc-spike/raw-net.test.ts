@@ -656,22 +656,21 @@ describe('raw node:net local IPC candidate', () => {
   it('fails a slow-drip response even when each byte arrives before an idle timeout', async () => {
     const endpoint = createIpcEndpoint();
     const sockets = new Set<Socket>();
+    let dripWrites = 0;
+    const response = encodeFrame(Buffer.from('slow-drip'));
     const server = createServer({ allowHalfOpen: true }, (socket) => {
       sockets.add(socket);
-      let requestBytes = 0;
-      socket.on('data', (chunk) => {
-        requestBytes += chunk.byteLength;
-      });
-      socket.once('end', () => {
-        if (requestBytes === 0) {
-          socket.destroy();
+      const decoder = new FrameDecoder();
+      let dripTimer: NodeJS.Timeout | undefined;
+      let offset = 0;
+      const startDrip = (): void => {
+        if (dripTimer !== undefined) {
           return;
         }
-        const response = encodeFrame(Buffer.from('slow-drip'));
-        let offset = 0;
-        const timer = setInterval(() => {
+        dripTimer = setInterval(() => {
           if (socket.destroyed || offset >= response.byteLength) {
-            clearInterval(timer);
+            clearInterval(dripTimer);
+            dripTimer = undefined;
             if (!socket.destroyed) {
               socket.end();
             }
@@ -679,10 +678,30 @@ describe('raw node:net local IPC candidate', () => {
           }
           socket.write(response.subarray(offset, offset + 1));
           offset += 1;
+          dripWrites += 1;
         }, 10);
-        socket.once('close', () => clearInterval(timer));
+      };
+      socket.on('data', (chunk) => {
+        try {
+          if (decoder.push(chunk) !== undefined) {
+            startDrip();
+          }
+        } catch {
+          socket.destroy();
+        }
       });
-      socket.once('close', () => sockets.delete(socket));
+      socket.once('end', () => {
+        if (dripTimer === undefined) {
+          socket.destroy();
+        }
+      });
+      socket.once('close', () => {
+        if (dripTimer !== undefined) {
+          clearInterval(dripTimer);
+          dripTimer = undefined;
+        }
+        sockets.delete(socket);
+      });
     });
     await listenServer(server, endpoint);
     const transport = new RawNetTransport();
@@ -694,6 +713,8 @@ describe('raw node:net local IPC candidate', () => {
         name: 'PhaseDeadlineExceededError',
         phase: 'read',
       });
+      expect(dripWrites).toBeGreaterThan(0);
+      expect(dripWrites).toBeLessThan(response.byteLength);
     } finally {
       await transport.close();
       await closeServer(server, sockets);

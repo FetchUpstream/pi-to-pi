@@ -284,6 +284,13 @@ function restoreQuarantinedSocket(endpoint: string, quarantine: string): void {
     linkSync(quarantine, endpoint);
   } catch (error: unknown) {
     if (errorCode(error) === 'EEXIST') {
+      try {
+        unlinkSync(quarantine);
+      } catch (cleanupError: unknown) {
+        if (errorCode(cleanupError) !== 'ENOENT') {
+          throw cleanupError;
+        }
+      }
       return;
     }
     throw error;
@@ -296,6 +303,8 @@ function restoreQuarantinedSocket(endpoint: string, quarantine: string): void {
     }
   }
 }
+/** Test-only seam for exercising replacement-safe quarantine recovery. */
+export const restoreQuarantinedSocketForTest = restoreQuarantinedSocket;
 
 function unlinkOwnedSocket(endpoint: string, expected?: PosixSocketIdentity): boolean {
   if (!isPosixRuntime()) {
