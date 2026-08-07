@@ -45,3 +45,31 @@ export type {
   ProcessDiagnostics,
   ProcessIdentity,
 } from './output.js';
+
+export {
+  createManagedChildProcess,
+  createManagedProcess,
+  createManagedProcessGroup,
+  DEFAULT_LIFECYCLE_FIXTURE_PATH,
+  DEFAULT_MANAGED_PROCESS_KILL_TIMEOUT_MS,
+  DEFAULT_MANAGED_PROCESS_TIMEOUT_MS,
+  DEFAULT_MAX_MANAGED_PROCESS_EVENTS,
+  LIFECYCLE_FIXTURE_PATH,
+  ManagedChildProcess,
+  ManagedProcess,
+  ManagedProcessClosedError,
+  ManagedProcessGroup,
+  ManagedProcessSpawnError,
+  ManagedProcessTimeoutError,
+  spawnManagedProcess,
+} from './process.js';
+export type {
+  KillAbruptlyOptions,
+  ManagedProcessEvent,
+  ManagedProcessExit,
+  ManagedProcessGroupOptions,
+  ManagedProcessOptions,
+  ManagedProcessState,
+  ManagedProcessWaitOptions,
+  ManagedProcessWorkspace,
+} from './process.js';
