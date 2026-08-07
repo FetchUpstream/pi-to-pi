@@ -1522,7 +1522,7 @@ export class RuntimeRegistry {
   private readonly pathOptions: RegistryPathOptions;
   private readonly clock: RegistryClock;
   private currentNetworkName: RegistryNetworkName;
-  private cleanupOptions: RuntimeRecordCleanupOptions;
+  private readonly cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
   private pendingRenewal: Promise<void> = Promise.resolve();
   private shutdownRequested = false;
@@ -1639,17 +1639,11 @@ export class RuntimeRegistry {
     }
 
     const previousNetworkName = this.networkName;
-    const previousCleanupOptions = this.cleanupOptions;
     this.currentNetworkName = canonical;
-    this.cleanupOptions = {
-      ...previousCleanupOptions,
-      expectedNetworkName: canonical,
-    };
     try {
       await this.renew();
     } catch (error) {
       this.currentNetworkName = previousNetworkName;
-      this.cleanupOptions = previousCleanupOptions;
       throw error;
     }
   }
@@ -1683,7 +1677,19 @@ export class RuntimeRegistry {
       this.shutdownPromise = (async () => {
         await this.lease.stop();
         await this.pendingRenewal;
-        const removed = await removeRuntimeRecord(this.roomId, this.runtimeId, this.cleanupOptions);
+        // A rename stages the mutable name before its queued publication commits;
+        // remove the exact record that was last committed to disk instead.
+        const committedRecord = this.currentRecord;
+        const cleanupOptions =
+          committedRecord === undefined
+            ? this.cleanupOptions
+            : {
+                ...this.cleanupOptions,
+                expectedSessionId: committedRecord.sessionId,
+                expectedEndpoint: committedRecord.endpoint,
+                expectedNetworkName: committedRecord.networkName,
+              };
+        const removed = await removeRuntimeRecord(this.roomId, this.runtimeId, cleanupOptions);
         this.currentRecord = undefined;
         return removed;
       })();
