@@ -169,15 +169,18 @@ describe('Git and cwd room derivation', () => {
 
   it('falls back to canonical cwd when Git fails', () => {
     const directory = temporaryDirectory();
+    const otherDirectory = temporaryDirectory();
     const runner = vi.fn(() => {
       throw new Error('git unavailable');
     });
 
     const resolved = resolveRoom({ cwd: join(directory, '.'), gitRunner: runner });
+    const otherResolved = resolveRoom({ cwd: join(otherDirectory, '.'), gitRunner: runner });
     expect(resolved.source).toBe('cwd');
     expect(resolved.value).toBe(canonicalizeDirectory(directory));
     expect(resolved.roomId).toBe(deriveRoomId('cwd', resolved.value));
-    expect(runner).toHaveBeenCalledTimes(1);
+    expect(resolved.roomId).not.toBe(otherResolved.roomId);
+    expect(runner).toHaveBeenCalledTimes(2);
   });
 
   it.each(['', '\u0000'])('falls back when Git returns malformed output (%j)', (output) => {
