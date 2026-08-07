@@ -160,8 +160,7 @@ type UnixSocketIdentity = Pick<
   BigIntStats,
   'dev' | 'ino' | 'mode' | 'uid' | 'gid' | 'size' | 'mtimeNs' | 'ctimeNs' | 'birthtimeNs'
 >;
-type UnixSocketObjectIdentity = Omit<UnixSocketIdentity, 'ctimeNs'>;
-
+type UnixObjectIdentity = Omit<UnixSocketIdentity, 'ctimeNs'>;
 interface EndpointOperationLockOptions {
   readonly deadline?: ReturnType<typeof createPhaseDeadline>;
   readonly signal?: AbortSignal;
@@ -924,10 +923,7 @@ function sameUnixSocketIdentity(stat: UnixSocketIdentity, identity: UnixSocketId
 }
 
 /** Rename changes ctime; compare the object fields that remain stable across quarantine. */
-function sameUnixSocketObjectIdentity(
-  stat: UnixSocketObjectIdentity,
-  identity: UnixSocketIdentity,
-): boolean {
+function sameUnixObjectIdentity(stat: UnixObjectIdentity, identity: UnixSocketIdentity): boolean {
   return (
     stat.dev === identity.dev &&
     stat.ino === identity.ino &&
@@ -1039,7 +1035,7 @@ async function hasLiveUnixListener(
   }
 }
 
-async function restoreQuarantinedUnixSocket(
+async function restoreQuarantinedUnixEntry(
   endpoint: string,
   quarantine: string,
   identity: UnixSocketIdentity,
@@ -1054,10 +1050,7 @@ async function restoreQuarantinedUnixSocket(
     }
     throw error;
   }
-  if (!quarantinedStat.isSocket()) {
-    throw new HttpIpcProtocolError('HTTP IPC endpoint quarantine is not a Unix socket');
-  }
-  const quarantinedIsOwned = sameUnixSocketObjectIdentity(quarantinedStat, identity);
+  const quarantinedIsOwned = sameUnixObjectIdentity(quarantinedStat, identity);
   const quarantineKind = quarantinedIsOwned ? 'owned' : 'replacement';
   // The quarantine path was created by our rename. Even if the inode changed
   // between the ownership probe and rename, restore that exact moved entry only
@@ -1087,10 +1080,7 @@ async function restoreQuarantinedUnixSocket(
   let unlinkError: unknown;
   try {
     const finalQuarantineStat = await tracker.track(lstat(quarantine, { bigint: true }));
-    if (
-      !finalQuarantineStat.isSocket() ||
-      !sameUnixSocketObjectIdentity(finalQuarantineStat, quarantinedStat)
-    ) {
+    if (!sameUnixObjectIdentity(finalQuarantineStat, quarantinedStat)) {
       throw new HttpIpcProtocolError('HTTP IPC endpoint quarantine ownership changed');
     }
     await tracker.track(unlink(quarantine));
@@ -1185,7 +1175,7 @@ async function removeOwnedUnixSocketWithinDeadline(
         if (!quarantineCreated) {
           return;
         }
-        await restoreQuarantinedUnixSocket(endpoint, quarantine, identity, tracker);
+        await restoreQuarantinedUnixEntry(endpoint, quarantine, identity, tracker);
         quarantineCreated = false;
       }),
     );
@@ -1224,7 +1214,7 @@ async function removeOwnedUnixSocketWithinDeadline(
       { signal },
     );
     throwIfAborted(signal);
-    if (quarantinedStat.isSocket() && sameUnixSocketObjectIdentity(quarantinedStat, identity)) {
+    if (quarantinedStat.isSocket() && sameUnixObjectIdentity(quarantinedStat, identity)) {
       await withDeadline(tracker.track(unlink(quarantine)), deadline, { signal }).catch(
         (error: unknown) => {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -1347,6 +1337,23 @@ export async function __removeStaleHttpIpcEndpointForTest(
     return;
   }
   await removeOwnedUnixSocket(endpoint, identity, timeoutMs, signal, deadline);
+}
+
+/** Test-only detached quarantine recovery seam for non-socket replacement entries. */
+export async function __recoverHttpIpcEndpointQuarantineForTest(
+  endpoint: string,
+  quarantine: string,
+  identity: UnixSocketIdentity,
+): Promise<void> {
+  if (process.platform === 'win32' || endpointKind(endpoint) !== 'unix-socket') {
+    return;
+  }
+  const tracker = createEndpointCleanupTracker();
+  try {
+    await restoreQuarantinedUnixEntry(endpoint, quarantine, identity, tracker);
+  } finally {
+    tracker.finish();
+  }
 }
 
 function forceCloseServer(server: Server, sockets: Set<Socket>): void {

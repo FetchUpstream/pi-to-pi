@@ -1,6 +1,15 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
+import {
+  lstat,
+  readFile,
+  readlink,
+  readdir,
+  rename,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { basename, dirname } from 'node:path';
 import { createConnection } from 'node:net';
 import type { Socket } from 'node:net';
@@ -14,6 +23,7 @@ import {
   withPhaseDeadline,
 } from '../local-ipc-spike/test-helpers.js';
 import {
+  __recoverHttpIpcEndpointQuarantineForTest,
   __removeStaleHttpIpcEndpointForTest,
   bindHttpIpc,
   DEFAULT_HTTP_CONNECT_TIMEOUT_MS,
@@ -40,6 +50,14 @@ async function closeRunningServers(): Promise<void> {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function unlinkIfPresent(path: string): Promise<void> {
+  await unlink(path).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+  });
 }
 
 async function waitForChildReady(child: ChildProcess): Promise<void> {
@@ -552,6 +570,63 @@ describe('HTTP over local IPC comparison candidate', () => {
       }
     }
   });
+  it.each(['regular-file', 'symlink'])(
+    'recovers an unchanged moved %s replacement without following it',
+    async (replacementKind) => {
+      if (process.platform === 'win32') {
+        return;
+      }
+      const endpoint = createHttpIpcEndpoint();
+      const quarantine = `${endpoint}.cleanup-${replacementKind}`;
+      const target = `${endpoint}.target`;
+      const script = [
+        "import { createServer } from 'node:net';",
+        'const staleServer = createServer(() => undefined);',
+        "staleServer.listen(process.argv[1], () => process.stdout.write('READY\\n'));",
+      ].join('\n');
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script, endpoint], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      try {
+        await waitForChildReady(child);
+        child.kill('SIGKILL');
+        await waitForChildClose(child);
+        const identity = await lstat(endpoint, { bigint: true });
+        expect(identity.isSocket()).toBe(true);
+        await unlink(endpoint);
+        if (replacementKind === 'regular-file') {
+          await writeFile(endpoint, 'regular replacement');
+        } else {
+          await writeFile(target, 'symlink target');
+          await symlink(target, endpoint);
+        }
+        await rename(endpoint, quarantine);
+        await __recoverHttpIpcEndpointQuarantineForTest(endpoint, quarantine, identity);
+        expect(existsSync(quarantine)).toBe(false);
+        const restored = await lstat(endpoint);
+        if (replacementKind === 'regular-file') {
+          expect(restored.isFile()).toBe(true);
+          await expect(readFile(endpoint, 'utf8')).resolves.toBe('regular replacement');
+        } else {
+          expect(restored.isSymbolicLink()).toBe(true);
+          await expect(readlink(endpoint)).resolves.toBe(target);
+          await expect(readFile(target, 'utf8')).resolves.toBe('symlink target');
+        }
+        const residuals = (await readdir(dirname(endpoint))).filter((entry) =>
+          entry.startsWith(`${basename(endpoint)}.cleanup-`),
+        );
+        expect(residuals).toEqual([]);
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL');
+        }
+        await waitForChildClose(child).catch(() => undefined);
+        await unlinkIfPresent(endpoint);
+        await unlinkIfPresent(quarantine);
+        await unlinkIfPresent(target);
+      }
+    },
+  );
 
   it('bounds close by the caller deadline and preserves a failed close', async () => {
     const candidate = await startServer(async (payload) => {
