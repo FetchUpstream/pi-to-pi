@@ -64,7 +64,18 @@ function normalizeRawResponseLimit(value: number | undefined): number {
   return limit;
 }
 
+function retainSocketErrorUntilClose(socket: Socket): void {
+  const onError = (): void => undefined;
+  const onClose = (): void => {
+    socket.off('error', onError);
+    socket.off('close', onClose);
+  };
+  socket.on('error', onError);
+  socket.once('close', onClose);
+}
+
 function waitForSocketConnect(socket: Socket, signal: AbortSignal): Promise<void> {
+  retainSocketErrorUntilClose(socket);
   return new Promise<void>((resolve, reject) => {
     let settled = false;
     let removeAbortListener = (): void => undefined;
@@ -92,6 +103,7 @@ function waitForSocketConnect(socket: Socket, signal: AbortSignal): Promise<void
 }
 
 function writeSocketChunk(socket: Socket, chunk: string, signal: AbortSignal): Promise<void> {
+  retainSocketErrorUntilClose(socket);
   return new Promise<void>((resolve, reject) => {
     let settled = false;
     let removeAbortListener = (): void => undefined;
@@ -132,6 +144,7 @@ function writeSocketChunk(socket: Socket, chunk: string, signal: AbortSignal): P
 }
 
 function endSocket(socket: Socket, signal: AbortSignal): Promise<void> {
+  retainSocketErrorUntilClose(socket);
   return new Promise<void>((resolve, reject) => {
     let settled = false;
     let removeAbortListener = (): void => undefined;
@@ -183,6 +196,7 @@ function readRawHttp(
   maxResponseBytes: number,
   signal: AbortSignal,
 ): Promise<Buffer> {
+  retainSocketErrorUntilClose(socket);
   return new Promise<Buffer>((resolve, reject) => {
     const responseChunks: Buffer[] = [];
     let receivedBytes = 0;
@@ -453,7 +467,7 @@ describe('HTTP over local IPC comparison candidate', () => {
     }
   });
 
-  it('bounds endpoint cleanup by the caller deadline and preserves a failed close', async () => {
+  it('bounds close by the caller deadline and preserves a failed close', async () => {
     const candidate = await startServer((payload) => payload);
     if (process.platform === 'win32') {
       await candidate.server.close({ timeoutMs: 0 });
@@ -464,11 +478,11 @@ describe('HTTP over local IPC comparison candidate', () => {
       const firstClose = candidate.server.close({ timeoutMs: 0 });
       await expect(firstClose).rejects.toMatchObject({
         name: 'PhaseDeadlineExceededError',
-        phase: 'endpoint-cleanup',
+        phase: 'close',
       });
       await expect(candidate.server.close({ timeoutMs: 500 })).rejects.toMatchObject({
         name: 'PhaseDeadlineExceededError',
-        phase: 'endpoint-cleanup',
+        phase: 'close',
       });
     } finally {
       const index = runningServers.indexOf(candidate.server);

@@ -9,6 +9,7 @@
 import { link, lstat, rename, unlink } from 'node:fs/promises';
 import type { BigIntStats } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import type { EventEmitter } from 'node:events';
 import { createConnection, type Socket } from 'node:net';
 import { createServer, request as createRequest } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -40,7 +41,6 @@ export const DEFAULT_HTTP_READ_TIMEOUT_MS = 1_000;
 export const DEFAULT_HTTP_REQUEST_TIMEOUT_MS = 1_000;
 export const DEFAULT_HTTP_HANDLER_TIMEOUT_MS = 1_000;
 export const DEFAULT_HTTP_CLOSE_TIMEOUT_MS = 1_000;
-export const DEFAULT_HTTP_FORCE_CLOSE_TIMEOUT_MS = 250;
 
 const HTTP_METHOD = 'POST';
 const HTTP_PATH = '/';
@@ -165,6 +165,8 @@ type UnixSocketObjectIdentity = Omit<UnixSocketIdentity, 'ctimeNs'>;
 interface EndpointOperationLockOptions {
   readonly deadline?: ReturnType<typeof createPhaseDeadline>;
   readonly signal?: AbortSignal;
+  /** Keep the lock held until detached resource work has actually settled. */
+  readonly completion?: () => PromiseLike<unknown> | undefined;
 }
 
 interface NormalizedHttpIpcServerOptions {
@@ -202,11 +204,65 @@ async function withEndpointOperationLock<T>(
     }
     return await operation();
   } finally {
-    release();
-    if (endpointOperationLocks.get(endpoint) === current) {
-      endpointOperationLocks.delete(endpoint);
+    let completion: PromiseLike<unknown> | undefined;
+    try {
+      completion = lockOptions.completion?.();
+    } catch {
+      completion = undefined;
     }
+    void Promise.allSettled([
+      predecessor ?? Promise.resolve(),
+      completion ?? Promise.resolve(),
+    ]).then(() => {
+      release();
+      if (endpointOperationLocks.get(endpoint) === current) {
+        endpointOperationLocks.delete(endpoint);
+      }
+    });
   }
+}
+
+interface EndpointCleanupTracker {
+  readonly completion: Promise<void>;
+  readonly track: <T>(operation: PromiseLike<T>) => Promise<T>;
+  readonly finish: () => void;
+}
+
+function createEndpointCleanupTracker(): EndpointCleanupTracker {
+  let pending = 0;
+  let finished = false;
+  let resolveCompletion!: () => void;
+  const completion = new Promise<void>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  const settleIfFinished = (): void => {
+    if (finished && pending === 0) {
+      resolveCompletion();
+    }
+  };
+  const track = <T>(operation: PromiseLike<T>): Promise<T> => {
+    pending += 1;
+    const tracked = Promise.resolve(operation);
+    void tracked.then(
+      () => {
+        pending -= 1;
+        settleIfFinished();
+      },
+      () => {
+        pending -= 1;
+        settleIfFinished();
+      },
+    );
+    return tracked;
+  };
+  return {
+    completion,
+    track,
+    finish: () => {
+      finished = true;
+      settleIfFinished();
+    },
+  };
 }
 
 function normalizeByteLimit(value: number | undefined, fallback: number, label: string): number {
@@ -309,6 +365,25 @@ function responseBodyText(message: string): Buffer {
   return Buffer.from(message, 'utf8');
 }
 
+const retainedErrorObservers = new WeakSet<EventEmitter>();
+
+function retainErrorListenerUntilClose(
+  stream: EventEmitter & { readonly destroyed?: boolean; readonly closed?: boolean },
+): void {
+  if (stream.destroyed === true || stream.closed === true || retainedErrorObservers.has(stream)) {
+    return;
+  }
+  retainedErrorObservers.add(stream);
+  const onError = (): void => undefined;
+  const onClose = (): void => {
+    retainedErrorObservers.delete(stream);
+    stream.off('error', onError);
+    stream.off('close', onClose);
+  };
+  stream.on('error', onError);
+  stream.once('close', onClose);
+}
+
 function writeHttpResponse(
   response: ServerResponse,
   body: Buffer,
@@ -330,6 +405,7 @@ function writeHttpResponse(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(response);
       cleanup();
       resolve();
     };
@@ -338,6 +414,7 @@ function writeHttpResponse(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(response);
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
@@ -396,6 +473,7 @@ function writeSocketAndEnd(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(socket);
       cleanup();
       resolve();
     };
@@ -404,6 +482,7 @@ function writeSocketAndEnd(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(socket);
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
@@ -525,6 +604,7 @@ async function collectRequestBody(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(request);
       cleanup();
       resolve(Buffer.concat(chunks, receivedBytes));
     };
@@ -533,6 +613,7 @@ async function collectRequestBody(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(request);
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
@@ -563,7 +644,7 @@ async function collectRequestBody(
       settleFailure(error);
     };
     const onClose = (): void => {
-      if (!settled && !request.complete) {
+      if (!settled) {
         settleFailure(new HttpIpcProtocolError('HTTP request closed before its body completed'));
       }
     };
@@ -606,17 +687,35 @@ async function handleRequest(
   const onRequestAborted = (): void => {
     if (!request.complete) {
       lifecycleController.abort(new AbortError('HTTP request was aborted'));
+      if (!response.destroyed) {
+        response.destroy();
+      }
     }
   };
   const onRequestError = (error: Error): void => {
     lifecycleController.abort(new AbortError(error.message, error));
+    if (!request.destroyed) {
+      request.destroy();
+    }
+    if (!response.destroyed) {
+      response.destroy();
+    }
   };
   const onResponseError = (error: Error): void => {
     lifecycleController.abort(new AbortError(error.message, error));
+    if (!request.destroyed) {
+      request.destroy();
+    }
+    if (!response.destroyed) {
+      response.destroy();
+    }
   };
   const onResponseClose = (): void => {
     if (!response.writableEnded) {
       lifecycleController.abort(new AbortError('HTTP response was closed'));
+      if (!request.destroyed) {
+        request.destroy();
+      }
     }
   };
 
@@ -743,6 +842,8 @@ async function handleRequest(
     );
     destroyRequestAfterResponse(request, response);
   } finally {
+    retainErrorListenerUntilClose(request);
+    retainErrorListenerUntilClose(response);
     removeShutdownAbort();
     request.off('aborted', onRequestAborted);
     request.off('error', onRequestError);
@@ -751,11 +852,18 @@ async function handleRequest(
   }
 }
 
-async function captureOwnedUnixSocket(endpoint: string): Promise<UnixSocketIdentity | undefined> {
+async function captureOwnedUnixSocket(
+  endpoint: string,
+  deadline: ReturnType<typeof createPhaseDeadline>,
+  signal: AbortSignal,
+  tracker: EndpointCleanupTracker,
+): Promise<UnixSocketIdentity | undefined> {
   if (process.platform === 'win32' || endpointKind(endpoint) !== 'unix-socket') {
     return undefined;
   }
-  const stat = await lstat(endpoint, { bigint: true });
+  const stat = await withDeadline(tracker.track(lstat(endpoint, { bigint: true })), deadline, {
+    signal,
+  });
   if (!stat.isSocket()) {
     throw new HttpIpcProtocolError('HTTP IPC endpoint is not a Unix socket after listening');
   }
@@ -807,6 +915,8 @@ type UnixListenerProbeResult = 'live' | 'stale' | 'unknown';
 
 function classifyUnixListenerProbeError(error: unknown): UnixListenerProbeResult {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  // ECONNREFUSED/ENOENT are the only probe outcomes that establish that no
+  // listener accepted this connection attempt. All other failures are unknown.
   if (code === 'ECONNREFUSED' || code === 'ENOENT') {
     return 'stale';
   }
@@ -822,33 +932,45 @@ async function hasLiveUnixListener(
   endpoint: string,
   deadline: ReturnType<typeof createPhaseDeadline>,
   signal: AbortSignal,
+  tracker: EndpointCleanupTracker,
 ): Promise<UnixListenerProbeResult> {
   let probe: Socket | undefined;
   let removeAbort = (): void => undefined;
   let cleanupProbeListeners = (): void => undefined;
   const completion = new Promise<UnixListenerProbeResult>((resolve) => {
     let settled = false;
-    const finish = (result: UnixListenerProbeResult): void => {
+    let result: UnixListenerProbeResult | undefined;
+    const finish = (probeResult: UnixListenerProbeResult): void => {
       if (settled) {
         return;
       }
       settled = true;
+      result = probeResult;
+      resolve(probeResult);
+    };
+    const onConnect = (): void => {
+      result = 'live';
       if (probe !== undefined && !probe.destroyed) {
         probe.destroy();
       }
-      resolve(result);
     };
-    const onConnect = (): void => finish('live');
-    const onError = (error: Error): void => finish(classifyUnixListenerProbeError(error));
-    const onClose = (): void => finish('unknown');
+    const onError = (error: Error): void => {
+      result = classifyUnixListenerProbeError(error);
+      if (probe !== undefined && !probe.destroyed) {
+        probe.destroy();
+      }
+    };
+    const onClose = (): void => {
+      finish(result ?? 'unknown');
+    };
 
     try {
       probe = createConnection(endpoint);
       probe.once('connect', onConnect);
-      probe.on('error', onError);
+      probe.once('error', onError);
       probe.once('close', onClose);
-    } catch (error: unknown) {
-      finish(classifyUnixListenerProbeError(error));
+    } catch {
+      finish('unknown');
     }
 
     cleanupProbeListeners = (): void => {
@@ -865,11 +987,14 @@ async function hasLiveUnixListener(
   };
   removeAbort = onAbort(signal, destroyProbe);
   try {
-    return await withDeadline(completion, deadline, {
+    return await withDeadline(tracker.track(completion), deadline, {
       signal,
       onTimeout: destroyProbe,
     });
   } finally {
+    if (probe !== undefined) {
+      retainErrorListenerUntilClose(probe);
+    }
     removeAbort();
     destroyProbe();
     cleanupProbeListeners();
@@ -881,65 +1006,79 @@ async function restoreQuarantinedUnixSocket(
   quarantine: string,
   identity: UnixSocketIdentity,
   deadline: ReturnType<typeof createPhaseDeadline>,
+  signal: AbortSignal,
+  tracker: EndpointCleanupTracker,
 ): Promise<void> {
+  throwIfAborted(signal);
   let quarantinedStat: BigIntStats;
   try {
-    quarantinedStat = await withDeadline(lstat(quarantine, { bigint: true }), deadline);
+    quarantinedStat = await withDeadline(
+      tracker.track(lstat(quarantine, { bigint: true })),
+      deadline,
+      { signal },
+    );
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return;
     }
     throw error;
   }
+  throwIfAborted(signal);
 
   const quarantinedIsOwned =
     quarantinedStat.isSocket() && sameUnixSocketObjectIdentity(quarantinedStat, identity);
   if (quarantinedIsOwned) {
     let endpointStat: BigIntStats | undefined;
     try {
-      endpointStat = await withDeadline(lstat(endpoint, { bigint: true }), deadline);
+      endpointStat = await withDeadline(
+        tracker.track(lstat(endpoint, { bigint: true })),
+        deadline,
+        { signal },
+      );
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw error;
       }
     }
+    throwIfAborted(signal);
     if (endpointStat === undefined) {
       try {
-        await withDeadline(link(quarantine, endpoint), deadline);
+        await withDeadline(tracker.track(link(quarantine, endpoint)), deadline, { signal });
       } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-          return;
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw error;
         }
-        throw error;
       }
     }
-    try {
-      await withDeadline(unlink(quarantine), deadline);
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw error;
-      }
-    }
+    await withDeadline(tracker.track(unlink(quarantine)), deadline, { signal }).catch(
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error;
+        }
+      },
+    );
     return;
   }
 
   // A different inode was moved by the race. Restore it only if the endpoint
   // is still vacant; never overwrite or unlink a replacement listener.
   try {
-    await withDeadline(link(quarantine, endpoint), deadline);
+    await withDeadline(tracker.track(link(quarantine, endpoint)), deadline, { signal });
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      return;
+      throw new HttpIpcProtocolError(
+        'HTTP IPC endpoint quarantine contains a replacement-owned socket',
+      );
     }
     throw error;
   }
-  try {
-    await withDeadline(unlink(quarantine), deadline);
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error;
-    }
-  }
+  await withDeadline(tracker.track(unlink(quarantine)), deadline, { signal }).catch(
+    (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+    },
+  );
 }
 
 async function removeOwnedUnixSocketWithinDeadline(
@@ -947,11 +1086,14 @@ async function removeOwnedUnixSocketWithinDeadline(
   identity: UnixSocketIdentity,
   deadline: ReturnType<typeof createPhaseDeadline>,
   signal: AbortSignal,
+  tracker: EndpointCleanupTracker,
 ): Promise<void> {
   throwIfAborted(signal);
   let stat: BigIntStats;
   try {
-    stat = await lstat(endpoint, { bigint: true });
+    stat = await withDeadline(tracker.track(lstat(endpoint, { bigint: true })), deadline, {
+      signal,
+    });
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return;
@@ -962,12 +1104,17 @@ async function removeOwnedUnixSocketWithinDeadline(
   if (!stat.isSocket() || !sameUnixSocketIdentity(stat, identity)) {
     return;
   }
-  const firstProbe = await hasLiveUnixListener(endpoint, deadline, signal);
-  if (firstProbe !== 'stale') {
+  const firstProbe = await hasLiveUnixListener(endpoint, deadline, signal, tracker);
+  if (firstProbe === 'unknown') {
+    throw new HttpIpcProtocolError('HTTP IPC endpoint listener probe was inconclusive');
+  }
+  if (firstProbe === 'live') {
     return;
   }
   throwIfAborted(signal);
-  const finalStat = await lstat(endpoint, { bigint: true }).catch((error: unknown) => {
+  const finalStat = await withDeadline(tracker.track(lstat(endpoint, { bigint: true })), deadline, {
+    signal,
+  }).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return undefined;
     }
@@ -981,8 +1128,11 @@ async function removeOwnedUnixSocketWithinDeadline(
   ) {
     return;
   }
-  const finalProbe = await hasLiveUnixListener(endpoint, deadline, signal);
-  if (finalProbe !== 'stale') {
+  const finalProbe = await hasLiveUnixListener(endpoint, deadline, signal, tracker);
+  if (finalProbe === 'unknown') {
+    throw new HttpIpcProtocolError('HTTP IPC endpoint listener probe was inconclusive');
+  }
+  if (finalProbe === 'live') {
     return;
   }
   throwIfAborted(signal);
@@ -993,7 +1143,7 @@ async function removeOwnedUnixSocketWithinDeadline(
   let quarantineCreated = false;
   try {
     try {
-      await rename(endpoint, quarantine);
+      await withDeadline(tracker.track(rename(endpoint, quarantine)), deadline, { signal });
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return;
@@ -1004,16 +1154,20 @@ async function removeOwnedUnixSocketWithinDeadline(
     // This check intentionally lives inside the recovery scope: if cancellation
     // races with rename, restoreQuarantinedUnixSocket releases the quarantine.
     throwIfAborted(signal);
-    const quarantinedStat = await lstat(quarantine, { bigint: true });
+    const quarantinedStat = await withDeadline(
+      tracker.track(lstat(quarantine, { bigint: true })),
+      deadline,
+      { signal },
+    );
     throwIfAborted(signal);
     if (quarantinedStat.isSocket() && sameUnixSocketObjectIdentity(quarantinedStat, identity)) {
-      try {
-        await unlink(quarantine);
-      } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw error;
-        }
-      }
+      await withDeadline(tracker.track(unlink(quarantine)), deadline, { signal }).catch(
+        (error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error;
+          }
+        },
+      );
       quarantineCreated = false;
       return;
     }
@@ -1021,25 +1175,34 @@ async function removeOwnedUnixSocketWithinDeadline(
     // A different inode was moved by the race. Restore it without replacing an
     // endpoint that another listener may have claimed while the path was absent.
     try {
-      await link(quarantine, endpoint);
+      await withDeadline(tracker.track(link(quarantine, endpoint)), deadline, { signal });
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        return;
+        throw new HttpIpcProtocolError(
+          'HTTP IPC endpoint replacement owns the path; quarantine was retained',
+        );
       }
       throw error;
     }
-    try {
-      await unlink(quarantine);
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw error;
-      }
-    }
+    await withDeadline(tracker.track(unlink(quarantine)), deadline, { signal }).catch(
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error;
+        }
+      },
+    );
     quarantineCreated = false;
   } catch (error: unknown) {
     if (quarantineCreated) {
       try {
-        await restoreQuarantinedUnixSocket(endpoint, quarantine, identity, deadline);
+        await restoreQuarantinedUnixSocket(
+          endpoint,
+          quarantine,
+          identity,
+          deadline,
+          signal,
+          tracker,
+        );
       } catch (recoveryError: unknown) {
         throw new AggregateError(
           [error, recoveryError],
@@ -1057,6 +1220,7 @@ async function removeOwnedUnixSocket(
   identity: UnixSocketIdentity | undefined,
   timeoutMs: number,
   signal?: AbortSignal,
+  deadlineOverride?: ReturnType<typeof createPhaseDeadline>,
 ): Promise<void> {
   if (
     identity === undefined ||
@@ -1066,17 +1230,40 @@ async function removeOwnedUnixSocket(
     return;
   }
 
-  const deadline = createPhaseDeadline('endpoint-cleanup', timeoutMs);
+  const deadline = deadlineOverride ?? createPhaseDeadline('endpoint-cleanup', timeoutMs);
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanupTracker = createEndpointCleanupTracker();
   await withEndpointOperationLock(
     endpoint,
     () =>
       withDeadline(
-        (operationSignal) =>
-          removeOwnedUnixSocketWithinDeadline(endpoint, identity, deadline, operationSignal),
+        (operationSignal) => {
+          cleanupPromise = removeOwnedUnixSocketWithinDeadline(
+            endpoint,
+            identity,
+            deadline,
+            operationSignal,
+            cleanupTracker,
+          );
+          void cleanupPromise.then(
+            () => cleanupTracker.finish(),
+            () => cleanupTracker.finish(),
+          );
+          return cleanupPromise;
+        },
         deadline,
         { signal },
       ),
-    { deadline, signal },
+    {
+      deadline,
+      signal,
+      completion: () => {
+        if (cleanupPromise === undefined) {
+          cleanupTracker.finish();
+        }
+        return cleanupTracker.completion;
+      },
+    },
   );
 }
 
@@ -1170,6 +1357,8 @@ async function closeServer(
     DEFAULT_HTTP_CLOSE_TIMEOUT_MS,
     'closeTimeoutMs',
   );
+  const closeDeadline = createPhaseDeadline('close', timeoutMs);
+  const cleanupDeadline = { phase: 'endpoint-cleanup', at: closeDeadline.at };
   const shutdownError = new AbortError('HTTP IPC server is closing');
   shutdownController.abort(shutdownError);
   for (const controller of activeRequests) {
@@ -1202,35 +1391,23 @@ async function closeServer(
   let closeFailure: unknown;
   let resourcesConfirmed = false;
   try {
-    await withPhaseDeadline('close', timeoutMs, waitForResources, {
+    await withDeadline(waitForResources, closeDeadline, {
       onTimeout: () => forceCloseServer(server, sockets),
     });
     resourcesConfirmed = true;
   } catch (error: unknown) {
+    // The caller's absolute close deadline is terminal. Force-close resources
+    // for eventual cleanup, but never turn a late cleanup into success.
+    closeFailure = error;
     if (error instanceof PhaseDeadlineExceededError) {
       forceCloseServer(server, sockets);
-      try {
-        await withPhaseDeadline(
-          'close-force',
-          DEFAULT_HTTP_FORCE_CLOSE_TIMEOUT_MS,
-          waitForResources,
-          { onTimeout: () => forceCloseServer(server, sockets) },
-        );
-        resourcesConfirmed = true;
-      } catch (forceError: unknown) {
-        // Do not clean the endpoint or report a successful close when the
-        // forced resource-completion phase itself exceeded its deadline.
-        closeFailure = forceError;
-      }
-    } else {
-      closeFailure = error;
     }
   }
 
   let cleanupFailure: unknown;
   if (resourcesConfirmed) {
     try {
-      await removeOwnedUnixSocket(endpoint, identity, timeoutMs);
+      await removeOwnedUnixSocket(endpoint, identity, timeoutMs, undefined, cleanupDeadline);
     } catch (error: unknown) {
       cleanupFailure = error;
     }
@@ -1322,9 +1499,11 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
   server.maxRequestsPerSocket = 1;
   server.requestTimeout = Math.max(1, normalized.requestTimeoutMs);
   server.headersTimeout = Math.max(1, normalized.requestTimeoutMs);
+  server.on('error', () => undefined);
   server.on('connection', (socket) => {
     counters.connectionCount += 1;
     sockets.add(socket);
+    retainErrorListenerUntilClose(socket);
 
     let settleHeaderDeadline = (): void => undefined;
     const completion = new Promise<void>((resolve) => {
@@ -1368,23 +1547,65 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
 
   let ownedEndpoint: UnixSocketIdentity | undefined;
   const startedAt = performance.now();
+  const startupDeadline = createPhaseDeadline('endpoint-startup', DEFAULT_HTTP_CLOSE_TIMEOUT_MS);
+  const startupTracker = createEndpointCleanupTracker();
+  let startupPromise: Promise<void> | undefined;
+  const abortStartup = (): void => {
+    try {
+      server.close(() => undefined);
+    } catch {
+      // Startup cleanup is retried by closeServer below.
+    }
+  };
   try {
-    await withEndpointOperationLock(normalized.endpoint, async () => {
-      await new Promise<void>((resolve, reject) => {
-        const onListening = (): void => {
-          server.off('error', onError);
-          resolve();
-        };
-        const onError = (error: Error): void => {
-          server.off('listening', onListening);
-          reject(error);
-        };
-        server.once('listening', onListening);
-        server.once('error', onError);
-        server.listen(normalized.endpoint);
-      });
-      ownedEndpoint = await captureOwnedUnixSocket(normalized.endpoint);
-    });
+    await withEndpointOperationLock(
+      normalized.endpoint,
+      () => {
+        startupPromise = withDeadline(
+          async (startupSignal) => {
+            const listening = new Promise<void>((resolve, reject) => {
+              const onListening = (): void => {
+                server.off('error', onError);
+                resolve();
+              };
+              const onError = (error: Error): void => {
+                server.off('listening', onListening);
+                reject(error);
+              };
+              server.once('listening', onListening);
+              server.once('error', onError);
+              server.listen(normalized.endpoint);
+            });
+            await withDeadline(startupTracker.track(listening), startupDeadline, {
+              signal: startupSignal,
+              onTimeout: abortStartup,
+            });
+            ownedEndpoint = await captureOwnedUnixSocket(
+              normalized.endpoint,
+              startupDeadline,
+              startupSignal,
+              startupTracker,
+            );
+          },
+          startupDeadline,
+          { onTimeout: abortStartup },
+        );
+        void startupPromise.then(
+          () => startupTracker.finish(),
+          () => startupTracker.finish(),
+        );
+        return startupPromise;
+      },
+      {
+        deadline: startupDeadline,
+        completion: () => {
+          if (startupPromise === undefined) {
+            startupTracker.finish();
+          }
+          return startupTracker.completion;
+        },
+      },
+    );
   } catch (error: unknown) {
     try {
       await closeServer(
@@ -1499,6 +1720,7 @@ function waitForSocketConnected(
     };
     const onSocket = (candidate: Socket): void => {
       socket = candidate;
+      retainErrorListenerUntilClose(candidate);
       assignSocket(candidate);
       candidate.once('connect', onConnect);
       candidate.once('error', onError);
@@ -1532,6 +1754,7 @@ function sendRequestAndWaitForFinish(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(request);
       cleanup();
       resolve();
     };
@@ -1540,6 +1763,7 @@ function sendRequestAndWaitForFinish(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(request);
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
@@ -1576,6 +1800,7 @@ function waitForResponse(request: ClientRequest, signal: AbortSignal): Promise<I
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(request);
       cleanup();
       resolve(response);
     };
@@ -1584,6 +1809,7 @@ function waitForResponse(request: ClientRequest, signal: AbortSignal): Promise<I
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(request);
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
@@ -1605,6 +1831,7 @@ async function readHttpResponse(
   maxResponseBytes: number,
   signal: AbortSignal,
 ): Promise<HttpIpcResponse> {
+  retainErrorListenerUntilClose(response);
   const declaredLength = parseContentLength(response.headers, 'HTTP response');
   if (declaredLength !== undefined && declaredLength > maxResponseBytes) {
     throw new HttpIpcBodyLimitError('response', maxResponseBytes, declaredLength);
@@ -1629,6 +1856,7 @@ async function readHttpResponse(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(response);
       cleanup();
       resolve({
         statusCode: response.statusCode ?? 0,
@@ -1641,6 +1869,7 @@ async function readHttpResponse(
         return;
       }
       settled = true;
+      retainErrorListenerUntilClose(response);
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
@@ -1672,7 +1901,7 @@ async function readHttpResponse(
       settleFailure(error);
     };
     const onClose = (): void => {
-      if (!settled && !response.complete) {
+      if (!settled) {
         settleFailure(new HttpIpcProtocolError('HTTP response closed before its body completed'));
       }
     };
@@ -1778,6 +2007,7 @@ export async function requestHttpIpcResponse(
       settleFailure(error);
     };
     const captureResponse = (response: IncomingMessage): void => {
+      retainErrorListenerUntilClose(response);
       if (settled) {
         response.resume();
         response.destroy();

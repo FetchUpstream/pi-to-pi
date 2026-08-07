@@ -25,8 +25,6 @@ also requires a real Windows run before it can be treated as portable. The
 length-prefixed `node:net` candidate remains the selected raw transport; this
 comparison does not change it.
 
-Baseline candidate commit: `f30e4ca6e2eadc5342c6c22d53ca20b6732f8e5b`; integrated evidence-correction commit: `c5a209515e722402e41d7fe6f2c3ac6799b03b92` (included in merge `0e0b23f58ec5c5b0cb4cafecc9b9754f8139371c`).
-
 ## Bounded behavior evidence
 
 The focused suite is `tests/fixtures/local-ipc-http/http-candidate.test.ts`.
@@ -45,12 +43,6 @@ all 12 tests passed. The checks cover:
 | HTTP parser/framing    | HTTP headers and chunked body sent in separate client writes are parsed; malformed input receives 400; truncated `Content-Length` input does not invoke the handler | PASS         |
 | Concurrent requests    | Three independent connections complete concurrently with response association preserved                                                                             | PASS         |
 | Cleanup/keep-alive     | `Connection: close`, disabled keep-alive, tracked active sockets, bounded close, and POSIX socket removal                                                           | PASS         |
-
-The candidate exposes `startupMs`, measured from the `listen()` call until the
-`listening` event. A separate 10-run Linux sample over fresh endpoints recorded
-0.031–0.663 ms (mean 0.100 ms) for the server bind/listen phase. This is not a
-process-start measurement; it isolates endpoint startup and is reported so the
-HTTP layer's startup cost is not confused with client request latency.
 
 ## HTTP-specific observations
 
@@ -86,6 +78,8 @@ tracks accepted sockets, stops accepting on `close()`, destroys remaining
 connections after the finite close deadline, and removes only the owned POSIX
 socket if Node has not already removed it. A Windows named pipe is not treated
 as a filesystem path and has no POSIX unlink step.
+An inconclusive Unix listener probe remains unknown and causes cleanup to fail
+conservatively; only a definitive no-listener result can authorize quarantine/unlink.
 
 HTTP has a more involved lifecycle than the raw one-frame exchange: status
 codes and headers must be interpreted, body streams must end, parser aborts
@@ -93,6 +87,13 @@ must be handled, and keep-alive must be actively disabled. `agent: false`,
 `Connection: close`, `keepAliveTimeout = 0`, and `maxRequestsPerSocket = 1`
 make the lifecycle bounded for this candidate; persistent HTTP connections are
 not part of the comparison target.
+
+Response write paths observe `finish`, `error`, and `close`; request/response read
+paths observe `end`/`aborted`, `error`, and `close`. Abort and timeout paths destroy
+the affected stream and retain an error observer until `close` so late EventEmitter
+errors are not unhandled. Server resource shutdown and owned POSIX endpoint cleanup
+share the caller's absolute close deadline; a deadline failure remains a failure even
+if forced destruction completes later.
 
 ### Debugging/tooling benefit
 
