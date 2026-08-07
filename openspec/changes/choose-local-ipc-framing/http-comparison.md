@@ -25,7 +25,7 @@ also requires a real Windows run before it can be treated as portable. The
 length-prefixed `node:net` candidate remains the selected raw transport; this
 comparison does not change it.
 
-Implementation candidate/test commit: `f30e4ca6e2eadc5342c6c22d53ca20b6732f8e5b`.
+Baseline candidate commit: `f30e4ca6e2eadc5342c6c22d53ca20b6732f8e5b`; integrated evidence-correction commit: `c5a209515e722402e41d7fe6f2c3ac6799b03b92` (included in merge `0e0b23f58ec5c5b0cb4cafecc9b9754f8139371c`).
 
 ## Bounded behavior evidence
 
@@ -33,18 +33,18 @@ The focused suite is `tests/fixtures/local-ipc-http/http-candidate.test.ts`.
 On this Linux runner (`node v25.0.0`, repository minimum `node >=22.19.0`),
 all 10 tests passed. The checks cover:
 
-| Behavior               | Evidence                                                                                                                                                       | Linux result |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| Normal operation       | Native Unix socket round trip with opaque bytes                                                                                                                | PASS         |
-| Request body limit     | `Content-Length` is rejected with HTTP 413 before the handler is called; a split chunked body is parsed and delivered to the handler                           | PASS         |
-| Response body limit    | Client rejects `HttpIpcBodyLimitError` before retaining a response over its configured limit; raw capture rejects once its configured response cap is exceeded | PASS         |
-| Connect deadline/error | Unavailable generated endpoint fails with a finite connect deadline                                                                                            | PASS         |
-| Write deadline         | A zero-millisecond write phase rejects with `PhaseDeadlineExceededError` before sending the body                                                               | PASS         |
-| Read deadline          | Delayed handler response exceeds an absolute read deadline; no slow-drip response peer was exercised                                                           | PASS         |
-| Cancellation           | Caller `AbortSignal` rejects with `AbortError` and destroys the request/socket                                                                                 | PASS         |
-| HTTP parser/framing    | Split header/body and chunked input are parsed; malformed input receives 400; truncated `Content-Length` input does not invoke the handler                     | PASS         |
-| Concurrent requests    | Three independent connections complete concurrently with response association preserved                                                                        | PASS         |
-| Cleanup/keep-alive     | `Connection: close`, disabled keep-alive, tracked active sockets, bounded close, and POSIX socket removal                                                      | PASS         |
+| Behavior               | Evidence                                                                                                                                                            | Linux result |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| Normal operation       | Native Unix socket round trip with opaque bytes                                                                                                                     | PASS         |
+| Request body limit     | `Content-Length` is rejected with HTTP 413 before the handler is called; a chunked body sent in separate client writes is parsed and delivered to the handler       | PASS         |
+| Response body limit    | Client rejects `HttpIpcBodyLimitError` before retaining a response over its configured limit; raw capture rejects once its configured response cap is exceeded      | PASS         |
+| Connect deadline/error | Unavailable generated endpoint fails with a finite connect deadline                                                                                                 | PASS         |
+| Write deadline         | A zero-millisecond write phase rejects with `PhaseDeadlineExceededError` before sending the body                                                                    | PASS         |
+| Read deadline          | Delayed handler response exceeds an absolute read deadline; no slow-drip response peer was exercised                                                                | PASS         |
+| Cancellation           | Caller `AbortSignal` rejects with `AbortError` and destroys the request/socket                                                                                      | PASS         |
+| HTTP parser/framing    | HTTP headers and chunked body sent in separate client writes are parsed; malformed input receives 400; truncated `Content-Length` input does not invoke the handler | PASS         |
+| Concurrent requests    | Three independent connections complete concurrently with response association preserved                                                                             | PASS         |
+| Cleanup/keep-alive     | `Connection: close`, disabled keep-alive, tracked active sockets, bounded close, and POSIX socket removal                                                           | PASS         |
 
 The candidate exposes `startupMs`, measured from the `listen()` call until the
 `listening` event. A separate 10-run Linux sample over fresh endpoints recorded
@@ -67,7 +67,7 @@ wire contract larger and dependent on HTTP parser behavior.
 
 The server performs a numeric `Content-Length` check before retaining a body and
 bounds chunked accumulation at the configured request limit. The focused suite
-verifies the `Content-Length` rejection and parses a split chunked request; it
+verifies the `Content-Length` rejection and parsing of a chunked request sent in separate client writes; it
 does not independently stress an oversized chunked body. The client similarly
 bounds response accumulation. Node's parser rejects malformed HTTP syntax and
 emits `clientError`; an incomplete body emits an aborted request or response

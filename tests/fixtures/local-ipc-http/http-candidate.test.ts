@@ -240,6 +240,11 @@ function readRawHttp(
     if (settled) {
       return;
     }
+    if (socket.readableEnded) {
+      onEnd();
+    } else if (socket.destroyed || socket.readyState === 'closed') {
+      onClose();
+    }
   });
 }
 
@@ -250,6 +255,7 @@ async function sendRawHttp(
 ): Promise<Buffer> {
   const maxResponseBytes = normalizeRawResponseLimit(options.maxResponseBytes);
   const socket = createConnection(endpoint);
+  const responseController = new AbortController();
   socket.on('error', () => undefined);
   try {
     await withPhaseDeadline(
@@ -258,6 +264,8 @@ async function sendRawHttp(
       (signal) => waitForSocketConnect(socket, signal),
       { signal: options.signal, onTimeout: () => socket.destroy() },
     );
+    const responsePromise = readRawHttp(socket, maxResponseBytes, responseController.signal);
+    void responsePromise.catch(() => undefined);
     await withPhaseDeadline(
       'write',
       options.writeTimeoutMs ?? DEFAULT_HTTP_WRITE_TIMEOUT_MS,
@@ -267,10 +275,17 @@ async function sendRawHttp(
     return await withPhaseDeadline(
       'read',
       options.readTimeoutMs ?? DEFAULT_HTTP_READ_TIMEOUT_MS,
-      (signal) => readRawHttp(socket, maxResponseBytes, signal),
-      { signal: options.signal, onTimeout: () => socket.destroy() },
+      responsePromise,
+      {
+        signal: options.signal,
+        onTimeout: () => {
+          responseController.abort();
+          socket.destroy();
+        },
+      },
     );
   } finally {
+    responseController.abort();
     socket.destroy();
   }
 }
