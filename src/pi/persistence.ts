@@ -70,7 +70,7 @@ export type RuntimeShutdownTaskHook = (
   task: Omit<RuntimeShutdownTask, 'delivery' | 'deliveryError'>,
 ) => RuntimeShutdownHookResult | PromiseLike<RuntimeShutdownHookResult>;
 /** Synchronously fences resources owned by this runtime before stores are disposed. */
-export type RuntimePersistenceOwnerShutdownHook = () => void;
+export type RuntimePersistenceOwnerShutdownHook = (graceful?: boolean) => void;
 export interface RuntimeShutdownOptions {
   /** Graceful shutdown attempts system-generated terminal signals. */
   readonly graceful?: boolean;
@@ -97,6 +97,10 @@ export interface RuntimeOperationGuardState {
   /** Keys are the sender runtime generation plus the wire operation ID. */
   readonly acceptedOperations: Map<string, AcceptedOperationRecord>;
   readonly unreachableResults: Map<string, UnreachableRecord>;
+  /** Non-retryable expiry tombstones retained through the original deadline plus grace. */
+  readonly expiredResults: Map<string, ExpiredRecord>;
+  /** Operation-ID aliases retained across sender runtime generations. */
+  readonly operationAliases: Map<string, RuntimeOperationAliasRecord>;
 }
 
 export interface RuntimeIdentityHistory {
@@ -111,9 +115,12 @@ export interface RuntimeDestinationGuardRecord {
   readonly recipientRuntimeId: string;
   /** Sender runtime ID is the generation fence for this transport-independent guard. */
   readonly generation: string | number;
+  /** The original absolute deadline; retries must not replace it. */
+  readonly deadlineAt: number;
   readonly retainedUntil: number;
-  state: 'pending' | 'delivered' | 'unreachable';
+  state: 'pending' | 'delivered' | 'unreachable' | 'expired';
   unreachableMessage?: string;
+  expiredMessage?: string;
   timer?: unknown;
   clearTimeout?: RuntimePersistenceClearTimeout;
 }
@@ -124,6 +131,33 @@ const destinationGuardStates = new WeakMap<
 >();
 export function runtimeOperationGuardKey(senderRuntimeId: string, operationId: string): string {
   return `${senderRuntimeId}\u0000${operationId}`;
+}
+export function runtimeOperationAliasKey(operationId: string, recipientRuntimeId?: string): string {
+  return `${recipientRuntimeId ?? ''}\u0000${operationId}`;
+}
+function operationAliasFor(
+  aliases: Map<string, RuntimeOperationAliasRecord>,
+  operationId: string,
+  senderRuntimeId: string,
+  recipientRuntimeId?: string,
+): RuntimeOperationAliasRecord | undefined {
+  const exact = aliases.get(runtimeOperationAliasKey(operationId, recipientRuntimeId));
+  if (exact !== undefined) {
+    return exact;
+  }
+  for (const candidate of aliases.values()) {
+    if (candidate.operationId !== operationId) {
+      continue;
+    }
+    if (
+      candidate.senderRuntimeId === recipientRuntimeId &&
+      candidate.recipientRuntimeId === senderRuntimeId
+    ) {
+      continue;
+    }
+    return candidate;
+  }
+  return undefined;
 }
 
 /** Return the destination state machine associated with one guard state object. */
@@ -189,6 +223,28 @@ export interface RuntimeUnreachableResult {
   readonly generation?: string;
 }
 
+export interface RuntimeExpiredResult {
+  readonly status: 'expired';
+  readonly operationId: string;
+  readonly error: ProtocolError & { readonly code: 'expired' };
+  readonly recipientRuntimeId?: string;
+  readonly senderRuntimeId?: string;
+  readonly generation?: string;
+}
+
+export interface RuntimeOperationAliasRecord {
+  readonly operationId: string;
+  readonly senderRuntimeId: string;
+  readonly recipientRuntimeId?: string;
+  readonly generation: string;
+  readonly deadlineAt: number;
+  readonly retainedUntil: number;
+  state: 'accepted' | 'delivered' | 'unreachable' | 'expired';
+  stale: boolean;
+  timer?: unknown;
+  clearTimeout?: RuntimePersistenceClearTimeout;
+}
+
 /** Error raised when a closed runtime or a stale operation is used. */
 export class RuntimePersistenceError extends Error {
   readonly code: 'closed' | 'stale_operation' | 'identity_conflict' | 'busy';
@@ -214,6 +270,7 @@ export interface AcceptedOperationRecord {
   readonly senderRuntimeId: string;
   /** Sender runtime ID is also the generation fence for this guard. */
   readonly generation: string;
+  readonly deadlineAt: number;
   readonly retainedUntil: number;
   stale: boolean;
   timer?: unknown;
@@ -224,6 +281,18 @@ export interface UnreachableRecord {
   readonly senderRuntimeId: string;
   /** Sender runtime ID is also the generation fence for this guard. */
   readonly generation: string;
+  readonly deadlineAt: number;
+  readonly recipientRuntimeId?: string;
+  readonly message: string;
+  readonly retainedUntil: number;
+  timer?: unknown;
+  clearTimeout?: RuntimePersistenceClearTimeout;
+}
+export interface ExpiredRecord {
+  readonly value: RuntimeExpiredResult;
+  readonly senderRuntimeId: string;
+  readonly generation: string;
+  readonly deadlineAt: number;
   readonly recipientRuntimeId?: string;
   readonly message: string;
   readonly retainedUntil: number;
@@ -265,6 +334,55 @@ function finiteNow(value: number): number {
     throw new RangeError('runtime persistence clock must return a finite number');
   }
   return value;
+}
+
+const monotonicClocks = new WeakSet<() => number>();
+/** Wrap a wall-clock source so regressions cannot move runtime deadlines backward. */
+export function createMonotonicClock(clock: () => number): () => number {
+  if (monotonicClocks.has(clock)) {
+    return clock;
+  }
+  const initialWall = finiteNow(clock());
+  const performanceNow = globalThis.performance?.now;
+  const initialMonotonic =
+    typeof performanceNow === 'function' ? performanceNow.call(globalThis.performance) : undefined;
+  let last = initialWall;
+  const monotonic = (): number => {
+    const wall = finiteNow(clock());
+    const currentMonotonic =
+      initialMonotonic === undefined || typeof globalThis.performance?.now !== 'function'
+        ? undefined
+        : globalThis.performance.now();
+    const elapsedEpoch =
+      initialMonotonic === undefined ||
+      currentMonotonic === undefined ||
+      !Number.isFinite(currentMonotonic)
+        ? wall
+        : initialWall + Math.max(0, currentMonotonic - initialMonotonic);
+    last = Math.max(last, wall, elapsedEpoch);
+    return last;
+  };
+  monotonicClocks.add(monotonic);
+  return monotonic;
+}
+
+function deepSnapshot<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  const existing = seen.get(value);
+  if (existing !== undefined) {
+    return existing as T;
+  }
+  const snapshot = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, snapshot);
+  for (const key of Object.keys(value as object)) {
+    (snapshot as Record<string, unknown>)[key] = deepSnapshot(
+      (value as Record<string, unknown>)[key],
+      seen,
+    );
+  }
+  return Object.freeze(snapshot) as T;
 }
 
 function validateRetentionGrace(value: number | undefined, fallback: number): number {
@@ -327,25 +445,24 @@ function deadlineMs(
   return parsed;
 }
 
-function retainedDeadline(
+function deadlineForRetention(
   value: RuntimeDeadlineInput | undefined,
   nowMs: number,
   graceMs: number,
-): number {
+): { readonly deadlineAt: number; readonly retainedUntil: number } {
   const grace = validateRetentionGrace(graceMs, DEDUPE_RETENTION_GRACE_MS);
-  const parsedDeadline = value === undefined ? undefined : deadlineMs(value, nowMs, true);
-  const deadline =
-    parsedDeadline === undefined || parsedDeadline <= nowMs
+  const deadlineAt =
+    value === undefined
       ? nowMs + MAX_OPERATION_DEADLINE_HORIZON_MS
-      : parsedDeadline;
-  if (!Number.isSafeInteger(deadline)) {
+      : deadlineMs(value, nowMs, true);
+  if (!Number.isSafeInteger(deadlineAt)) {
     throw new RangeError('operation retention deadline must be a safe timestamp');
   }
-  const retainedUntil = deadline + grace;
+  const retainedUntil = deadlineAt + grace;
   if (!Number.isSafeInteger(retainedUntil)) {
     throw new RangeError('operation retention deadline must be a safe timestamp');
   }
-  return retainedUntil;
+  return { deadlineAt, retainedUntil };
 }
 
 export class RuntimeShutdownHookTimeout extends Error {
@@ -370,6 +487,8 @@ export function createRuntimeOperationGuardState(): RuntimeOperationGuardState {
   return {
     acceptedOperations: new Map<string, AcceptedOperationRecord>(),
     unreachableResults: new Map<string, UnreachableRecord>(),
+    expiredResults: new Map<string, ExpiredRecord>(),
+    operationAliases: new Map<string, RuntimeOperationAliasRecord>(),
   };
 }
 
@@ -699,13 +818,15 @@ export class RuntimePersistence {
   public readonly operationGuardState: RuntimeOperationGuardState;
   private readonly acceptedOperations: Map<string, AcceptedOperationRecord>;
   private readonly unreachableResults: Map<string, UnreachableRecord>;
+  private readonly expiredResults: Map<string, ExpiredRecord>;
+  private readonly operationAliases: Map<string, RuntimeOperationAliasRecord>;
   private readonly shutdownHooks = new Set<Promise<unknown>>();
   private readonly ownerShutdownHooks = new Set<RuntimePersistenceOwnerShutdownHook>();
   private replacementOptions: RuntimeReloadOptions | undefined;
   private previousRuntimeShutdownPromise: Promise<RuntimeShutdownReport> | undefined;
   private previousRuntimeShutdownFailure: unknown;
   public constructor(options: RuntimePersistenceOptions = {}) {
-    this.now = options.now ?? (() => Date.now());
+    this.now = createMonotonicClock(options.now ?? (() => Date.now()));
     this.setTimeout = options.setTimeout ?? defaultSetTimeout;
     this.clearTimeout = options.clearTimeout ?? defaultClearTimeout;
     const configuredGrace = options.retentionGraceMs;
@@ -749,6 +870,8 @@ export class RuntimePersistence {
     this.operationGuardState = options.operationGuardState ?? createRuntimeOperationGuardState();
     this.acceptedOperations = this.operationGuardState.acceptedOperations;
     this.unreachableResults = this.operationGuardState.unreachableResults;
+    this.expiredResults = this.operationGuardState.expiredResults;
+    this.operationAliases = this.operationGuardState.operationAliases;
     this.identity = identityFromOptions(options);
     if (history.issued.has(this.identity.runtimeId)) {
       throw new RuntimePersistenceError(
@@ -859,7 +982,7 @@ export class RuntimePersistence {
       throw new TypeError('runtime owner shutdown hook must be a function');
     }
     if (!this.active) {
-      hook();
+      hook(true);
       return () => undefined;
     }
     if (this.ownerShutdownHooks.size >= MAX_SHUTDOWN_HOOKS) {
@@ -896,6 +1019,33 @@ export class RuntimePersistence {
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
     const nowMs = finiteNow(this.now());
     this.prune(nowMs);
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperationId,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (
+      alias !== undefined &&
+      (alias.stale ||
+        alias.senderRuntimeId !== normalizedSender ||
+        alias.recipientRuntimeId !== normalizedRecipient)
+    ) {
+      alias.stale = true;
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'operationId belongs to an earlier sender generation; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
+    const previousExpired = this.expiredResults.get(key);
+    if (previousExpired !== undefined) {
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'an expired operation is immutable; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
     const previousUnreachable = this.unreachableResults.get(key);
     if (previousUnreachable !== undefined) {
       if (previousUnreachable.recipientRuntimeId !== normalizedRecipient) {
@@ -913,32 +1063,55 @@ export class RuntimePersistence {
     }
     const previous = this.acceptedOperations.get(key);
     if (previous !== undefined) {
-      if (previous.stale || previous.value.recipientRuntimeId !== normalizedRecipient) {
-        // Once a caller has tried to move an accepted ID to a replacement,
-        // neither the old nor the replacement endpoint may reuse it.
+      if (
+        previous.stale ||
+        previous.value.recipientRuntimeId !== normalizedRecipient ||
+        previous.deadlineAt <= nowMs
+      ) {
         previous.stale = true;
+        if (previous.deadlineAt <= nowMs) {
+          void this.reportExpired(
+            normalizedOperationId,
+            normalizedRecipient,
+            'local IPC operation deadline elapsed before acceptance',
+            expiresAt,
+            normalizedSender,
+          );
+        }
         throw new RuntimePersistenceError(
           'stale_operation',
-          'an accepted operation cannot be replayed at a replacement runtime; create a new operationId',
+          'an accepted operation cannot be replayed at a replacement or after expiry; create a new operationId',
           { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
         );
       }
       return previous.value;
     }
-    const requestedRetainedUntil =
-      expiresAt === undefined
-        ? undefined
-        : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
-    if (this.acceptedOperations.size >= MAX_OPERATION_GUARD_ENTRIES) {
+    const window = deadlineForRetention(expiresAt, nowMs, this.retentionGraceMs);
+    if (window.deadlineAt <= nowMs) {
+      void this.reportExpired(
+        normalizedOperationId,
+        normalizedRecipient,
+        'local IPC operation deadline elapsed before acceptance',
+        expiresAt,
+        normalizedSender,
+      );
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'operation deadline elapsed; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
+    if (
+      this.acceptedOperations.size >= MAX_OPERATION_GUARD_ENTRIES ||
+      this.operationAliases.size >= MAX_OPERATION_GUARD_ENTRIES
+    ) {
       throw new RuntimePersistenceError(
         'busy',
         'operation guard capacity is temporarily exhausted',
         { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
       );
     }
-    const retainedUntil =
-      requestedRetainedUntil ?? retainedDeadline(undefined, nowMs, this.retentionGraceMs);
-    const accepted = Object.freeze({
+    const accepted = deepSnapshot({
       operationId: normalizedOperationId,
       recipientRuntimeId: normalizedRecipient,
       senderRuntimeId: normalizedSender,
@@ -948,11 +1121,30 @@ export class RuntimePersistence {
       value: accepted,
       senderRuntimeId: normalizedSender,
       generation: normalizedSender,
-      retainedUntil,
+      deadlineAt: window.deadlineAt,
+      retainedUntil: window.retainedUntil,
+      stale: false,
+    };
+    const operationAlias: RuntimeOperationAliasRecord = {
+      operationId: normalizedOperationId,
+      senderRuntimeId: normalizedSender,
+      recipientRuntimeId: normalizedRecipient,
+      generation: normalizedSender,
+      deadlineAt: window.deadlineAt,
+      retainedUntil: window.retainedUntil,
+      state: 'accepted',
       stale: false,
     };
     this.acceptedOperations.set(key, record);
+    this.operationAliases.set(
+      runtimeOperationAliasKey(normalizedOperationId, normalizedRecipient),
+      operationAlias,
+    );
     this.scheduleAcceptedOperation(key, record);
+    this.scheduleOperationAlias(
+      runtimeOperationAliasKey(normalizedOperationId, normalizedRecipient),
+      operationAlias,
+    );
     return accepted;
   }
 
@@ -990,13 +1182,30 @@ export class RuntimePersistence {
       return false;
     }
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperationId,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (
+      alias !== undefined &&
+      (alias.stale ||
+        alias.senderRuntimeId !== normalizedSender ||
+        alias.recipientRuntimeId !== normalizedRecipient)
+    ) {
+      alias.stale = true;
+      return false;
+    }
     const previous = this.acceptedOperations.get(key);
     const unreachable = this.unreachableResults.get(key);
+    const expired = this.expiredResults.get(key);
     if (previous !== undefined && previous.value.recipientRuntimeId !== normalizedRecipient) {
       previous.stale = true;
     }
     return (
       unreachable === undefined &&
+      expired === undefined &&
       (previous === undefined ||
         (!previous.stale && previous.value.recipientRuntimeId === normalizedRecipient))
     );
@@ -1039,13 +1248,33 @@ export class RuntimePersistence {
     const normalizedRecipient = requireText(recipientRuntimeId, 'recipientRuntimeId');
     const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
     this.prune(finiteNow(this.now()));
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperationId,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (
+      alias !== undefined &&
+      (alias.senderRuntimeId !== normalizedSender ||
+        alias.recipientRuntimeId !== normalizedRecipient)
+    ) {
+      alias.stale = true;
+    }
     const previous = this.acceptedOperations.get(
       runtimeOperationGuardKey(normalizedSender, normalizedOperationId),
     );
     if (previous !== undefined && previous.value.recipientRuntimeId !== normalizedRecipient) {
       previous.stale = true;
     }
-    return randomUUID() as OperationId;
+    let retryOperationId: OperationId;
+    do {
+      retryOperationId = randomUUID() as OperationId;
+    } while (
+      this.operationAliases.has(runtimeOperationAliasKey(retryOperationId, normalizedRecipient)) &&
+      this.operationAliases.size < MAX_OPERATION_GUARD_ENTRIES
+    );
+    return retryOperationId;
   }
 
   public newOperationIdForRetry(
@@ -1075,6 +1304,33 @@ export class RuntimePersistence {
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
     const nowMs = finiteNow(this.now());
     this.prune(nowMs);
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperationId,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (
+      alias !== undefined &&
+      (alias.stale ||
+        alias.senderRuntimeId !== normalizedSender ||
+        (normalizedRecipient !== undefined && alias.recipientRuntimeId !== normalizedRecipient))
+    ) {
+      alias.stale = true;
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'operationId belongs to an earlier sender generation; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
+    const expired = this.expiredResults.get(key);
+    if (expired !== undefined) {
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'an expired operation result is immutable; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
     const accepted = this.acceptedOperations.get(key);
     const previous = this.unreachableResults.get(key);
     const acceptedRecipient = accepted?.value.recipientRuntimeId;
@@ -1087,8 +1343,6 @@ export class RuntimePersistence {
           { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
         );
       }
-      // Terminal delivery is immutable: a retry with the same destination
-      // replays the first result even when its message or deadline differs.
       return previous.value;
     }
     if (accepted !== undefined && acceptedRecipient !== effectiveRecipient) {
@@ -1098,12 +1352,10 @@ export class RuntimePersistence {
         { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
       );
     }
-    // Once an accepted operation exists, its retained deadline is authoritative
-    // and may be used even when the caller's original deadline has elapsed.
-    const requestedRetainedUntil =
-      accepted === undefined && expiresAt !== undefined
-        ? retainedDeadline(expiresAt, nowMs, this.retentionGraceMs)
-        : undefined;
+    const window =
+      accepted === undefined
+        ? deadlineForRetention(expiresAt, nowMs, this.retentionGraceMs)
+        : { deadlineAt: accepted.deadlineAt, retainedUntil: accepted.retainedUntil };
     if (this.unreachableResults.size >= MAX_OPERATION_GUARD_ENTRIES) {
       throw new RuntimePersistenceError(
         'busy',
@@ -1111,33 +1363,219 @@ export class RuntimePersistence {
         { operationId: normalizedOperationId, recipientRuntimeId: effectiveRecipient },
       );
     }
+    if (alias === undefined && this.operationAliases.size >= MAX_OPERATION_GUARD_ENTRIES) {
+      throw new RuntimePersistenceError(
+        'busy',
+        'operation alias guard capacity is temporarily exhausted',
+        { operationId: normalizedOperationId, recipientRuntimeId: effectiveRecipient },
+      );
+    }
     const error = createProtocolError('unreachable', normalizedMessage, {
       details:
         effectiveRecipient === undefined ? undefined : { recipientRuntimeId: effectiveRecipient },
     });
-    const result: RuntimeUnreachableResult = Object.freeze({
-      status: 'unreachable',
+    const result = deepSnapshot({
+      status: 'unreachable' as const,
       operationId: normalizedOperationId,
       error: error as ProtocolError & { readonly code: 'unreachable' },
       ...(effectiveRecipient === undefined ? {} : { recipientRuntimeId: effectiveRecipient }),
       senderRuntimeId: normalizedSender,
       generation: normalizedSender,
     });
-    const retainedUntil =
-      accepted?.retainedUntil ??
-      requestedRetainedUntil ??
-      retainedDeadline(undefined, nowMs, this.retentionGraceMs);
     const record: UnreachableRecord = {
       value: result,
       senderRuntimeId: normalizedSender,
       generation: normalizedSender,
+      deadlineAt: window.deadlineAt,
       recipientRuntimeId: effectiveRecipient,
       message: normalizedMessage,
-      retainedUntil,
+      retainedUntil: window.retainedUntil,
     };
     this.unreachableResults.set(key, record);
+    if (alias === undefined) {
+      const operationAlias: RuntimeOperationAliasRecord = {
+        operationId: normalizedOperationId,
+        senderRuntimeId: normalizedSender,
+        recipientRuntimeId: effectiveRecipient,
+        generation: normalizedSender,
+        deadlineAt: window.deadlineAt,
+        retainedUntil: window.retainedUntil,
+        state: 'unreachable',
+        stale: false,
+      };
+      this.operationAliases.set(
+        runtimeOperationAliasKey(normalizedOperationId, effectiveRecipient),
+        operationAlias,
+      );
+      this.scheduleOperationAlias(
+        runtimeOperationAliasKey(normalizedOperationId, effectiveRecipient),
+        operationAlias,
+      );
+    } else {
+      alias.state = 'unreachable';
+    }
     this.scheduleUnreachableResult(key, record);
     return result;
+  }
+  /** Record a non-retryable expiry tombstone using the original absolute deadline. */
+  public reportExpired(
+    operationId: string,
+    recipientRuntimeId?: string,
+    message = 'operation deadline elapsed',
+    expiresAt?: RuntimeDeadlineInput,
+    senderRuntimeId?: string,
+  ): RuntimeExpiredResult {
+    this.assertActive();
+    const normalizedOperationId = requireText(operationId, 'operationId');
+    const normalizedRecipient =
+      recipientRuntimeId === undefined
+        ? undefined
+        : requireText(recipientRuntimeId, 'recipientRuntimeId');
+    const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
+    const normalizedMessage = requireText(message, 'message');
+    const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
+    const nowMs = finiteNow(this.now());
+    this.prune(nowMs);
+    const previous = this.expiredResults.get(key);
+    if (previous !== undefined) {
+      if (previous.recipientRuntimeId !== (normalizedRecipient ?? previous.recipientRuntimeId)) {
+        throw new RuntimePersistenceError(
+          'identity_conflict',
+          'an expired result belongs to a different destination',
+          { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+        );
+      }
+      return previous.value;
+    }
+    const previousUnreachable = this.unreachableResults.get(key);
+    if (previousUnreachable !== undefined) {
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'an unreachable operation result is immutable; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperationId,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (
+      alias !== undefined &&
+      (alias.stale ||
+        alias.senderRuntimeId !== normalizedSender ||
+        (normalizedRecipient !== undefined && alias.recipientRuntimeId !== normalizedRecipient))
+    ) {
+      alias.stale = true;
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'operationId belongs to an earlier sender generation; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
+    const accepted = this.acceptedOperations.get(key);
+    const acceptedRecipient = accepted?.value.recipientRuntimeId;
+    const effectiveRecipient = normalizedRecipient ?? acceptedRecipient;
+    if (accepted !== undefined && acceptedRecipient !== effectiveRecipient) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'expired result does not belong to the accepted destination',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
+    const window =
+      accepted === undefined
+        ? deadlineForRetention(expiresAt, nowMs, this.retentionGraceMs)
+        : { deadlineAt: accepted.deadlineAt, retainedUntil: accepted.retainedUntil };
+    if (this.expiredResults.size >= MAX_OPERATION_GUARD_ENTRIES) {
+      throw new RuntimePersistenceError(
+        'busy',
+        'expired-result guard capacity is temporarily exhausted',
+        { operationId: normalizedOperationId, recipientRuntimeId: effectiveRecipient },
+      );
+    }
+    if (alias === undefined && this.operationAliases.size >= MAX_OPERATION_GUARD_ENTRIES) {
+      throw new RuntimePersistenceError(
+        'busy',
+        'operation alias guard capacity is temporarily exhausted',
+        { operationId: normalizedOperationId, recipientRuntimeId: effectiveRecipient },
+      );
+    }
+    if (accepted !== undefined) {
+      this.removeAcceptedOperation(key, accepted);
+      accepted.stale = true;
+    }
+    const error = createProtocolError('expired', normalizedMessage, {
+      details:
+        effectiveRecipient === undefined ? undefined : { recipientRuntimeId: effectiveRecipient },
+    });
+    const result = deepSnapshot({
+      status: 'expired' as const,
+      operationId: normalizedOperationId,
+      error: error as ProtocolError & { readonly code: 'expired' },
+      ...(effectiveRecipient === undefined ? {} : { recipientRuntimeId: effectiveRecipient }),
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
+    });
+    const record: ExpiredRecord = {
+      value: result,
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
+      deadlineAt: window.deadlineAt,
+      recipientRuntimeId: effectiveRecipient,
+      message: normalizedMessage,
+      retainedUntil: window.retainedUntil,
+    };
+    this.expiredResults.set(key, record);
+    if (alias === undefined) {
+      const operationAlias: RuntimeOperationAliasRecord = {
+        operationId: normalizedOperationId,
+        senderRuntimeId: normalizedSender,
+        recipientRuntimeId: effectiveRecipient,
+        generation: normalizedSender,
+        deadlineAt: window.deadlineAt,
+        retainedUntil: window.retainedUntil,
+        state: 'expired',
+        stale: false,
+      };
+      this.operationAliases.set(
+        runtimeOperationAliasKey(normalizedOperationId, effectiveRecipient),
+        operationAlias,
+      );
+      this.scheduleOperationAlias(
+        runtimeOperationAliasKey(normalizedOperationId, effectiveRecipient),
+        operationAlias,
+      );
+    } else {
+      alias.state = 'expired';
+      alias.stale = false;
+    }
+    this.scheduleExpiredResult(key, record);
+    return result;
+  }
+
+  public markExpired(
+    operationId: string,
+    recipientRuntimeId?: string,
+    message?: string,
+    expiresAt?: RuntimeDeadlineInput,
+    senderRuntimeId?: string,
+  ): RuntimeExpiredResult {
+    return this.reportExpired(operationId, recipientRuntimeId, message, expiresAt, senderRuntimeId);
+  }
+
+  public getExpired(
+    operationId: string,
+    senderRuntimeId?: string,
+  ): RuntimeExpiredResult | undefined {
+    this.assertActive();
+    const normalizedOperationId = requireText(operationId, 'operationId');
+    const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
+    this.prune(finiteNow(this.now()));
+    return this.expiredResults.get(
+      runtimeOperationGuardKey(normalizedSender, normalizedOperationId),
+    )?.value;
   }
 
   public markUnreachable(
@@ -1178,16 +1616,29 @@ export class RuntimePersistence {
     if (!Number.isFinite(nowMs)) {
       throw new RangeError('runtime persistence clock must return a finite number');
     }
+    const effectiveNowMs = Math.max(nowMs, finiteNow(this.now()));
     let removed = 0;
     for (const [operationKey, record] of this.acceptedOperations) {
-      if (record.retainedUntil <= nowMs) {
+      if (record.retainedUntil <= effectiveNowMs) {
         this.removeAcceptedOperation(operationKey, record);
         removed += 1;
       }
     }
     for (const [operationKey, record] of this.unreachableResults) {
-      if (record.retainedUntil <= nowMs) {
+      if (record.retainedUntil <= effectiveNowMs) {
         this.removeUnreachableResult(operationKey, record);
+        removed += 1;
+      }
+    }
+    for (const [operationKey, record] of this.expiredResults) {
+      if (record.retainedUntil <= effectiveNowMs) {
+        this.removeExpiredResult(operationKey, record);
+        removed += 1;
+      }
+    }
+    for (const [aliasKey, record] of this.operationAliases) {
+      if (record.retainedUntil <= effectiveNowMs) {
+        this.removeOperationAlias(aliasKey, record);
         removed += 1;
       }
     }
@@ -1233,7 +1684,7 @@ export class RuntimePersistence {
     // abort listeners, and shutdown hooks can all re-enter this boundary.
     this.shutdownPromise = shutdownPromise;
     this.lifecycleState = 'shutting_down';
-    this.notifyOwnerShutdownHooks();
+    this.notifyOwnerShutdownHooks(graceful);
 
     let tasks: RuntimeShutdownTask[] = [];
     try {
@@ -1448,6 +1899,56 @@ export class RuntimePersistence {
     );
     unrefTimer(record.timer);
   }
+  private scheduleExpiredResult(operationId: string, record: ExpiredRecord): void {
+    const delay = record.retainedUntil - finiteNow(this.now());
+    if (delay <= 0) {
+      this.removeExpiredResult(operationId, record);
+      return;
+    }
+    record.clearTimeout = this.clearTimeout;
+    record.timer = this.setTimeout(
+      () => {
+        record.timer = undefined;
+        if (this.expiredResults.get(operationId) !== record) {
+          return;
+        }
+        if (record.retainedUntil <= finiteNow(this.now())) {
+          this.removeExpiredResult(operationId, record);
+        } else {
+          this.scheduleExpiredResult(operationId, record);
+        }
+      },
+      Math.min(delay, MAX_TIMER_DELAY_MS),
+    );
+    unrefTimer(record.timer);
+  }
+
+  private scheduleOperationAlias(aliasKey: string, record: RuntimeOperationAliasRecord): void {
+    if (record.timer !== undefined) {
+      return;
+    }
+    const delay = record.retainedUntil - finiteNow(this.now());
+    if (delay <= 0) {
+      this.removeOperationAlias(aliasKey, record);
+      return;
+    }
+    record.clearTimeout = this.clearTimeout;
+    record.timer = this.setTimeout(
+      () => {
+        record.timer = undefined;
+        if (this.operationAliases.get(aliasKey) !== record) {
+          return;
+        }
+        if (record.retainedUntil <= finiteNow(this.now())) {
+          this.removeOperationAlias(aliasKey, record);
+        } else {
+          this.scheduleOperationAlias(aliasKey, record);
+        }
+      },
+      Math.min(delay, MAX_TIMER_DELAY_MS),
+    );
+    unrefTimer(record.timer);
+  }
 
   private removeAcceptedOperation(operationId: string, record: AcceptedOperationRecord): void {
     if (this.acceptedOperations.get(operationId) !== record) {
@@ -1470,12 +1971,34 @@ export class RuntimePersistence {
     }
     this.unreachableResults.delete(operationId);
   }
-  private notifyOwnerShutdownHooks(): void {
+
+  private removeExpiredResult(operationId: string, record: ExpiredRecord): void {
+    if (this.expiredResults.get(operationId) !== record) {
+      return;
+    }
+    if (record.timer !== undefined) {
+      (record.clearTimeout ?? this.clearTimeout)(record.timer);
+      record.timer = undefined;
+    }
+    this.expiredResults.delete(operationId);
+  }
+
+  private removeOperationAlias(aliasKey: string, record: RuntimeOperationAliasRecord): void {
+    if (this.operationAliases.get(aliasKey) !== record) {
+      return;
+    }
+    if (record.timer !== undefined) {
+      (record.clearTimeout ?? this.clearTimeout)(record.timer);
+      record.timer = undefined;
+    }
+    this.operationAliases.delete(aliasKey);
+  }
+  private notifyOwnerShutdownHooks(graceful: boolean): void {
     const hooks = [...this.ownerShutdownHooks];
     this.ownerShutdownHooks.clear();
     for (const hook of hooks) {
       try {
-        hook();
+        hook(graceful);
       } catch {
         // Owner hooks are fences; shutdown remains idempotent even if a fence fails.
       }

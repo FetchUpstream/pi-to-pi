@@ -13,12 +13,17 @@ import {
 } from '../config.js';
 import {
   runtimeDestinationGuardStateFor,
+  runtimeOperationAliasKey,
   runtimeOperationGuardKey,
   RUNTIME_ID_GUARD_RETENTION_MS,
+  createMonotonicClock,
   createRuntimeOperationGuardState,
   type AcceptedOperationRecord,
+  type ExpiredRecord,
+  type RuntimeExpiredResult,
   type RuntimeDestinationGuardRecord,
   type RuntimeIdentityHistory,
+  type RuntimeOperationAliasRecord,
   type RuntimeOperationGuardState,
   type RuntimePersistence,
   type RuntimeUnreachableResult,
@@ -47,7 +52,7 @@ export type LocalIpcRuntimeTarget = TransportRuntimeTarget<LocalIpcEndpoint>;
 export interface LocalIpcShutdownNotice {
   readonly runtimeId: string;
   readonly endpoint: LocalIpcEndpoint;
-  readonly graceful: true;
+  readonly graceful: boolean;
   readonly reason: string;
   readonly source: LocalIpcRuntimeTarget;
 }
@@ -259,27 +264,71 @@ function operationDeadline(value: unknown, nowMs: number, allowElapsed = false):
   return parsed;
 }
 
-function retentionDeadline(value: unknown, nowMs: number, graceMs: number): number {
+function deadlineWindow(
+  value: unknown,
+  nowMs: number,
+  graceMs: number,
+): { readonly deadlineAt: number; readonly retainedUntil: number } {
   const grace = validateRetention(graceMs, 'retentionGraceMs');
-  const parsedDeadline = value === undefined ? undefined : operationDeadline(value, nowMs, true);
-  const deadline =
-    parsedDeadline === undefined || parsedDeadline <= nowMs
-      ? nowMs + MAX_REQUEST_TTL_MS
-      : parsedDeadline;
-  if (!Number.isSafeInteger(deadline)) {
+  const deadlineAt =
+    value === undefined ? nowMs + MAX_REQUEST_TTL_MS : operationDeadline(value, nowMs, true);
+  if (!Number.isSafeInteger(deadlineAt)) {
     throw new LocalIpcBindingError(
       'invalid_target',
       'operation retention deadline must be a safe timestamp',
     );
   }
-  const retainedUntil = deadline + grace;
+  const retainedUntil = deadlineAt + grace;
   if (!Number.isSafeInteger(retainedUntil)) {
     throw new LocalIpcBindingError(
       'invalid_target',
       'operation retention deadline must be a safe timestamp',
     );
   }
-  return retainedUntil;
+  return { deadlineAt, retainedUntil };
+}
+
+function deepSnapshot<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  const existing = seen.get(value);
+  if (existing !== undefined) {
+    return existing as T;
+  }
+  const snapshot = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, snapshot);
+  for (const key of Object.keys(value as object)) {
+    (snapshot as Record<string, unknown>)[key] = deepSnapshot(
+      (value as Record<string, unknown>)[key],
+      seen,
+    );
+  }
+  return Object.freeze(snapshot) as T;
+}
+function operationAliasFor(
+  aliases: Map<string, RuntimeOperationAliasRecord>,
+  operationId: string,
+  senderRuntimeId: string,
+  recipientRuntimeId?: string,
+): RuntimeOperationAliasRecord | undefined {
+  const exact = aliases.get(runtimeOperationAliasKey(operationId, recipientRuntimeId));
+  if (exact !== undefined) {
+    return exact;
+  }
+  for (const candidate of aliases.values()) {
+    if (candidate.operationId !== operationId) {
+      continue;
+    }
+    if (
+      candidate.senderRuntimeId === recipientRuntimeId &&
+      candidate.recipientRuntimeId === senderRuntimeId
+    ) {
+      continue;
+    }
+    return candidate;
+  }
+  return undefined;
 }
 
 function removeSharedAcceptedOperation(
@@ -313,6 +362,37 @@ function removeSharedUnreachableResult(
   }
   state.unreachableResults.delete(operationKey);
 }
+function removeSharedExpiredResult(
+  state: RuntimeOperationGuardState,
+  operationKey: string,
+  record: ExpiredRecord,
+  clearTimeoutFn: LocalIpcClearTimeout,
+): void {
+  if (state.expiredResults.get(operationKey) !== record) {
+    return;
+  }
+  if (record.timer !== undefined) {
+    (record.clearTimeout ?? clearTimeoutFn)(record.timer);
+    record.timer = undefined;
+  }
+  state.expiredResults.delete(operationKey);
+}
+
+function removeOperationAlias(
+  state: RuntimeOperationGuardState,
+  aliasKey: string,
+  record: RuntimeOperationAliasRecord,
+  clearTimeoutFn: LocalIpcClearTimeout,
+): void {
+  if (state.operationAliases.get(aliasKey) !== record) {
+    return;
+  }
+  if (record.timer !== undefined) {
+    (record.clearTimeout ?? clearTimeoutFn)(record.timer);
+    record.timer = undefined;
+  }
+  state.operationAliases.delete(aliasKey);
+}
 
 function pruneSharedOperationGuards(
   state: RuntimeOperationGuardState,
@@ -327,6 +407,16 @@ function pruneSharedOperationGuards(
   for (const [operationKey, record] of state.unreachableResults) {
     if (record.retainedUntil <= nowMs) {
       removeSharedUnreachableResult(state, operationKey, record, clearTimeoutFn);
+    }
+  }
+  for (const [operationKey, record] of state.expiredResults) {
+    if (record.retainedUntil <= nowMs) {
+      removeSharedExpiredResult(state, operationKey, record, clearTimeoutFn);
+    }
+  }
+  for (const [aliasKey, record] of state.operationAliases) {
+    if (record.retainedUntil <= nowMs) {
+      removeOperationAlias(state, aliasKey, record, clearTimeoutFn);
     }
   }
 }
@@ -403,6 +493,7 @@ function failure<Endpoint>(
   target: TransportRuntimeTarget<Endpoint> | undefined,
   operationId: string | undefined,
   cause?: unknown,
+  retryableOverride?: boolean,
 ): TransportDeliveryFailure<Endpoint> {
   return Object.freeze({
     status: 'failed',
@@ -410,7 +501,7 @@ function failure<Endpoint>(
     error: Object.freeze({
       code,
       message,
-      retryable: code === 'unreachable' || code === 'timeout',
+      retryable: retryableOverride ?? (code === 'unreachable' || code === 'timeout'),
       ...(target === undefined ? {} : { target }),
       ...(operationId === undefined ? {} : { operationId }),
       ...(cause === undefined ? {} : { cause }),
@@ -444,6 +535,8 @@ export class LocalIpcRegistry {
   private readonly runtimes = new Map<string, LocalIpcRegistryRecord>();
   private readonly issuedRuntimeIds = new Map<string, IssuedRuntimeRecord>();
   private readonly operationDestinations: Map<string, OperationDestinationRecord>;
+  private readonly expiredResults: Map<string, ExpiredRecord>;
+  private readonly operationAliases: Map<string, RuntimeOperationAliasRecord>;
   public readonly operationGuardState: RuntimeOperationGuardState;
   public readonly runtimeIdentityHistory: RuntimeIdentityHistory;
   public readonly currentRuntimeId: string | undefined;
@@ -455,11 +548,13 @@ export class LocalIpcRegistry {
   private nextGeneration = 0;
 
   public constructor(options: LocalIpcRegistryOptions = {}) {
-    this.now = options.now ?? (() => Date.now());
+    this.now = createMonotonicClock(options.now ?? (() => Date.now()));
     this.setTimeout = options.setTimeout ?? defaultSetTimeout;
     this.clearTimeout = options.clearTimeout ?? defaultClearTimeout;
     this.operationGuardState = options.operationGuardState ?? createRuntimeOperationGuardState();
     this.operationDestinations = runtimeDestinationGuardStateFor(this.operationGuardState);
+    this.expiredResults = this.operationGuardState.expiredResults;
+    this.operationAliases = this.operationGuardState.operationAliases;
     const effectiveRetentionGrace = validateRetention(
       options.retentionGraceMs ?? DEDUPE_RETENTION_GRACE_MS,
       'retentionGraceMs',
@@ -649,6 +744,33 @@ export class LocalIpcRegistry {
     const nowMs = finiteClock(this.now());
     this.prune(nowMs);
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperation);
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperation,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (
+      alias !== undefined &&
+      (alias.stale ||
+        alias.senderRuntimeId !== normalizedSender ||
+        alias.recipientRuntimeId !== normalizedRecipient)
+    ) {
+      alias.stale = true;
+      return null;
+    }
+    const sharedExpired = this.expiredResults.get(key);
+    if (sharedExpired !== undefined) {
+      if (sharedExpired.recipientRuntimeId !== normalizedRecipient) {
+        return null;
+      }
+      return {
+        key,
+        created: false,
+        terminal: 'expired',
+        expiredMessage: sharedExpired.message,
+      };
+    }
     const sharedUnreachable = this.operationGuardState.unreachableResults.get(key);
     if (sharedUnreachable !== undefined) {
       if (sharedUnreachable.recipientRuntimeId !== normalizedRecipient) {
@@ -687,20 +809,68 @@ export class LocalIpcRegistry {
           unreachableMessage: previous.unreachableMessage,
         };
       }
+      if (previous.state === 'expired') {
+        return {
+          key,
+          created: false,
+          terminal: 'expired',
+          expiredMessage: previous.expiredMessage,
+        };
+      }
       if (previous.state === 'delivered') {
         return { key, created: false, terminal: 'delivered' };
       }
       if (sharedAccepted?.stale && !allowStaleAccepted) {
         return null;
       }
+      if (previous.deadlineAt <= nowMs) {
+        const terminal = this.markOperationExpired(
+          normalizedSender,
+          normalizedOperation,
+          normalizedRecipient,
+          'local IPC operation deadline elapsed before delivery',
+          expiresAt,
+        );
+        return {
+          key,
+          created: false,
+          terminal,
+          ...(terminal === 'expired'
+            ? { expiredMessage: 'local IPC operation deadline elapsed before delivery' }
+            : {}),
+        };
+      }
       return { key, created: false, terminal: 'pending' };
     }
     if (sharedAccepted?.stale && !allowStaleAccepted) {
       return null;
     }
-    const retainedUntil =
-      sharedAccepted?.retainedUntil ?? retentionDeadline(expiresAt, nowMs, this.retentionGraceMs);
-    if (this.operationDestinations.size >= MAX_OPERATION_DESTINATIONS) {
+    const window =
+      sharedAccepted === undefined
+        ? deadlineWindow(expiresAt, nowMs, this.retentionGraceMs)
+        : { deadlineAt: sharedAccepted.deadlineAt, retainedUntil: sharedAccepted.retainedUntil };
+    if (window.deadlineAt <= nowMs) {
+      const terminal = this.markOperationExpired(
+        normalizedSender,
+        normalizedOperation,
+        normalizedRecipient,
+        'local IPC operation deadline elapsed before delivery',
+        expiresAt,
+      );
+      return {
+        key,
+        created: false,
+        terminal,
+        ...(terminal === 'expired'
+          ? { expiredMessage: 'local IPC operation deadline elapsed before delivery' }
+          : {}),
+      };
+    }
+    if (
+      this.operationDestinations.size >= MAX_OPERATION_DESTINATIONS ||
+      (sharedAccepted === undefined &&
+        this.operationGuardState.operationAliases.size >= MAX_OPERATION_DESTINATIONS)
+    ) {
       return null;
     }
     const record: OperationDestinationRecord = {
@@ -708,7 +878,8 @@ export class LocalIpcRegistry {
       operationId: normalizedOperation,
       recipientRuntimeId: normalizedRecipient,
       generation: normalizedSender,
-      retainedUntil,
+      deadlineAt: window.deadlineAt,
+      retainedUntil: window.retainedUntil,
       state: 'pending',
     };
     this.operationDestinations.set(key, record);
@@ -719,7 +890,7 @@ export class LocalIpcRegistry {
         return null;
       }
       const accepted: AcceptedOperationRecord = {
-        value: Object.freeze({
+        value: deepSnapshot({
           operationId: normalizedOperation,
           recipientRuntimeId: normalizedRecipient,
           senderRuntimeId: normalizedSender,
@@ -727,15 +898,187 @@ export class LocalIpcRegistry {
         }),
         senderRuntimeId: normalizedSender,
         generation: normalizedSender,
-        retainedUntil,
+        deadlineAt: window.deadlineAt,
+        retainedUntil: window.retainedUntil,
         stale: false,
       };
       this.operationGuardState.acceptedOperations.set(key, accepted);
       this.scheduleSharedAcceptedOperation(key, accepted);
+      const operationAlias: RuntimeOperationAliasRecord = {
+        operationId: normalizedOperation,
+        senderRuntimeId: normalizedSender,
+        recipientRuntimeId: normalizedRecipient,
+        generation: normalizedSender,
+        deadlineAt: window.deadlineAt,
+        retainedUntil: window.retainedUntil,
+        state: 'accepted',
+        stale: false,
+      };
+      this.operationAliases.set(
+        runtimeOperationAliasKey(normalizedOperation, normalizedRecipient),
+        operationAlias,
+      );
+      this.scheduleOperationAlias(
+        runtimeOperationAliasKey(normalizedOperation, normalizedRecipient),
+        operationAlias,
+      );
     } else if (sharedAccepted.timer === undefined) {
       this.scheduleSharedAcceptedOperation(key, sharedAccepted);
     }
     return { key, created: sharedAccepted === undefined, terminal: 'pending' };
+  }
+
+  public markOperationExpired(
+    senderRuntimeId: string,
+    operationId: string,
+    recipientRuntimeId: string,
+    message: string,
+    expiresAt?: unknown,
+  ): OperationTerminalState {
+    const normalizedSender = validateIdentifier(senderRuntimeId, 'sender runtimeId');
+    const normalizedOperation = validateIdentifier(operationId, 'operationId');
+    const normalizedRecipient = validateIdentifier(recipientRuntimeId, 'recipient runtimeId');
+    const normalizedMessage = validateIdentifier(message, 'expired message');
+    const key = runtimeOperationGuardKey(normalizedSender, normalizedOperation);
+    const nowMs = finiteClock(this.now());
+    this.prune(nowMs);
+    const previousExpired = this.expiredResults.get(key);
+    if (previousExpired !== undefined) {
+      if (previousExpired.recipientRuntimeId !== normalizedRecipient) {
+        throw new LocalIpcBindingError(
+          'identity_conflict',
+          'expired result is immutable for this operation destination',
+        );
+      }
+      return 'expired';
+    }
+    const sharedUnreachable = this.operationGuardState.unreachableResults.get(key);
+    if (sharedUnreachable !== undefined) {
+      if (sharedUnreachable.recipientRuntimeId !== normalizedRecipient) {
+        throw new LocalIpcBindingError(
+          'identity_conflict',
+          'unreachable result is immutable for this operation destination',
+        );
+      }
+      return 'unreachable';
+    }
+    const previousDestination = this.operationDestinations.get(key);
+    if (previousDestination?.state === 'delivered') {
+      return 'delivered';
+    }
+    if (previousDestination?.state === 'unreachable') {
+      return 'unreachable';
+    }
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperation,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (
+      alias !== undefined &&
+      (alias.stale ||
+        alias.senderRuntimeId !== normalizedSender ||
+        alias.recipientRuntimeId !== normalizedRecipient)
+    ) {
+      alias.stale = true;
+      throw new LocalIpcBindingError(
+        'identity_conflict',
+        'expired operation belongs to an earlier runtime generation',
+      );
+    }
+    const accepted = this.operationGuardState.acceptedOperations.get(key);
+    const acceptedRecipient = accepted?.value.recipientRuntimeId;
+    if (accepted !== undefined && acceptedRecipient !== normalizedRecipient) {
+      throw new LocalIpcBindingError(
+        'identity_conflict',
+        'expired result does not belong to the accepted destination',
+      );
+    }
+    const window =
+      accepted === undefined
+        ? deadlineWindow(expiresAt, nowMs, this.retentionGraceMs)
+        : { deadlineAt: accepted.deadlineAt, retainedUntil: accepted.retainedUntil };
+    if (this.expiredResults.size >= MAX_OPERATION_DESTINATIONS) {
+      throw new LocalIpcBindingError(
+        'identity_conflict',
+        'expired-result guard capacity is temporarily exhausted',
+      );
+    }
+    if (alias === undefined && this.operationAliases.size >= MAX_OPERATION_DESTINATIONS) {
+      throw new LocalIpcBindingError(
+        'identity_conflict',
+        'operation alias guard capacity is temporarily exhausted',
+      );
+    }
+    if (accepted !== undefined) {
+      removeSharedAcceptedOperation(this.operationGuardState, key, accepted, this.clearTimeout);
+      accepted.stale = true;
+    }
+    let record = this.operationDestinations.get(key);
+    if (record === undefined) {
+      record = {
+        senderRuntimeId: normalizedSender,
+        operationId: normalizedOperation,
+        recipientRuntimeId: normalizedRecipient,
+        generation: normalizedSender,
+        deadlineAt: window.deadlineAt,
+        retainedUntil: window.retainedUntil,
+        state: 'expired',
+        expiredMessage: normalizedMessage,
+      };
+      this.operationDestinations.set(key, record);
+      this.scheduleOperationDestination(key, record);
+    } else {
+      record.state = 'expired';
+      record.expiredMessage = normalizedMessage;
+    }
+    const error = createProtocolError('expired', normalizedMessage, {
+      details: { recipientRuntimeId: normalizedRecipient },
+    });
+    const result = deepSnapshot({
+      status: 'expired' as const,
+      operationId: normalizedOperation,
+      error: error as RuntimeExpiredResult['error'],
+      recipientRuntimeId: normalizedRecipient,
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
+    });
+    const sharedRecord: ExpiredRecord = {
+      value: result,
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
+      deadlineAt: window.deadlineAt,
+      recipientRuntimeId: normalizedRecipient,
+      message: normalizedMessage,
+      retainedUntil: window.retainedUntil,
+    };
+    this.expiredResults.set(key, sharedRecord);
+    if (alias !== undefined) {
+      alias.state = 'expired';
+      alias.stale = false;
+    } else {
+      const operationAlias: RuntimeOperationAliasRecord = {
+        operationId: normalizedOperation,
+        senderRuntimeId: normalizedSender,
+        recipientRuntimeId: normalizedRecipient,
+        generation: normalizedSender,
+        deadlineAt: window.deadlineAt,
+        retainedUntil: window.retainedUntil,
+        state: 'expired',
+        stale: false,
+      };
+      this.operationAliases.set(
+        runtimeOperationAliasKey(normalizedOperation, normalizedRecipient),
+        operationAlias,
+      );
+      this.scheduleOperationAlias(
+        runtimeOperationAliasKey(normalizedOperation, normalizedRecipient),
+        operationAlias,
+      );
+    }
+    this.scheduleSharedExpiredResult(key, sharedRecord);
+    return 'expired';
   }
 
   public markOperationUnreachable(
@@ -755,11 +1098,14 @@ export class LocalIpcRegistry {
     if (reservation === null) {
       throw new LocalIpcBindingError(
         'identity_conflict',
-        'operation destination conflicts with an earlier runtime',
+        'operation destination conflicts with an earlier runtime generation',
       );
     }
     if (reservation.terminal === 'delivered') {
       return 'delivered';
+    }
+    if (reservation.terminal === 'expired') {
+      return 'expired';
     }
     if (reservation.terminal === 'unreachable') {
       return 'unreachable';
@@ -779,9 +1125,16 @@ export class LocalIpcRegistry {
       }
       return 'unreachable';
     }
+    const expired = this.expiredResults.get(key);
+    if (expired !== undefined) {
+      return 'expired';
+    }
     const record = this.operationDestinations.get(key);
     if (record === undefined || record.state === 'delivered') {
       return record?.state ?? 'delivered';
+    }
+    if (record.state === 'expired') {
+      return 'expired';
     }
     if (record.state === 'unreachable') {
       return 'unreachable';
@@ -789,6 +1142,7 @@ export class LocalIpcRegistry {
     record.state = 'unreachable';
     record.unreachableMessage = normalizedMessage;
     const accepted = this.operationGuardState.acceptedOperations.get(key);
+    const deadlineAt = accepted?.deadlineAt ?? record.deadlineAt;
     const retainedUntil = accepted?.retainedUntil ?? record.retainedUntil;
     if (this.operationGuardState.unreachableResults.size >= MAX_OPERATION_DESTINATIONS) {
       record.state = 'pending';
@@ -801,8 +1155,8 @@ export class LocalIpcRegistry {
     const error = createProtocolError('unreachable', normalizedMessage, {
       details: { recipientRuntimeId: normalizedRecipient },
     });
-    const result: RuntimeUnreachableResult = Object.freeze({
-      status: 'unreachable',
+    const result = deepSnapshot({
+      status: 'unreachable' as const,
       operationId: normalizedOperation,
       error: error as RuntimeUnreachableResult['error'],
       recipientRuntimeId: normalizedRecipient,
@@ -813,11 +1167,21 @@ export class LocalIpcRegistry {
       value: result,
       senderRuntimeId: normalizedSender,
       generation: normalizedSender,
+      deadlineAt,
       recipientRuntimeId: normalizedRecipient,
       message: normalizedMessage,
       retainedUntil,
     };
     this.operationGuardState.unreachableResults.set(key, sharedRecord);
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperation,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (alias !== undefined) {
+      alias.state = 'unreachable';
+    }
     this.scheduleSharedUnreachableResult(key, sharedRecord);
     return 'unreachable';
   }
@@ -831,6 +1195,10 @@ export class LocalIpcRegistry {
     const normalizedOperation = validateIdentifier(operationId, 'operationId');
     const normalizedRecipient = validateIdentifier(recipientRuntimeId, 'recipient runtimeId');
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperation);
+    const sharedExpired = this.expiredResults.get(key);
+    if (sharedExpired?.recipientRuntimeId === normalizedRecipient) {
+      return 'expired';
+    }
     const sharedUnreachable = this.operationGuardState.unreachableResults.get(key);
     if (sharedUnreachable?.recipientRuntimeId === normalizedRecipient) {
       return 'unreachable';
@@ -839,6 +1207,9 @@ export class LocalIpcRegistry {
     if (record === undefined || record.recipientRuntimeId !== normalizedRecipient) {
       return undefined;
     }
+    if (record.state === 'expired') {
+      return 'expired';
+    }
     if (record.state === 'unreachable') {
       return 'unreachable';
     }
@@ -846,6 +1217,15 @@ export class LocalIpcRegistry {
       return 'delivered';
     }
     record.state = 'delivered';
+    const alias = operationAliasFor(
+      this.operationAliases,
+      normalizedOperation,
+      normalizedSender,
+      normalizedRecipient,
+    );
+    if (alias !== undefined) {
+      alias.state = 'delivered';
+    }
     return 'delivered';
   }
   public operationUnreachableMessage(
@@ -866,27 +1246,46 @@ export class LocalIpcRegistry {
       ? record.unreachableMessage
       : undefined;
   }
+  public operationExpiredMessage(
+    senderRuntimeId: string,
+    operationId: string,
+    recipientRuntimeId: string,
+  ): string | undefined {
+    const normalizedSender = validateIdentifier(senderRuntimeId, 'sender runtimeId');
+    const normalizedOperation = validateIdentifier(operationId, 'operationId');
+    const normalizedRecipient = validateIdentifier(recipientRuntimeId, 'recipient runtimeId');
+    const key = runtimeOperationGuardKey(normalizedSender, normalizedOperation);
+    const sharedExpired = this.expiredResults.get(key);
+    if (sharedExpired?.recipientRuntimeId === normalizedRecipient) {
+      return sharedExpired.message;
+    }
+    const record = this.operationDestinations.get(key);
+    return record?.recipientRuntimeId === normalizedRecipient && record.state === 'expired'
+      ? record.expiredMessage
+      : undefined;
+  }
 
   public prune(nowMs = finiteClock(this.now())): number {
     if (!Number.isFinite(nowMs)) {
       throw new RangeError('local IPC clock must return a finite number');
     }
+    const effectiveNowMs = Math.max(nowMs, finiteClock(this.now()));
     let removed = 0;
-    pruneSharedOperationGuards(this.operationGuardState, nowMs, this.clearTimeout);
+    pruneSharedOperationGuards(this.operationGuardState, effectiveNowMs, this.clearTimeout);
     for (const [runtimeId, retainedUntil] of this.runtimeIdentityHistory.issued) {
-      if (retainedUntil <= nowMs && !this.issuedRuntimeIds.has(runtimeId)) {
+      if (retainedUntil <= effectiveNowMs && !this.issuedRuntimeIds.has(runtimeId)) {
         this.runtimeIdentityHistory.issued.delete(runtimeId);
         removed += 1;
       }
     }
     for (const [runtimeId, record] of this.issuedRuntimeIds) {
-      if (record.retired && record.retainedUntil <= nowMs) {
+      if (record.retired && record.retainedUntil <= effectiveNowMs) {
         this.removeIssuedRuntimeId(runtimeId, record);
         removed += 1;
       }
     }
     for (const [key, record] of this.operationDestinations) {
-      if (record.retainedUntil <= nowMs) {
+      if (record.retainedUntil <= effectiveNowMs) {
         this.removeOperationDestination(key, record);
         removed += 1;
       }
@@ -1069,6 +1468,64 @@ export class LocalIpcRegistry {
     );
     unrefTimer(record.timer);
   }
+  private scheduleSharedExpiredResult(operationKey: string, record: ExpiredRecord): void {
+    if (record.timer !== undefined) {
+      return;
+    }
+    const delay = record.retainedUntil - finiteClock(this.now());
+    if (delay <= 0) {
+      removeSharedExpiredResult(this.operationGuardState, operationKey, record, this.clearTimeout);
+      return;
+    }
+    record.clearTimeout = this.clearTimeout;
+    record.timer = this.setTimeout(
+      () => {
+        record.timer = undefined;
+        if (this.operationGuardState.expiredResults.get(operationKey) !== record) {
+          return;
+        }
+        if (record.retainedUntil <= finiteClock(this.now())) {
+          removeSharedExpiredResult(
+            this.operationGuardState,
+            operationKey,
+            record,
+            this.clearTimeout,
+          );
+        } else {
+          this.scheduleSharedExpiredResult(operationKey, record);
+        }
+      },
+      Math.min(delay, MAX_TIMER_DELAY_MS),
+    );
+    unrefTimer(record.timer);
+  }
+
+  private scheduleOperationAlias(aliasKey: string, record: RuntimeOperationAliasRecord): void {
+    if (record.timer !== undefined) {
+      return;
+    }
+    const delay = record.retainedUntil - finiteClock(this.now());
+    if (delay <= 0) {
+      removeOperationAlias(this.operationGuardState, aliasKey, record, this.clearTimeout);
+      return;
+    }
+    record.clearTimeout = this.clearTimeout;
+    record.timer = this.setTimeout(
+      () => {
+        record.timer = undefined;
+        if (this.operationAliases.get(aliasKey) !== record) {
+          return;
+        }
+        if (record.retainedUntil <= finiteClock(this.now())) {
+          removeOperationAlias(this.operationGuardState, aliasKey, record, this.clearTimeout);
+        } else {
+          this.scheduleOperationAlias(aliasKey, record);
+        }
+      },
+      Math.min(delay, MAX_TIMER_DELAY_MS),
+    );
+    unrefTimer(record.timer);
+  }
 
   private retireRuntimeId(runtimeId: string): void {
     const nowMs = finiteClock(this.now());
@@ -1223,12 +1680,13 @@ export function createLocalIpcRegistry(options: LocalIpcRegistryOptions = {}): L
   return new LocalIpcRegistry(options);
 }
 
-type OperationTerminalState = 'pending' | 'delivered' | 'unreachable';
+type OperationTerminalState = 'pending' | 'delivered' | 'unreachable' | 'expired';
 interface RouteReservation {
   readonly key: string;
   readonly created: boolean;
   readonly terminal?: OperationTerminalState;
   readonly unreachableMessage?: string;
+  readonly expiredMessage?: string;
 }
 
 class LocalIpcBinding<
@@ -1289,8 +1747,8 @@ export class LocalIpcTransport<
   private closedState = false;
   private closePromise: Promise<void> | undefined;
   private ownerActive = true;
+  private ownerShutdownGraceful = true;
   private unregisterOwnerShutdownHook: (() => void) | undefined;
-
   public constructor(options: LocalIpcTransportOptions = {}) {
     if (
       options.persistence !== undefined &&
@@ -1503,15 +1961,16 @@ export class LocalIpcTransport<
     }
     finiteClock(this.now());
     if (persistence !== undefined) {
-      this.unregisterOwnerShutdownHook = persistence.registerOwnerShutdownHook(() => {
-        this.handleOwnerShutdown();
+      this.unregisterOwnerShutdownHook = persistence.registerOwnerShutdownHook((graceful) => {
+        this.handleOwnerShutdown(graceful ?? true);
       });
     }
   }
   private isOwnerActive(): boolean {
     return this.ownerActive && (this.persistence === undefined || this.persistence.active);
   }
-  private handleOwnerShutdown(): void {
+  private handleOwnerShutdown(graceful: boolean): void {
+    this.ownerShutdownGraceful = graceful;
     this.ownerActive = false;
     this.closedState = true;
     void this.close().catch(() => undefined);
@@ -1748,6 +2207,16 @@ export class LocalIpcTransport<
         message,
         envelope.expiresAt,
       );
+      if (terminal === 'expired') {
+        return this.expiredFailure(
+          message,
+          normalizedTarget,
+          operationId,
+          envelope.expiresAt,
+          cause,
+          senderRuntimeId,
+        );
+      }
       if (terminal === 'delivered') {
         return delivered(operationId);
       }
@@ -1768,6 +2237,17 @@ export class LocalIpcTransport<
     };
     if (this.persistence !== undefined) {
       try {
+        const expired = this.persistence.getExpired(operationId, senderRuntimeId);
+        if (expired !== undefined && expired.recipientRuntimeId === normalizedTarget.runtimeId) {
+          return this.expiredFailure(
+            expired.error.message,
+            normalizedTarget,
+            operationId,
+            envelope.expiresAt,
+            expired.error,
+            senderRuntimeId,
+          );
+        }
         const cached = this.persistence.getUnreachable(operationId, senderRuntimeId);
         if (cached !== undefined && cached.recipientRuntimeId === normalizedTarget.runtimeId) {
           return failure(
@@ -1848,6 +2328,16 @@ export class LocalIpcTransport<
     if (reservation.terminal === 'delivered') {
       return delivered(operationId);
     }
+    if (reservation.terminal === 'expired') {
+      return this.expiredFailure(
+        reservation.expiredMessage ?? 'local IPC operation deadline elapsed before delivery',
+        normalizedTarget,
+        operationId,
+        envelope.expiresAt,
+        undefined,
+        senderRuntimeId,
+      );
+    }
     if (reservation.terminal === 'unreachable') {
       return this.unreachableFailure(
         reservation.unreachableMessage ?? 'local IPC delivery was previously unreachable',
@@ -1859,7 +2349,14 @@ export class LocalIpcTransport<
       );
     }
     if (operationExpiresAtMs <= finiteClock(this.now())) {
-      return terminalFailure('local IPC operation deadline elapsed before delivery');
+      return this.expiredFailure(
+        'local IPC operation deadline elapsed before delivery',
+        normalizedTarget,
+        operationId,
+        envelope.expiresAt,
+        undefined,
+        senderRuntimeId,
+      );
     }
     if (this.persistence !== undefined) {
       try {
@@ -1912,11 +2409,54 @@ export class LocalIpcTransport<
       const currentSource = sourceForRuntime(this.registry, senderRuntimeId);
       return currentSource !== undefined && targetKey(currentSource) === targetKey(source);
     };
-    const fence = { active: true, expiresAt: operationExpiresAtMs };
+    const fence: {
+      active: boolean;
+      expiresAt: number;
+      terminalOperationId?: string;
+      terminalResult?: Promise<TransportDeliveryResult<LocalIpcEndpoint>>;
+      replyRejected: boolean;
+    } = { active: true, expiresAt: operationExpiresAtMs, replyRejected: false };
     const delivery: TransportInboundEnvelope<Envelope, Response, LocalIpcEndpoint> = {
       envelope,
       source,
       reply: (response) => {
+        let responseOperationId: string | undefined;
+        try {
+          responseOperationId = operationIdOf(response);
+        } catch (error) {
+          fence.replyRejected = true;
+          return Promise.resolve(
+            failure(
+              'invalid_target',
+              'local IPC response identifier is invalid',
+              source,
+              undefined,
+              error,
+            ),
+          );
+        }
+        if (responseOperationId === undefined) {
+          fence.replyRejected = true;
+          return Promise.resolve(
+            failure('invalid_target', 'local IPC responses require operationId', source, undefined),
+          );
+        }
+        if (responseOperationId !== operationId) {
+          if (fence.terminalResult === undefined) {
+            fence.replyRejected = true;
+          }
+          return Promise.resolve(
+            failure(
+              'invalid_target',
+              'inbound reply operationId must match the envelope operationId',
+              source,
+              responseOperationId,
+            ),
+          );
+        }
+        if (fence.terminalResult !== undefined) {
+          return fence.terminalResult;
+        }
         if (
           !fence.active ||
           !this.isOwnerActive() ||
@@ -1925,41 +2465,57 @@ export class LocalIpcTransport<
           fence.expiresAt <= finiteClock(this.now())
         ) {
           fence.active = false;
-          let responseOperationId: string | undefined;
-          try {
-            responseOperationId = operationIdOf(response);
-          } catch (error) {
-            return Promise.resolve(
+          fence.terminalOperationId = responseOperationId;
+          const terminalResult =
+            fence.expiresAt <= finiteClock(this.now())
+              ? Promise.resolve(
+                  this.expiredFailure(
+                    'inbound response path expired before delivery',
+                    normalizedTarget,
+                    operationId,
+                    fence.expiresAt,
+                    undefined,
+                    senderRuntimeId,
+                  ),
+                )
+              : Promise.resolve(
+                  this.terminalFailureForOperation(
+                    normalizedTarget.runtimeId,
+                    operationId,
+                    source,
+                    'inbound response path expired or belongs to a stale runtime generation',
+                    fence.expiresAt,
+                  ),
+                );
+          fence.terminalResult = terminalResult.then((result) => deepSnapshot(result));
+          return fence.terminalResult;
+        }
+        fence.replyRejected = false;
+        fence.terminalOperationId = responseOperationId;
+        const responseSnapshot = deepSnapshot(response);
+        const terminalResult = this.deliverResponse(source, responseSnapshot, fence.expiresAt).then(
+          (result) => deepSnapshot(result),
+          (error: unknown) =>
+            deepSnapshot(
               failure(
-                'invalid_target',
-                'local IPC response identifier is invalid',
+                'unreachable',
+                'local IPC response delivery failed',
                 source,
-                undefined,
+                operationId,
                 error,
               ),
-            );
-          }
-          if (responseOperationId === undefined) {
-            return Promise.resolve(
-              failure(
-                'invalid_target',
-                'local IPC responses require operationId',
-                source,
-                undefined,
-              ),
-            );
-          }
-          return Promise.resolve(
-            this.terminalFailureForOperation(
-              normalizedTarget.runtimeId,
-              responseOperationId,
-              source,
-              'inbound response path expired or belongs to a stale runtime generation',
-              fence.expiresAt,
             ),
-          );
-        }
-        return this.deliverResponse(source, response, fence.expiresAt);
+        );
+        fence.terminalResult = terminalResult;
+        void terminalResult.then(
+          () => {
+            fence.active = false;
+          },
+          () => {
+            fence.active = false;
+          },
+        );
+        return terminalResult;
       },
     };
     if (
@@ -1969,7 +2525,16 @@ export class LocalIpcTransport<
       fence.expiresAt <= finiteClock(this.now())
     ) {
       fence.active = false;
-      return terminalFailure('local IPC delivery expired before hook invocation');
+      return fence.expiresAt <= finiteClock(this.now())
+        ? this.expiredFailure(
+            'local IPC delivery expired before hook invocation',
+            normalizedTarget,
+            operationId,
+            envelope.expiresAt,
+            undefined,
+            senderRuntimeId,
+          )
+        : terminalFailure('local IPC delivery became stale before hook invocation');
     }
     try {
       const trackedHook = this.trackRecord(record, () => {
@@ -2000,7 +2565,14 @@ export class LocalIpcTransport<
       const remainingMs = fence.expiresAt - finiteClock(this.now());
       if (remainingMs <= 0) {
         fence.active = false;
-        return terminalFailure('local IPC delivery deadline elapsed before hook completion');
+        return this.expiredFailure(
+          'local IPC delivery deadline elapsed before hook completion',
+          normalizedTarget,
+          operationId,
+          envelope.expiresAt,
+          undefined,
+          senderRuntimeId,
+        );
       }
       await waitForHook(
         () => trackedHook,
@@ -2008,6 +2580,15 @@ export class LocalIpcTransport<
         this.setTimeout,
         this.clearTimeout,
       );
+      if (fence.replyRejected && fence.terminalResult === undefined) {
+        fence.active = false;
+        return failure(
+          'invalid_target',
+          'inbound reply operationId must match the envelope operationId',
+          normalizedTarget,
+          operationId,
+        );
+      }
       if (
         !fence.active ||
         !this.isOwnerActive() ||
@@ -2016,13 +2597,36 @@ export class LocalIpcTransport<
         fence.expiresAt <= finiteClock(this.now())
       ) {
         fence.active = false;
-        return terminalFailure('local IPC delivery expired or closed before finalization');
+        return fence.expiresAt <= finiteClock(this.now())
+          ? this.expiredFailure(
+              'local IPC delivery expired before hook finalization',
+              normalizedTarget,
+              operationId,
+              envelope.expiresAt,
+              undefined,
+              senderRuntimeId,
+            )
+          : terminalFailure('local IPC delivery became stale before finalization');
       }
       const terminal = this.registry.markOperationDelivered(
         senderRuntimeId,
         operationId,
         normalizedTarget.runtimeId,
       );
+      if (terminal === 'expired') {
+        return this.expiredFailure(
+          this.registry.operationExpiredMessage(
+            senderRuntimeId,
+            operationId,
+            normalizedTarget.runtimeId,
+          ) ?? 'local IPC delivery was already expired',
+          normalizedTarget,
+          operationId,
+          envelope.expiresAt,
+          undefined,
+          senderRuntimeId,
+        );
+      }
       if (terminal === 'unreachable') {
         return terminalFailure(
           this.registry.operationUnreachableMessage(
@@ -2042,6 +2646,20 @@ export class LocalIpcTransport<
         'local IPC delivery hook could not be established',
         envelope.expiresAt,
       );
+      if (terminal === 'expired') {
+        return this.expiredFailure(
+          this.registry.operationExpiredMessage(
+            senderRuntimeId,
+            operationId,
+            normalizedTarget.runtimeId,
+          ) ?? 'local IPC delivery was already expired',
+          normalizedTarget,
+          operationId,
+          envelope.expiresAt,
+          error,
+          senderRuntimeId,
+        );
+      }
       if (terminal === 'delivered') {
         return delivered(operationId);
       }
@@ -2119,6 +2737,16 @@ export class LocalIpcTransport<
         message,
         deliveryDeadlineMs,
       );
+      if (terminal === 'expired') {
+        return this.expiredFailure(
+          message,
+          normalizedTarget,
+          operationId,
+          deliveryDeadlineMs,
+          cause,
+          senderRuntimeId,
+        );
+      }
       if (terminal === 'delivered') {
         return delivered(operationId);
       }
@@ -2139,6 +2767,17 @@ export class LocalIpcTransport<
     };
     if (this.persistence !== undefined) {
       try {
+        const expired = this.persistence.getExpired(operationId, senderRuntimeId);
+        if (expired !== undefined && expired.recipientRuntimeId === normalizedTarget.runtimeId) {
+          return this.expiredFailure(
+            expired.error.message,
+            normalizedTarget,
+            operationId,
+            deliveryDeadlineMs,
+            expired.error,
+            senderRuntimeId,
+          );
+        }
         const cached = this.persistence.getUnreachable(operationId, senderRuntimeId);
         if (cached !== undefined && cached.recipientRuntimeId === normalizedTarget.runtimeId) {
           return failure(
@@ -2217,6 +2856,16 @@ export class LocalIpcTransport<
     if (reservation.terminal === 'delivered') {
       return delivered(operationId);
     }
+    if (reservation.terminal === 'expired') {
+      return this.expiredFailure(
+        reservation.expiredMessage ?? 'local IPC response was previously expired',
+        normalizedTarget,
+        operationId,
+        deliveryDeadlineMs,
+        undefined,
+        senderRuntimeId,
+      );
+    }
     if (reservation.terminal === 'unreachable') {
       return this.unreachableFailure(
         reservation.unreachableMessage ?? 'local IPC response was previously unreachable',
@@ -2228,7 +2877,14 @@ export class LocalIpcTransport<
       );
     }
     if (deliveryDeadlineMs !== undefined && deliveryDeadlineMs <= finiteClock(this.now())) {
-      return terminalFailure('local IPC response deadline elapsed before delivery');
+      return this.expiredFailure(
+        'local IPC response deadline elapsed before delivery',
+        normalizedTarget,
+        operationId,
+        deliveryDeadlineMs,
+        undefined,
+        senderRuntimeId,
+      );
     }
     if (this.persistence !== undefined) {
       try {
@@ -2289,7 +2945,16 @@ export class LocalIpcTransport<
       (fence.expiresAt !== undefined && fence.expiresAt <= finiteClock(this.now()))
     ) {
       fence.active = false;
-      return terminalFailure('local IPC response expired before hook invocation');
+      return fence.expiresAt !== undefined && fence.expiresAt <= finiteClock(this.now())
+        ? this.expiredFailure(
+            'local IPC response expired before hook invocation',
+            normalizedTarget,
+            operationId,
+            deliveryDeadlineMs,
+            undefined,
+            senderRuntimeId,
+          )
+        : terminalFailure('local IPC response became stale before hook invocation');
     }
     try {
       const trackedHook = this.trackRecord(record, () => {
@@ -2323,7 +2988,14 @@ export class LocalIpcTransport<
           : fence.expiresAt - finiteClock(this.now());
       if (remainingMs <= 0) {
         fence.active = false;
-        return terminalFailure('local IPC response deadline elapsed before hook completion');
+        return this.expiredFailure(
+          'local IPC response deadline elapsed before hook completion',
+          normalizedTarget,
+          operationId,
+          deliveryDeadlineMs,
+          undefined,
+          senderRuntimeId,
+        );
       }
       await waitForHook(
         () => trackedHook,
@@ -2339,13 +3011,36 @@ export class LocalIpcTransport<
         (fence.expiresAt !== undefined && fence.expiresAt <= finiteClock(this.now()))
       ) {
         fence.active = false;
-        return terminalFailure('local IPC response expired or closed before finalization');
+        return fence.expiresAt !== undefined && fence.expiresAt <= finiteClock(this.now())
+          ? this.expiredFailure(
+              'local IPC response expired before finalization',
+              normalizedTarget,
+              operationId,
+              deliveryDeadlineMs,
+              undefined,
+              senderRuntimeId,
+            )
+          : terminalFailure('local IPC response became stale before finalization');
       }
       const terminal = this.registry.markOperationDelivered(
         senderRuntimeId,
         operationId,
         normalizedTarget.runtimeId,
       );
+      if (terminal === 'expired') {
+        return this.expiredFailure(
+          this.registry.operationExpiredMessage(
+            senderRuntimeId,
+            operationId,
+            normalizedTarget.runtimeId,
+          ) ?? 'local IPC response was already expired',
+          normalizedTarget,
+          operationId,
+          deliveryDeadlineMs,
+          undefined,
+          senderRuntimeId,
+        );
+      }
       if (terminal === 'unreachable') {
         return terminalFailure(
           this.registry.operationUnreachableMessage(
@@ -2365,6 +3060,20 @@ export class LocalIpcTransport<
         'local IPC response hook could not be established',
         deliveryDeadlineMs,
       );
+      if (terminal === 'expired') {
+        return this.expiredFailure(
+          this.registry.operationExpiredMessage(
+            senderRuntimeId,
+            operationId,
+            normalizedTarget.runtimeId,
+          ) ?? 'local IPC response was already expired',
+          normalizedTarget,
+          operationId,
+          deliveryDeadlineMs,
+          error,
+          senderRuntimeId,
+        );
+      }
       if (terminal === 'delivered') {
         return delivered(operationId);
       }
@@ -2431,6 +3140,29 @@ export class LocalIpcTransport<
     }
   }
 
+  private markOperationExpired(
+    senderRuntimeId: string | undefined,
+    operationId: string | undefined,
+    target: LocalIpcRuntimeTarget | undefined,
+    message: string,
+    expiresAt?: unknown,
+  ): OperationTerminalState | undefined {
+    if (senderRuntimeId === undefined || operationId === undefined || target === undefined) {
+      return undefined;
+    }
+    try {
+      return this.registry.markOperationExpired(
+        senderRuntimeId,
+        operationId,
+        target.runtimeId,
+        message,
+        expiresAt,
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
   private trackRecord<T>(
     record: LocalIpcRegistryRecord,
     factory: () => T | PromiseLike<T>,
@@ -2443,6 +3175,48 @@ export class LocalIpcTransport<
     record.inFlight.add(tracked);
     return tracked;
   }
+  private expiredFailure(
+    message: string,
+    target: LocalIpcRuntimeTarget | undefined,
+    operationId: string | undefined,
+    expiresAt?: unknown,
+    cause?: unknown,
+    senderRuntimeId?: string,
+  ): TransportDeliveryResult<LocalIpcEndpoint> {
+    const terminal = this.markOperationExpired(
+      senderRuntimeId,
+      operationId,
+      target,
+      message,
+      expiresAt,
+    );
+    if (terminal === 'delivered') {
+      return delivered(operationId);
+    }
+    if (
+      terminal === 'unreachable' &&
+      target !== undefined &&
+      operationId !== undefined &&
+      senderRuntimeId !== undefined
+    ) {
+      return this.unreachableFailure(
+        this.registry.operationUnreachableMessage(senderRuntimeId, operationId, target.runtimeId) ??
+          message,
+        target,
+        operationId,
+        expiresAt,
+        cause,
+        senderRuntimeId,
+      );
+    }
+    const immutableMessage =
+      target !== undefined && operationId !== undefined && senderRuntimeId !== undefined
+        ? (this.registry.operationExpiredMessage(senderRuntimeId, operationId, target.runtimeId) ??
+          message)
+        : message;
+    return failure('unreachable', immutableMessage, target, operationId, cause, false);
+  }
+
   private terminalFailureForOperation(
     senderRuntimeId: string,
     operationId: string,
@@ -2458,6 +3232,9 @@ export class LocalIpcTransport<
       message,
       expiresAt,
     );
+    if (terminal === 'expired') {
+      return this.expiredFailure(message, target, operationId, expiresAt, cause, senderRuntimeId);
+    }
     if (terminal === 'delivered') {
       return delivered(operationId);
     }
@@ -2491,6 +3268,21 @@ export class LocalIpcTransport<
     let effectiveMessage = message;
     let effectiveCause = cause;
     if (operationId !== undefined && this.persistence !== undefined) {
+      try {
+        const expired = this.persistence.getExpired(operationId, senderRuntimeId);
+        if (expired !== undefined) {
+          return failure(
+            'unreachable',
+            expired.error.message,
+            target,
+            operationId,
+            expired.error,
+            false,
+          );
+        }
+      } catch (error) {
+        effectiveCause ??= error;
+      }
       const reportExpiry =
         typeof expiresAt === 'string' || typeof expiresAt === 'number' || expiresAt instanceof Date
           ? expiresAt
@@ -2517,7 +3309,7 @@ export class LocalIpcTransport<
     const notice: LocalIpcShutdownNotice = {
       runtimeId: binding.target.runtimeId,
       endpoint: binding.target.endpoint,
-      graceful: true,
+      graceful: this.ownerShutdownGraceful,
       reason: 'runtime binding closed',
       source: binding.target,
     };
