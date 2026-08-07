@@ -69,6 +69,8 @@ export type RuntimeShutdownHookResult =
 export type RuntimeShutdownTaskHook = (
   task: Omit<RuntimeShutdownTask, 'delivery' | 'deliveryError'>,
 ) => RuntimeShutdownHookResult | PromiseLike<RuntimeShutdownHookResult>;
+/** Synchronously fences resources owned by this runtime before stores are disposed. */
+export type RuntimePersistenceOwnerShutdownHook = () => void;
 export interface RuntimeShutdownOptions {
   /** Graceful shutdown attempts system-generated terminal signals. */
   readonly graceful?: boolean;
@@ -240,7 +242,6 @@ export const RUNTIME_ID_GUARD_RETENTION_MS =
 const MAX_OPERATION_GUARD_ENTRIES = 4_096;
 const MAX_RUNTIME_ID_HISTORY_ENTRIES = 4_096;
 const MAX_SHUTDOWN_HOOKS = 256;
-const runtimeGuardStates = new WeakMap<object, RuntimeOperationGuardState>();
 function defaultSetTimeout(callback: () => void, delayMs: number): unknown {
   return globalThis.setTimeout(callback, delayMs);
 }
@@ -294,7 +295,11 @@ function validateRuntimeIdRetention(
   return retention;
 }
 
-function deadlineMs(value: RuntimeDeadlineInput | undefined, nowMs: number): number {
+function deadlineMs(
+  value: RuntimeDeadlineInput | undefined,
+  nowMs: number,
+  allowElapsed = false,
+): number {
   if (value === undefined) {
     const defaultDeadline = nowMs + DEFAULT_REQUEST_TTL_MS;
     if (!Number.isSafeInteger(defaultDeadline)) {
@@ -313,7 +318,7 @@ function deadlineMs(value: RuntimeDeadlineInput | undefined, nowMs: number): num
   if (!Number.isSafeInteger(parsed)) {
     throw new TypeError('operation expiry must be a finite safe timestamp');
   }
-  if (parsed <= nowMs) {
+  if (parsed <= nowMs && !allowElapsed) {
     throw new RangeError('operation expiry is already elapsed');
   }
   if (parsed > nowMs + MAX_OPERATION_DEADLINE_HORIZON_MS) {
@@ -328,8 +333,11 @@ function retainedDeadline(
   graceMs: number,
 ): number {
   const grace = validateRetentionGrace(graceMs, DEDUPE_RETENTION_GRACE_MS);
+  const parsedDeadline = value === undefined ? undefined : deadlineMs(value, nowMs, true);
   const deadline =
-    value === undefined ? nowMs + MAX_OPERATION_DEADLINE_HORIZON_MS : deadlineMs(value, nowMs);
+    parsedDeadline === undefined || parsedDeadline <= nowMs
+      ? nowMs + MAX_OPERATION_DEADLINE_HORIZON_MS
+      : parsedDeadline;
   if (!Number.isSafeInteger(deadline)) {
     throw new RangeError('operation retention deadline must be a safe timestamp');
   }
@@ -358,14 +366,15 @@ function requireText(value: string | undefined, field: string): string {
   return value;
 }
 
-function createGuardState(): RuntimeOperationGuardState {
+export function createRuntimeOperationGuardState(): RuntimeOperationGuardState {
   return {
     acceptedOperations: new Map<string, AcceptedOperationRecord>(),
     unreachableResults: new Map<string, UnreachableRecord>(),
   };
 }
 
-export const sharedRuntimeOperationGuardState: RuntimeOperationGuardState = createGuardState();
+export const sharedRuntimeOperationGuardState: RuntimeOperationGuardState =
+  createRuntimeOperationGuardState();
 
 function identityFromOptions(options: RuntimePersistenceOptions): SessionRuntimeIdentity {
   const supplied = options.identity;
@@ -691,6 +700,7 @@ export class RuntimePersistence {
   private readonly acceptedOperations: Map<string, AcceptedOperationRecord>;
   private readonly unreachableResults: Map<string, UnreachableRecord>;
   private readonly shutdownHooks = new Set<Promise<unknown>>();
+  private readonly ownerShutdownHooks = new Set<RuntimePersistenceOwnerShutdownHook>();
   private replacementOptions: RuntimeReloadOptions | undefined;
   private previousRuntimeShutdownPromise: Promise<RuntimeShutdownReport> | undefined;
   private previousRuntimeShutdownFailure: unknown;
@@ -736,23 +746,9 @@ export class RuntimePersistence {
     const nowMs = finiteNow(this.now());
     pruneRuntimeIdentityHistory(history, nowMs);
     this.runtimeIdentityHistory = history;
-    const cachedGuardState = runtimeGuardStates.get(history);
-    if (
-      options.operationGuardState !== undefined &&
-      cachedGuardState !== undefined &&
-      options.operationGuardState !== cachedGuardState
-    ) {
-      throw new RuntimePersistenceError(
-        'identity_conflict',
-        'operationGuardState conflicts with the shared runtime identity history',
-      );
-    }
-    const guardState =
-      options.operationGuardState ?? cachedGuardState ?? sharedRuntimeOperationGuardState;
-    runtimeGuardStates.set(history, guardState);
-    this.operationGuardState = guardState;
-    this.acceptedOperations = guardState.acceptedOperations;
-    this.unreachableResults = guardState.unreachableResults;
+    this.operationGuardState = options.operationGuardState ?? createRuntimeOperationGuardState();
+    this.acceptedOperations = this.operationGuardState.acceptedOperations;
+    this.unreachableResults = this.operationGuardState.unreachableResults;
     this.identity = identityFromOptions(options);
     if (history.issued.has(this.identity.runtimeId)) {
       throw new RuntimePersistenceError(
@@ -856,6 +852,31 @@ export class RuntimePersistence {
     if (!this.active) {
       throw new RuntimePersistenceError('closed', 'runtime persistence boundary is closed');
     }
+  }
+  /** Register a resource owner that must be fenced before this runtime shuts down. */
+  public registerOwnerShutdownHook(hook: RuntimePersistenceOwnerShutdownHook): () => void {
+    if (typeof hook !== 'function') {
+      throw new TypeError('runtime owner shutdown hook must be a function');
+    }
+    if (!this.active) {
+      hook();
+      return () => undefined;
+    }
+    if (this.ownerShutdownHooks.size >= MAX_SHUTDOWN_HOOKS) {
+      throw new RuntimePersistenceError(
+        'busy',
+        'runtime owner shutdown hook capacity is temporarily exhausted',
+      );
+    }
+    this.ownerShutdownHooks.add(hook);
+    let registered = true;
+    return () => {
+      if (!registered) {
+        return;
+      }
+      registered = false;
+      this.ownerShutdownHooks.delete(hook);
+    };
   }
 
   /**
@@ -1212,6 +1233,7 @@ export class RuntimePersistence {
     // abort listeners, and shutdown hooks can all re-enter this boundary.
     this.shutdownPromise = shutdownPromise;
     this.lifecycleState = 'shutting_down';
+    this.notifyOwnerShutdownHooks();
 
     let tasks: RuntimeShutdownTask[] = [];
     try {
@@ -1448,6 +1470,17 @@ export class RuntimePersistence {
     }
     this.unreachableResults.delete(operationId);
   }
+  private notifyOwnerShutdownHooks(): void {
+    const hooks = [...this.ownerShutdownHooks];
+    this.ownerShutdownHooks.clear();
+    for (const hook of hooks) {
+      try {
+        hook();
+      } catch {
+        // Owner hooks are fences; shutdown remains idempotent even if a fence fails.
+      }
+    }
+  }
 
   private trackShutdownHook<T>(factory: () => T | PromiseLike<T>): Promise<T> | undefined {
     // Check capacity before creating a promise so an over-capacity hook can
@@ -1486,6 +1519,9 @@ export class RuntimePersistence {
       this.setTimeout,
       this.clearTimeout,
     );
+    if (outcomes.some((outcome) => !outcome.settled)) {
+      this.shutdownHooks.clear();
+    }
     const completedTasks = tasks.map((task, index) => {
       const outcome = outcomes[index];
       const delivery: RuntimeShutdownDelivery =
@@ -1525,14 +1561,16 @@ export class RuntimePersistence {
       const owner = this.taskStore.getOwner(previous.requestId) ?? {
         runtimeId: this.runtimeId,
       };
-      tasks.push({
-        identity: this.identity,
-        requestId: previous.requestId,
-        owner,
-        previous,
-        snapshot,
-        delivery: 'skipped',
-      });
+      tasks.push(
+        Object.freeze({
+          identity: this.identity,
+          requestId: previous.requestId,
+          owner,
+          previous,
+          snapshot,
+          delivery: 'skipped',
+        }),
+      );
     }
     return tasks;
   }
