@@ -771,7 +771,9 @@ export class SerializedLease {
             return Promise.reject(new LeaseExpiredError());
           }
         } catch (error: unknown) {
-          this.reportError(error);
+          // A shared renewal attempt owns its error notification.  In particular,
+          // expiry may reject the attempt while this concurrent preflight observes
+          // the same lifecycle transition; reporting here would duplicate it.
           return Promise.reject(error);
         }
       }
@@ -795,6 +797,14 @@ export class SerializedLease {
       this.reportError(error);
       return Promise.reject(error);
     }
+    let operationErrorReported = false;
+    const reportOperationError = (error: unknown): void => {
+      if (operationErrorReported) {
+        return;
+      }
+      operationErrorReported = true;
+      this.reportError(error);
+    };
     let rejectOnExpiry: (error: unknown) => void = () => undefined;
     const expiry = new Promise<never>((_resolve, reject) => {
       rejectOnExpiry = reject;
@@ -973,7 +983,7 @@ export class SerializedLease {
           this.inFlightRenewal = undefined;
           this.renewalExpiryReject = undefined;
         }
-        this.reportError(error);
+        reportOperationError(error);
         try {
           if (this.expiresAt !== null && clockValue(this.now) >= this.expiresAt) {
             this.markExpired();
@@ -1156,6 +1166,28 @@ export class SerializedLease {
       throw new LeaseConfigurationError('endpoint update became stale before callback');
     }
     const endpointCopy = cloneEndpoint(endpoint, ownerAtStart?.runtimeId);
+    // Endpoint validation may inspect a caller-controlled object.  Recheck every
+    // lease fence after that inspection and immediately before reflection so a
+    // reentrant stop/expire/endpoint update cannot invoke a stale callback.
+    const nowImmediatelyBeforeCallback = clockValue(this.now);
+    this.assertLifecycle(lifecycleGeneration);
+    if (nowImmediatelyBeforeCallback >= (this.expiresAt ?? Number.POSITIVE_INFINITY)) {
+      this.markExpired();
+      throw new LeaseExpiredError();
+    }
+    if (this.ownerIdentity !== undefined && ownerAtStart !== undefined) {
+      if (!sameIdentity(this.ownerIdentity, ownerAtStart)) {
+        throw new LeaseConfigurationError('lease owner changed before endpoint callback');
+      }
+    } else if (this.ownerIdentity !== ownerAtStart) {
+      throw new LeaseConfigurationError('lease owner changed before endpoint callback');
+    }
+    if (
+      this.endpointGeneration !== endpointGenerationAtStart ||
+      this.endpointGenerationAuthority !== endpointAuthorityAtStart
+    ) {
+      throw new LeaseConfigurationError('endpoint update became stale before callback');
+    }
     // Persist through the owning registry before changing this lease's local
     // snapshot.  A failed publication therefore cannot create divergent state.
     const callbackResult = this.onEndpointUpdate?.(endpointCopy);
