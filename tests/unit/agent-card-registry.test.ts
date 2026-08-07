@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -17,6 +17,7 @@ import {
   type AgentCardValidationCode,
   type AgentCardValidationResult,
   isAgentCard,
+  isSafeRuntimeInstanceId,
   validateAgentCard,
   validateLiveAgentCard,
 } from '../../src/protocol/validation.js';
@@ -92,6 +93,20 @@ function makeTemporaryRoot(): string {
   return root;
 }
 
+let windowsPathCounter = 0;
+
+function makeWindowsPath(label: string): string {
+  const profile = process.env.USERPROFILE ?? 'C:\\Users\\test-user';
+  const path = nodePath.win32.join(
+    profile,
+    'AppData',
+    'Local',
+    `pi-to-pi-unit-${process.pid}-${windowsPathCounter++}-${label}`,
+  );
+  temporaryRoots.push(path);
+  return path;
+}
+
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -134,6 +149,52 @@ describe('Agent Card schema and strict validation', () => {
 
     const oversized = validateAgentCard(makeCard(), { maxCardSizeBytes: 1 });
     expectIssue(oversized, '$', 'card-too-large');
+  });
+
+  it('rejects non-object roots, unknown nested fields, and missing structural fields', () => {
+    const cardWithoutRoleTags = { ...makeCard() } as Record<string, unknown>;
+    delete cardWithoutRoleTags.roleTags;
+    const cardWithoutCapabilities = { ...makeCard() } as Record<string, unknown>;
+    delete cardWithoutCapabilities.capabilities;
+    const cardWithoutEndpoint = { ...makeCard() } as Record<string, unknown>;
+    delete cardWithoutEndpoint.endpoint;
+
+    const cases: ReadonlyArray<{
+      input: unknown;
+      path: string;
+      code: AgentCardValidationCode;
+    }> = [
+      { input: 'not-a-card', path: '$', code: 'invalid-type' },
+      { input: [], path: '$', code: 'invalid-type' },
+      {
+        input: {
+          ...makeCard(),
+          model: { provider: 'openai', id: 'gpt-test', unexpected: true },
+        },
+        path: 'model.unexpected',
+        code: 'invalid-value',
+      },
+      {
+        input: {
+          ...makeCard(),
+          contextUsage: { tokens: 1, percent: 1, unexpected: true },
+        },
+        path: 'contextUsage.unexpected',
+        code: 'invalid-value',
+      },
+      {
+        input: { ...makeCard(), endpoint: { ...makeCard().endpoint, unexpected: true } },
+        path: 'endpoint.unexpected',
+        code: 'invalid-value',
+      },
+      { input: cardWithoutRoleTags, path: 'roleTags', code: 'missing-field' },
+      { input: cardWithoutCapabilities, path: 'capabilities', code: 'missing-field' },
+      { input: cardWithoutEndpoint, path: 'endpoint', code: 'missing-field' },
+    ];
+
+    for (const testCase of cases) {
+      expectIssue(validateAgentCard(testCase.input), testCase.path, testCase.code);
+    }
   });
 
   it('rejects unsupported versions, enum values, queue bounds, and malformed timestamps', () => {
@@ -213,6 +274,14 @@ describe('Agent Card schema and strict validation', () => {
     const cardWithoutContext = { ...makeCard() } as Record<string, unknown>;
     delete cardWithoutContext.contextUsage;
     expectIssue(validateAgentCard(cardWithoutContext), 'contextUsage', 'missing-field');
+
+    const cardWithoutWorkingDirectoryLabel = { ...makeCard() } as Record<string, unknown>;
+    delete cardWithoutWorkingDirectoryLabel.workingDirectoryLabel;
+    expectIssue(
+      validateAgentCard(cardWithoutWorkingDirectoryLabel),
+      'workingDirectoryLabel',
+      'missing-field',
+    );
 
     expect(validateAgentCard(makeCard()).valid).toBe(true);
     expect(
@@ -338,6 +407,24 @@ describe('Agent Card identity and room/path safety', () => {
       PrivateFilesystemError,
     );
   });
+
+  it('rejects unsafe runtime identities in validation and path construction', () => {
+    const root = nodePath.join(tmpdir(), 'pi-to-pi-runtime-identity-fixture');
+    const unsafeRuntimeIds = ['CON', 'runtime.', 'runtime ', 'runtime/name', 'runtime\\\\name'];
+
+    for (const runtimeInstanceId of unsafeRuntimeIds) {
+      const card = makeCard({
+        runtimeInstanceId,
+        endpoint: { ...makeCard().endpoint, runtimeInstanceId },
+      });
+
+      expect(isSafeRuntimeInstanceId(runtimeInstanceId)).toBe(false);
+      expectIssue(validateAgentCard(card), 'runtimeInstanceId', 'invalid-value');
+      expect(() => buildAgentCardPath(root, STORAGE_KEY, runtimeInstanceId)).toThrow(
+        PrivateFilesystemError,
+      );
+    }
+  });
 });
 
 describe('runtime-root selection', () => {
@@ -362,7 +449,7 @@ describe('runtime-root selection', () => {
       });
 
       expect(selection).toMatchObject({ path: override, source: 'override' });
-      expect(statSync(override).mode & 0o777).toBe(PRIVATE_DIRECTORY_MODE);
+      expect(statSync(override).mode & 0o777).toBe(0o700);
     });
 
     it('selects a private XDG child when no override is usable', () => {
@@ -370,11 +457,13 @@ describe('runtime-root selection', () => {
         return;
       }
       const xdg = makeTemporaryRoot();
+      const insecureOverride = makeTemporaryRoot();
+      chmodSync(insecureOverride, 0o755);
       const temporaryDirectory = makeTemporaryRoot();
       const selection = resolveRuntimeRoot({
         platform: 'linux',
         uid,
-        env: { XDG_RUNTIME_DIR: xdg },
+        env: { PI_TO_PI_RUNTIME_DIR: insecureOverride, XDG_RUNTIME_DIR: xdg },
         temporaryDirectory,
         warn: vi.fn(),
       });
@@ -383,7 +472,7 @@ describe('runtime-root selection', () => {
         path: nodePath.join(xdg, 'pi-to-pi'),
         source: 'xdg',
       });
-      expect(statSync(selection.path).mode & 0o777).toBe(PRIVATE_DIRECTORY_MODE);
+      expect(statSync(selection.path).mode & 0o777).toBe(0o700);
     });
 
     it('falls back to a deterministic private per-user temporary root with a warning', () => {
@@ -407,7 +496,7 @@ describe('runtime-root selection', () => {
       expect(selection).toMatchObject({ path: expectedPath, source: 'temporary' });
       expect(selection.warning).toContain('private temporary runtime root');
       expect(warn).toHaveBeenCalledWith(selection.warning);
-      expect(statSync(expectedPath).mode & 0o777).toBe(PRIVATE_DIRECTORY_MODE);
+      expect(statSync(expectedPath).mode & 0o777).toBe(0o700);
 
       const secondSelection = resolveRuntimeRoot({
         platform: 'linux',
@@ -418,6 +507,28 @@ describe('runtime-root selection', () => {
         warn,
       });
       expect(secondSelection.path).toBe(expectedPath);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails closed when an existing temporary fallback directory is not private', () => {
+      if (uid === undefined) {
+        return;
+      }
+      const temporaryDirectory = makeTemporaryRoot();
+      const fallback = nodePath.join(temporaryDirectory, `pi-to-pi-uid-${uid}`);
+      mkdirSync(fallback);
+      chmodSync(fallback, 0o755);
+
+      expect(statSync(fallback).mode & 0o777).toBe(0o755);
+      expect(() =>
+        resolveRuntimeRoot({
+          platform: 'linux',
+          uid,
+          env: {},
+          temporaryDirectory,
+          warn: vi.fn(),
+        }),
+      ).toThrow(RuntimeRootError);
     });
 
     it('fails closed when no absolute private fallback can be established', () => {
@@ -430,6 +541,54 @@ describe('runtime-root selection', () => {
           warn: vi.fn(),
         }),
       ).toThrow(RuntimeRootError);
+    });
+  });
+
+  describe('on Windows via injected platform', () => {
+    it('selects a usable LocalAppData runtime root with ACL protection', () => {
+      const localAppData = makeWindowsPath('local-app-data');
+      const temporaryDirectory = makeWindowsPath('temporary');
+      const expectedPath = nodePath.win32.join(localAppData, 'pi-to-pi', 'runtime');
+      temporaryRoots.push(expectedPath);
+      const protectWindowsPath = vi.fn<(target: string) => void>();
+      const selection = resolveRuntimeRoot({
+        platform: 'win32',
+        env: { LOCALAPPDATA: localAppData, USERNAME: 'unit-user' },
+        temporaryDirectory,
+        homeDirectory: nodePath.win32.join(localAppData, 'home'),
+        protectWindowsPath,
+        warn: vi.fn(),
+      });
+
+      expect(selection).toMatchObject({ path: expectedPath, source: 'local-app-data' });
+      expect(selection.path).toBe(expectedPath);
+      expect(protectWindowsPath.mock.calls.map(([target]) => target)).toEqual(
+        process.platform === 'win32' ? [expectedPath] : [],
+      );
+    });
+
+    it('falls back to a private temporary root when LocalAppData is unusable', () => {
+      const temporaryDirectory = makeWindowsPath('temporary-fallback');
+      const protectWindowsPath = vi.fn<(target: string) => void>();
+      const warn = vi.fn<(message: string) => void>();
+      const selection = resolveRuntimeRoot({
+        platform: 'win32',
+        env: { LOCALAPPDATA: 'relative-local-app-data', USERNAME: 'unit-user' },
+        temporaryDirectory,
+        homeDirectory: nodePath.win32.join(temporaryDirectory, 'home'),
+        protectWindowsPath,
+        warn,
+      });
+      temporaryRoots.push(selection.path);
+
+      expect(selection.source).toBe('temporary');
+      expect(nodePath.win32.dirname(selection.path)).toBe(temporaryDirectory);
+      expect(nodePath.win32.basename(selection.path)).toMatch(/^pi-to-pi-user-[0-9a-f]{24}$/u);
+      expect(selection.warning).toContain('LocalAppData runtime root is unavailable');
+      expect(warn).toHaveBeenCalledWith(selection.warning);
+      expect(protectWindowsPath.mock.calls.map(([target]) => target)).toEqual(
+        process.platform === 'win32' ? [selection.path] : [],
+      );
     });
   });
 });
