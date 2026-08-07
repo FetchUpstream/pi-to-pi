@@ -20,6 +20,7 @@ Run these commands from the repository root on Ubuntu, macOS, or Windows. They
 are one-line commands so the same text works in Bash, PowerShell, and `cmd.exe`:
 
 ```text
+node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 22 || (major === 22 && minor < 19)) { console.error('Node >=22.19.0 required; found ' + process.version); process.exit(1); }"
 node --version
 npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-ipc-spike --reporter=verbose
 npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
@@ -27,9 +28,8 @@ npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=v
 
 The first Vitest command is the raw candidate matrix: it intentionally names
 `endpoint.test.ts` rather than the whole `tests/fixtures/local-ipc` directory,
-so it cannot accidentally select the HTTP directory by path prefix. The second
-command is the HTTP comparison. A run is valid only when `node --version` is
-`v22.19.0` or later and the command exits with status `0`; the verbose output
+so it cannot accidentally select the HTTP directory by path prefix.
+The second command is the HTTP comparison. The Node guard must exit with status `0`; `node --version` records the exact runtime after the guard, and the verbose output
 must be retained, not replaced by a test-count summary.
 
 For the full fixture check, run the two focused commands above followed by:
@@ -39,28 +39,33 @@ npm run typecheck
 npx eslint tests/fixtures/local-ipc tests/fixtures/local-ipc-spike tests/fixtures/local-ipc-http
 ```
 
-The exact commands and per-test output captured on the available runner are
+The canonical test commands and per-test output captured on the available runner are
 stored beside this record:
 
-- [`raw-run-1.txt`](evidence/ubuntu-node-25.0.0/raw-run-1.txt) — raw run 1;
+- [`raw-run-1.txt`](evidence/ubuntu-node-25.0.0/raw-run-1.txt) — canonical raw run 1;
   6 files, 70 tests passed.
-- [`raw-run-2.txt`](evidence/ubuntu-node-25.0.0/raw-run-2.txt) — raw run 2;
+- [`raw-run-2.txt`](evidence/ubuntu-node-25.0.0/raw-run-2.txt) — canonical raw run 2;
   6 files, 70 tests passed.
-- [`http-run-1.txt`](evidence/ubuntu-node-25.0.0/http-run-1.txt) — HTTP run 1;
+- [`raw-run-3.txt`](evidence/ubuntu-node-25.0.0/raw-run-3.txt) — canonical raw run 3;
+  6 files, 70 tests passed.
+- [`http-run-1.txt`](evidence/ubuntu-node-25.0.0/http-run-1.txt) — canonical HTTP run 1;
   1 file, 14 tests passed.
-- [`http-run-2.txt`](evidence/ubuntu-node-25.0.0/http-run-2.txt) — HTTP run 2;
+- [`http-run-2.txt`](evidence/ubuntu-node-25.0.0/http-run-2.txt) — canonical HTTP run 2;
+  1 file, 14 tests passed.
+- [`http-run-3.txt`](evidence/ubuntu-node-25.0.0/http-run-3.txt) — canonical HTTP run 3;
   1 file, 14 tests passed.
 - [`cleanup-baseline-delta.txt`](evidence/ubuntu-node-25.0.0/cleanup-baseline-delta.txt)
-  — a third raw and HTTP run with pre/post artifact inventories and deltas.
+  — separate pre/post artifact inventory captured around the third raw/HTTP repetitions; it is not a test-run record or a fourth run.
 - [`repository-checks.txt`](evidence/ubuntu-node-25.0.0/repository-checks.txt)
   — typecheck, focused lint, format check, and full repository test output.
 - [`openspec-validation.txt`](evidence/ubuntu-node-25.0.0/openspec-validation.txt)
   — strict OpenSpec change validation output.
 
-Each `✓` line in those files is the Vitest pass/fail output for an acceptance
-scenario. There are no silently skipped tests: non-native-platform cases are
-assertions that emit an explicit limitation string and pass only as a recorded
-limitation.
+Each canonical raw/HTTP run file contains the Vitest pass/fail output for its acceptance
+scenarios. `cleanup-baseline-delta.txt` contains only inventory/delta metadata around
+the third raw and HTTP repetitions; it is not a replacement for either run file.
+Non-native-platform cases are explicit limitation assertions; they do not claim native
+macOS or Windows support.
 
 ## Platform matrix
 
@@ -105,26 +110,29 @@ for 70 passing tests in 6 files.
 
 ## HTTP comparison acceptance matrix
 
-| Acceptance area                       | Exact evidence covered by `http-candidate.test.ts`                                                                                                                                   | Ubuntu result                                                                        |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| Native one-operation request/response | `round-trips one request and one response over the native POSIX endpoint`                                                                                                            | **PASS**                                                                             |
-| Request and response body limits      | `rejects an oversized request before invoking the handler`, `rejects an oversized response without retaining an unbounded body`, and `bounds raw HTTP response capture`              | **PASS**                                                                             |
-| Write and close bounds                | `bounds server response writes and completes resource cleanup`, `bounds close by the caller deadline and preserves a failed close`                                                   | **PASS**                                                                             |
-| Connect/write/read deadlines          | `applies finite connect, write, and read phase deadlines`                                                                                                                            | **PASS**                                                                             |
-| Caller cancellation                   | `destroys the request when the caller aborts`                                                                                                                                        | **PASS**                                                                             |
-| HTTP parser/framing                   | `handles split HTTP headers/body and rejects malformed HTTP through the parser`; chunked input is sent in separate writes and truncated `Content-Length` does not invoke the handler | **PASS**                                                                             |
-| Concurrent one-operation requests     | `supports concurrent one-operation requests and preserves response association`                                                                                                      | **PASS**                                                                             |
-| Keep-alive and endpoint cleanup       | `closes the HTTP server, disables keep-alive, and removes its POSIX socket`; this also exercises an abrupt child and stale socket recovery                                           | **PASS**                                                                             |
-| Endpoint replacement safety           | `recovers an unchanged moved regular-file replacement without following it` and the corresponding symlink case                                                                       | **PASS**                                                                             |
-| Windows endpoint limitation           | `represents Windows named pipes explicitly even when this run is not Windows`                                                                                                        | **PASS as an explicit limitation assertion**; native Windows HTTP result unavailable |
+| Acceptance area                       | Exact evidence covered by `http-candidate.test.ts`                                                                                                                                                             | Ubuntu result                                                                        |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Native one-operation request/response | `round-trips one request and one response over the native POSIX endpoint`                                                                                                                                      | **PASS**                                                                             |
+| Request and response body limits      | `rejects an oversized request before invoking the handler`, `rejects an oversized response without retaining an unbounded body`, and `bounds raw HTTP response capture`                                        | **PASS**                                                                             |
+| Write and close bounds                | `bounds server response writes and completes resource cleanup`, `bounds close by the caller deadline and preserves a failed close`                                                                             | **PASS**                                                                             |
+| Connect/write/read deadlines          | `applies finite connect, write, and read phase deadlines`                                                                                                                                                      | **PASS**                                                                             |
+| Caller cancellation                   | `destroys the request when the caller aborts`                                                                                                                                                                  | **PASS**                                                                             |
+| HTTP parser/framing                   | `handles split HTTP headers/body and rejects malformed HTTP through the parser`; chunked input is sent in separate writes and truncated `Content-Length` does not invoke the handler                           | **PASS**                                                                             |
+| Concurrent one-operation requests     | `supports concurrent one-operation requests and preserves response association`                                                                                                                                | **PASS**                                                                             |
+| Keep-alive and endpoint cleanup       | `closes the HTTP server, disables keep-alive, and removes its POSIX socket`; its Windows branch asserts the named-pipe limitation; this also exercises an abrupt child and stale socket recovery               | **PASS**                                                                             |
+| Endpoint replacement safety           | `recovers an unchanged moved regular-file replacement without following it` and corresponding symlink case; each Windows branch asserts the named-pipe limitation instead of running POSIX replacement cleanup | **PASS**                                                                             |
+| Windows endpoint limitation           | `represents Windows named pipes explicitly even when this run is not Windows`                                                                                                                                  | **PASS as an explicit limitation assertion**; native Windows HTTP result unavailable |
 
-The HTTP run totals are stable across runs 1, 2, and 3: 14 passing tests in one
-file. The fixture's focused report also records that no slow-drip response peer
-was exercised for HTTP; therefore no HTTP slow-drip result is claimed.
+The canonical HTTP run files `http-run-1.txt`, `http-run-2.txt`, and `http-run-3.txt`
+each record 14 passing tests in one file. The fixture's focused report also records that no
+slow-drip response peer was exercised for HTTP; therefore no HTTP slow-drip result is claimed.
 
 ## Repeated-run cleanup evidence
 
-`cleanup-baseline-delta.txt` runs the raw command and then the HTTP command,
+The canonical test records are `raw-run-1.txt`, `raw-run-2.txt`, and `raw-run-3.txt`
+for raw (70 tests each), plus `http-run-1.txt`, `http-run-2.txt`, and `http-run-3.txt`
+for HTTP (14 tests each). `cleanup-baseline-delta.txt` is a separate cleanup inventory
+captured around the third pair; it runs the raw command and then the HTTP command
 with a pre-run and post-run inventory of:
 
 - POSIX socket files (`/tmp/p2p-*.sock`);
@@ -148,10 +156,12 @@ Ubuntu inventory and remains a required native Windows run.
 
 ## Evidence status
 
-- Ubuntu/Linux raw candidate: **PASS**, all 70 scenarios in each of three runs.
-- Ubuntu/Linux HTTP candidate: **PASS**, all 14 scenarios in each of three runs.
-- Ubuntu/Linux repeated cleanup delta: **PASS**, no new artifacts or fixture
-  children.
+- Ubuntu/Linux raw candidate: **PASS** — `raw-run-1.txt`, `raw-run-2.txt`, and
+  `raw-run-3.txt` each contain all 70 passing scenarios.
+- Ubuntu/Linux HTTP candidate: **PASS** — `http-run-1.txt`, `http-run-2.txt`, and
+  `http-run-3.txt` each contain all 14 passing scenarios.
+- Ubuntu/Linux repeated cleanup delta: **PASS** — `cleanup-baseline-delta.txt` records
+  no new artifacts or fixture children.
 - macOS raw/HTTP/cleanup: **UNAVAILABLE**, native runner required; no pass
   claimed.
 - Windows raw/HTTP/cleanup: **UNAVAILABLE**, native named-pipe runner required;

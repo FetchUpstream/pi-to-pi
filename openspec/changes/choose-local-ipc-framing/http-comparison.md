@@ -113,19 +113,22 @@ for the candidate or its tests.
 | macOS           | `/tmp/p2p-<24 hex>.sock` | Not run in this Linux environment                                                                                       | The code uses the same Node Unix-socket API and needs a native macOS run; no macOS pass is claimed here                                                                                                                                                                         |
 | Windows         | `\\?\pipe\p2p-<24 hex>`  | Endpoint shape and capability reporting were exercised without binding; actual HTTP named-pipe bind/request was not run | A Linux runtime cannot honestly execute Windows named-pipe semantics. Node's `listen(endpoint)` and `request({ socketPath: endpoint })` are wired for the generated pipe namespace, but ACLs, parser behavior, cleanup, and one-operation lifecycle require Windows CI evidence |
 
-The test explicitly records the Windows named-pipe limitation rather than
-skipping it silently. The fixture's Windows branch uses the OS-owned named-pipe
-lifecycle and never calls POSIX filesystem cleanup. A future Windows run must
-execute the same focused test command and preserve its result before the HTTP
-candidate could be considered portable.
+The test explicitly records the Windows named-pipe limitation rather than skipping
+it silently. POSIX-only cleanup branches assert the active platform and named-pipe
+endpoint alongside a limitation string; they never call POSIX filesystem cleanup. A
+future Windows run must execute the same focused test command and preserve its result
+before the HTTP candidate could be considered portable.
 
 ## Reproducibility
 
 ```sh
-npm test -- --run tests/fixtures/local-ipc-http/http-candidate.test.ts
+node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 22 || (major === 22 && minor < 19)) { console.error('Node >=22.19.0 required; found ' + process.version); process.exit(1); }"
+node --version
+npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
 ```
 
-The focused test command is the available-platform evidence for this work. The
-candidate remains isolated from the raw `node:net` candidate and production
-transport; no external service is started and no production transport behavior
-is changed.
+The Node guard must pass before the focused test command; `node --version` records
+the exact runtime. The focused test command is the available-platform evidence for
+this work. The candidate remains isolated from the raw `node:net` candidate and
+production transport; no external service is started and no production transport
+behavior is changed.

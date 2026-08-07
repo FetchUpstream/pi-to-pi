@@ -121,6 +121,19 @@ async function startServer(
   return { endpoint, server };
 }
 
+function assertWindowsHttpLimitation(limitation: string): void {
+  const endpoint = createHttpIpcEndpoint();
+  expect({
+    platform: process.platform,
+    endpointKind: getHttpIpcEndpointKind(endpoint),
+    limitation,
+  }).toEqual({
+    platform: 'win32',
+    endpointKind: 'named-pipe',
+    limitation,
+  });
+}
+
 interface RawHttpRequestOptions {
   readonly connectTimeoutMs?: number;
   readonly writeTimeoutMs?: number;
@@ -535,6 +548,11 @@ describe('HTTP over local IPC comparison candidate', () => {
     await candidate.server.close();
 
     expect(candidate.server.activeConnectionCount).toBe(0);
+    if (process.platform === 'win32') {
+      assertWindowsHttpLimitation(
+        'Windows named-pipe cleanup is OS-owned; POSIX socket removal is not exercised',
+      );
+    }
     if (process.platform !== 'win32') {
       expect(existsSync(endpoint)).toBe(false);
     }
@@ -574,6 +592,9 @@ describe('HTTP over local IPC comparison candidate', () => {
     'recovers an unchanged moved %s replacement without following it',
     async (replacementKind) => {
       if (process.platform === 'win32') {
+        assertWindowsHttpLimitation(
+          'POSIX replacement cleanup requires a Linux or macOS runner; Windows uses OS-owned named pipes',
+        );
         return;
       }
       const endpoint = createHttpIpcEndpoint();
@@ -634,6 +655,9 @@ describe('HTTP over local IPC comparison candidate', () => {
       return payload;
     });
     if (process.platform === 'win32') {
+      assertWindowsHttpLimitation(
+        'Windows named-pipe close uses the native OS lifecycle; POSIX stale-socket retry is not exercised',
+      );
       const response = requestHttpIpcResponse(candidate.endpoint, Buffer.from('x'));
       try {
         await delay(10);

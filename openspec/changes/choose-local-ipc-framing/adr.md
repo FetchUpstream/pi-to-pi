@@ -66,17 +66,21 @@ The available runner is Ubuntu/Linux (`Linux 7.0.0-28-generic x86_64`) with
 Node `v25.0.0` (`>=22.19.0`). The reproducible commands are:
 
 ```text
+node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 22 || (major === 22 && minor < 19)) { console.error('Node >=22.19.0 required; found ' + process.version); process.exit(1); }"
 node --version
 npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-ipc-spike --reporter=verbose
 npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
 ```
 
-The same one-line commands are valid in Bash, PowerShell, and `cmd.exe`; the
-verbose output must be retained. The raw command passed 70 tests in 6 files on
-each of three runs. The HTTP command passed 14 tests in 1 file on each of
-three runs. The exact per-test output is retained in the evidence directory;
-non-native platform cases are explicit limitation assertions rather than
-silently skipped tests.
+The same one-line commands are valid in Bash, PowerShell, and `cmd.exe`. The Node
+guard must exit with status `0`; `node --version` records the exact runtime, and
+the verbose output must be retained. Canonical raw evidence is indexed as
+`raw-run-1.txt`, `raw-run-2.txt`, and `raw-run-3.txt` (70 tests in 6 files each);
+canonical HTTP evidence is `http-run-1.txt`, `http-run-2.txt`, and `http-run-3.txt`
+(14 tests in 1 file each). `cleanup-baseline-delta.txt` is a separate pre/post
+inventory around the third pair, not an additional test run. Non-native platform
+cases are explicit limitation assertions; no native macOS or Windows support is
+claimed from the Ubuntu run.
 
 | Candidate                      | Ubuntu/Linux, Node `v25.0.0`                                                                  | macOS, Node `>=22.19.0`                                      | Windows, Node `>=22.19.0`                                              |
 | ------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------- |
@@ -129,11 +133,13 @@ non-socket, a live listener, an arbitrary root, or an inconclusive probe is not
 blindly unlinked. Windows named-pipe lifetime is delegated to the operating
 system and requires native Windows evidence.
 
-The repeated Ubuntu run began with three pre-existing `/tmp/p2p-*.sock` files
-and eleven `/tmp/p2p-*` temporary directories. The run introduced no new
-socket, quarantine entry, temporary directory, or fixture child, and it did not
-remove those unrelated baseline entries because ownership was not established.
-This is the honest cleanup result; a global absence claim would be incorrect.
+The separate `cleanup-baseline-delta.txt` records the pre/post artifact inventory
+captured around `raw-run-3.txt` and `http-run-3.txt`; it is not a fourth test run.
+The baseline contained three pre-existing `/tmp/p2p-*.sock` files and eleven
+`/tmp/p2p-*` temporary directories. The run introduced no new socket, quarantine
+entry, temporary directory, or fixture child, and it did not remove those unrelated
+baseline entries because ownership was not established. This is the honest cleanup
+result; a global absence claim would be incorrect.
 
 ## Transport-only interface
 
@@ -194,8 +200,8 @@ recorded as a follow-up decision rather than silently changing this evidence.
    Windows named-pipe behavior, ACLs, process cleanup, and endpoint lifecycle
    require native runners. No unavailable row is reported as a pass.
 2. The available runtime was Node `v25.0.0`, which satisfies but does not equal
-   the declared minimum `v22.19.0`. The commands enforce the lower bound; a
-   release matrix should still include the minimum line explicitly.
+   the declared minimum `v22.19.0`. The reproducible Node guard command enforces
+   the lower bound; a release matrix should still include the minimum line explicitly.
 3. The HTTP suite did not include a slow-drip response peer. The selected raw
    candidate does, and no equivalent HTTP claim is made.
 4. The spike is behavioral evidence, not a throughput or latency benchmark. It

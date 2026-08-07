@@ -8,7 +8,9 @@ message/task module.
 Run the focused candidate checks with:
 
 ```sh
-npm test -- --run tests/fixtures/local-ipc-http/http-candidate.test.ts
+node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 22 || (major === 22 && minor < 19)) { console.error('Node >=22.19.0 required; found ' + process.version); process.exit(1); }"
+node --version
+npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
 ```
 
 `http-candidate.ts` binds `http.createServer()` to the generated Unix socket or
