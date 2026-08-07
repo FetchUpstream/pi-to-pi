@@ -1,2 +1,270 @@
-/** Session and runtime identity boundary reserved for a later implementation wave. */
-export {};
+import { randomUUID } from 'node:crypto';
+
+/**
+ * The logical identity of a Pi conversation. Pi supplies this value through its
+ * session manager; this module deliberately does not create or persist it.
+ */
+export type SessionId = string;
+
+/**
+ * The identity of one live extension runtime and its routing endpoint.
+ */
+export type RuntimeId = string;
+
+/**
+ * Identity carried by protocol envelopes and discovery records.
+ *
+ * A session can have more than one runtime over its lifetime (for example,
+ * after `/reload`). The runtime ID is therefore the endpoint identity; the
+ * session ID is only the stable logical-session identity.
+ */
+export interface SessionRuntimeIdentity {
+  readonly sessionId: SessionId;
+  readonly runtimeId: RuntimeId;
+}
+
+/** Alias used by callers that refer to the pair as a runtime identity. */
+export type RuntimeIdentity = SessionRuntimeIdentity;
+
+/** A native Pi session-manager shape, kept local so this module has no Pi dependency. */
+export interface SessionManagerLike {
+  getSessionId(): SessionId;
+}
+
+/** Factory seam for deterministic lifecycle tests. */
+export type RuntimeIdFactory = () => RuntimeId;
+
+/** A full machine-actionable runtime address, scoped to an exact room. */
+export interface RuntimeAddress {
+  readonly runtimeId: RuntimeId;
+  readonly roomId: string;
+}
+
+/** Error raised when an identity input is empty or contains unsafe control data. */
+export class IdentityInputError extends TypeError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IdentityInputError';
+  }
+}
+
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
+
+function requireIdentifier(value: string, field: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new IdentityInputError(`${field} must be a non-empty string`);
+  }
+
+  if (CONTROL_CHARACTER_PATTERN.test(value)) {
+    throw new IdentityInputError(`${field} must not contain control characters`);
+  }
+
+  return value;
+}
+
+/** Return whether a value has the UUIDv4 representation used by runtime IDs. */
+export function isUuidV4(value: unknown): value is RuntimeId {
+  return typeof value === 'string' && UUID_V4_PATTERN.test(value);
+}
+
+/** Validate and create one runtime ID using the supplied (or cryptographic) factory. */
+export function createRuntimeId(factory: RuntimeIdFactory = randomUUID): RuntimeId {
+  return requireIdentifier(factory(), 'runtimeId');
+}
+
+/**
+ * Create the identity for one started extension runtime.
+ *
+ * `sessionId` must be read from Pi's native session manager at `session_start`.
+ * Calling this function again with the same session ID intentionally preserves
+ * the logical identity while generating a new runtime ID.
+ */
+export function createRuntimeIdentity(
+  sessionId: SessionId,
+  runtimeIdFactory: RuntimeIdFactory = randomUUID,
+): SessionRuntimeIdentity {
+  const stableSessionId = requireIdentifier(sessionId, 'sessionId');
+  const runtimeId = createRuntimeId(runtimeIdFactory);
+
+  return Object.freeze({ sessionId: stableSessionId, runtimeId });
+}
+
+/** Explicitly named alias for callers that prefer the pair's full name. */
+export const createSessionRuntimeIdentity = createRuntimeIdentity;
+
+/** Create a runtime identity from a Pi-like native session manager. */
+export function createRuntimeIdentityFromSessionManager(
+  sessionManager: SessionManagerLike,
+  runtimeIdFactory: RuntimeIdFactory = randomUUID,
+): SessionRuntimeIdentity {
+  return createRuntimeIdentity(sessionManager.getSessionId(), runtimeIdFactory);
+}
+
+/** Type guard for values received from discovery or a protocol boundary. */
+export function isSessionRuntimeIdentity(value: unknown): value is SessionRuntimeIdentity {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as { sessionId?: unknown; runtimeId?: unknown };
+  return (
+    typeof candidate.sessionId === 'string' &&
+    typeof candidate.runtimeId === 'string' &&
+    candidate.sessionId.length > 0 &&
+    candidate.runtimeId.length > 0 &&
+    !CONTROL_CHARACTER_PATTERN.test(candidate.sessionId) &&
+    !CONTROL_CHARACTER_PATTERN.test(candidate.runtimeId)
+  );
+}
+
+/** Create an exact runtime address; the runtime UUID and room are both required for routing. */
+export function createRuntimeAddress(
+  runtime: RuntimeId | SessionRuntimeIdentity,
+  roomId: string,
+): RuntimeAddress {
+  const runtimeId = typeof runtime === 'string' ? runtime : runtime.runtimeId;
+  return Object.freeze({
+    runtimeId: requireIdentifier(runtimeId, 'runtimeId'),
+    roomId: requireIdentifier(roomId, 'roomId'),
+  });
+}
+
+/** Type guard for an exact runtime address. */
+export function isRuntimeAddress(value: unknown): value is RuntimeAddress {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as { runtimeId?: unknown; roomId?: unknown };
+  return (
+    typeof candidate.runtimeId === 'string' &&
+    typeof candidate.roomId === 'string' &&
+    candidate.runtimeId.length > 0 &&
+    candidate.roomId.length > 0 &&
+    !CONTROL_CHARACTER_PATTERN.test(candidate.runtimeId) &&
+    !CONTROL_CHARACTER_PATTERN.test(candidate.roomId)
+  );
+}
+
+/** Exact comparison for machine-actionable runtime addresses. */
+export function runtimeAddressesEqual(left: RuntimeAddress, right: RuntimeAddress): boolean {
+  return left.runtimeId === right.runtimeId && left.roomId === right.roomId;
+}
+
+/** Alias emphasizing that a runtime address is the peer address. */
+export const peerAddressesEqual = runtimeAddressesEqual;
+
+/**
+ * Owns the identity of the currently live runtime.
+ *
+ * Every `start`/`reload` call creates a fresh runtime ID. Shutdown accepts an
+ * optional runtime ID so a delayed shutdown from an old runtime cannot clear a
+ * replacement runtime's identity. Shutdown is idempotent for the current
+ * runtime and for an already stopped lifecycle.
+ */
+export class RuntimeIdentityLifecycle {
+  private readonly runtimeIdFactory: RuntimeIdFactory;
+  private readonly issuedRuntimeIds = new Set<RuntimeId>();
+  private currentIdentity: SessionRuntimeIdentity | undefined;
+
+  constructor(options: RuntimeIdentityLifecycleOptions | RuntimeIdFactory = {}) {
+    this.runtimeIdFactory =
+      typeof options === 'function' ? options : (options.runtimeIdFactory ?? randomUUID);
+  }
+
+  get current(): SessionRuntimeIdentity | undefined {
+    return this.currentIdentity;
+  }
+
+  get state(): 'active' | 'stopped' {
+    return this.currentIdentity === undefined ? 'stopped' : 'active';
+  }
+
+  /** Start a runtime for the session ID read from Pi at `session_start`. */
+  start(sessionId: SessionId): SessionRuntimeIdentity {
+    const stableSessionId = requireIdentifier(sessionId, 'sessionId');
+    let runtimeId = createRuntimeId(this.runtimeIdFactory);
+
+    // A custom test factory may return a duplicate. Do not allow a lifecycle
+    // to issue the same endpoint identity twice.
+    if (this.issuedRuntimeIds.has(runtimeId)) {
+      do {
+        runtimeId = createRuntimeId(randomUUID);
+      } while (this.issuedRuntimeIds.has(runtimeId));
+    }
+
+    this.issuedRuntimeIds.add(runtimeId);
+    this.currentIdentity = Object.freeze({ sessionId: stableSessionId, runtimeId });
+    return this.currentIdentity;
+  }
+
+  /** Start a runtime using a Pi-like native session manager. */
+  startFromSessionManager(sessionManager: SessionManagerLike): SessionRuntimeIdentity {
+    return this.start(sessionManager.getSessionId());
+  }
+
+  /** Replace the current runtime while retaining its logical session identity. */
+  reload(): SessionRuntimeIdentity {
+    if (this.currentIdentity === undefined) {
+      throw new IdentityInputError('cannot reload before a runtime has started');
+    }
+
+    return this.start(this.currentIdentity.sessionId);
+  }
+
+  /**
+   * Release the current runtime. Passing an old runtime identity after replacement
+   * is a no-op and returns false; repeated shutdown is safe and returns true.
+   */
+  shutdown(runtime?: RuntimeId | SessionRuntimeIdentity): boolean {
+    if (this.currentIdentity === undefined) {
+      return true;
+    }
+
+    const runtimeId = typeof runtime === 'string' ? runtime : runtime?.runtimeId;
+    if (runtimeId !== undefined && runtimeId !== this.currentIdentity.runtimeId) {
+      return false;
+    }
+
+    this.currentIdentity = undefined;
+    return true;
+  }
+
+  /** Alias used by resource-owning lifecycle adapters. */
+  close(runtime?: RuntimeId | SessionRuntimeIdentity): boolean {
+    return this.shutdown(runtime);
+  }
+
+  /** Return whether an identity belongs to this currently live runtime. */
+  isCurrent(identityOrRuntimeId: SessionRuntimeIdentity | RuntimeId): boolean {
+    const runtimeId =
+      typeof identityOrRuntimeId === 'string' ? identityOrRuntimeId : identityOrRuntimeId.runtimeId;
+    return this.currentIdentity?.runtimeId === runtimeId;
+  }
+}
+
+export interface RuntimeIdentityLifecycleOptions {
+  readonly runtimeIdFactory?: RuntimeIdFactory;
+}
+
+/** Factory form for consumers that prefer composition over class construction. */
+export function createRuntimeIdentityLifecycle(
+  options: RuntimeIdentityLifecycleOptions | RuntimeIdFactory = {},
+): RuntimeIdentityLifecycle {
+  return new RuntimeIdentityLifecycle(options);
+}
+
+/** Short alias for lifecycle integrations. */
+export const createIdentityLifecycle = createRuntimeIdentityLifecycle;
+
+/** Compare two identities exactly, including the live runtime generation. */
+export function runtimeIdentitiesEqual(
+  left: SessionRuntimeIdentity,
+  right: SessionRuntimeIdentity,
+): boolean {
+  return left.sessionId === right.sessionId && left.runtimeId === right.runtimeId;
+}
+
+/** Alias for callers that use the shorter runtime terminology. */
+export const isSameRuntimeIdentity = runtimeIdentitiesEqual;
