@@ -21,7 +21,7 @@ type ProtocolLimitName = keyof ProtocolLimits;
  * than the v1 ceiling for that limit.
  */
 const V1_LIMIT_CEILINGS: Readonly<ProtocolLimits> = Object.freeze({
-  requestTtlMs: DEFAULT_REQUEST_TTL_MS,
+  requestTtlMs: MAX_REQUEST_TTL_MS,
   maxRequestTtlMs: MAX_REQUEST_TTL_MS,
   maxControlTtlMs: MAX_CONTROL_TTL_MS,
   maxEnvelopeBytes: MAX_ENVELOPE_BYTES,

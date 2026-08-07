@@ -4,7 +4,6 @@ import { isSafeIdentifier, isUuidV4 as canonicalIsUuidV4 } from '../identity.js'
 import { isRoomId } from '../room.js';
 import {
   createProtocolConfig,
-  DEFAULT_REQUEST_TTL_MS,
   DEFAULT_QUEUE_LIMIT,
   MAX_CONTROL_TTL_MS,
   MAX_ENVELOPE_BYTES,
@@ -1524,7 +1523,7 @@ function validateSchemaShape(
   }
 
   for (const key of ['allOf', 'anyOf', 'oneOf'] as const) {
-    if (Array.isArray(value[key])) {
+    if (hasOwn(value, key) && Array.isArray(value[key])) {
       for (const [index, child] of value[key].entries()) {
         const childIssue = validateSchemaShape(child, `${path}.${key}[${index}]`, seen, references);
         if (childIssue !== undefined) {
@@ -1606,7 +1605,7 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
       return;
     }
     seen.add(value);
-    if (typeof value.$anchor === 'string') {
+    if (hasOwn(value, '$anchor') && typeof value.$anchor === 'string') {
       if (anchors.has(value.$anchor) && anchorIssue === undefined) {
         anchorIssue = issue(
           'malformed',
@@ -1618,7 +1617,7 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
         anchors.set(value.$anchor, value);
       }
     }
-    if (typeof value.$dynamicAnchor === 'string') {
+    if (hasOwn(value, '$dynamicAnchor') && typeof value.$dynamicAnchor === 'string') {
       anchors.set(value.$dynamicAnchor, value);
     }
 
@@ -1634,10 +1633,11 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
       'patternProperties',
       'properties',
     ] as const) {
-      if (isPlainObject(value[key])) {
-        for (const [name, child] of Object.entries(value[key])) {
-          schemaChild(`${key}.${name}`, child);
-        }
+      if (!hasOwn(value, key) || !isPlainObject(value[key])) {
+        continue;
+      }
+      for (const [name, child] of Object.entries(value[key])) {
+        schemaChild(`${key}.${name}`, child);
       }
     }
     for (const key of [
@@ -1656,11 +1656,11 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
         schemaChild(key, value[key]);
       }
     }
-    if (Array.isArray(value.prefixItems)) {
+    if (hasOwn(value, 'prefixItems') && Array.isArray(value.prefixItems)) {
       value.prefixItems.forEach((child, index) => schemaChild(`prefixItems.${index}`, child));
     }
     for (const key of ['allOf', 'anyOf', 'oneOf'] as const) {
-      if (Array.isArray(value[key])) {
+      if (hasOwn(value, key) && Array.isArray(value[key])) {
         value[key].forEach((child, index) => schemaChild(`${key}[${index}]`, child));
       }
     }
@@ -1992,7 +1992,21 @@ function validatePayloadInternal(
           ? issue('malformed', `${path}.error`, `${outcome} replies require an error`)
           : undefined;
       }
-      return validateProtocolErrorValue(payload.error, `${path}.error`, options);
+      const errorIssue = validateProtocolErrorValue(payload.error, `${path}.error`, options);
+      if (errorIssue !== undefined) {
+        return errorIssue;
+      }
+      if (outcome === 'cancelled' || outcome === 'expired') {
+        if ((payload.error as UnknownRecord).code !== outcome) {
+          return issue(
+            'malformed',
+            `${path}.error.code`,
+            `${outcome} replies must use the system-generated ${outcome} error code`,
+            'code',
+          );
+        }
+      }
+      return undefined;
     }
     case 'task.status':
       if (
@@ -2325,10 +2339,31 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
   if (!hasOwn(value, 'runtimeId') || !isSafeIdentifier(value.runtimeId)) {
     return issue('malformed', `${path}.runtimeId`, 'agent card runtimeId is invalid', 'runtimeId');
   }
+  if (!hasOwn(value, 'supportedProtocolVersions')) {
+    return issue(
+      'incompatible',
+      `${path}.supportedProtocolVersions`,
+      'agent card does not advertise supported protocol versions',
+      'supportedProtocolVersions',
+    );
+  }
+  if (!Array.isArray(value.supportedProtocolVersions)) {
+    return issue(
+      'malformed',
+      `${path}.supportedProtocolVersions`,
+      'supportedProtocolVersions must be an array',
+      'supportedProtocolVersions',
+    );
+  }
+  if (value.supportedProtocolVersions.length === 0) {
+    return issue(
+      'incompatible',
+      `${path}.supportedProtocolVersions`,
+      'agent card advertises no supported protocol versions',
+      'supportedProtocolVersions',
+    );
+  }
   if (
-    !hasOwn(value, 'supportedProtocolVersions') ||
-    !Array.isArray(value.supportedProtocolVersions) ||
-    value.supportedProtocolVersions.length === 0 ||
     !value.supportedProtocolVersions.every(
       (version) => typeof version === 'string' && version.length > 0,
     )
@@ -2336,7 +2371,7 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     return issue(
       'malformed',
       `${path}.supportedProtocolVersions`,
-      'supportedProtocolVersions must be a non-empty array of non-empty strings',
+      'supportedProtocolVersions must contain only non-empty strings',
       'supportedProtocolVersions',
     );
   }
@@ -2472,7 +2507,7 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     return issue('malformed', `${path}.limits`, 'protocol limits are required', 'limits');
   }
   const limitCeilings: Record<string, number> = {
-    requestTtlMs: DEFAULT_REQUEST_TTL_MS,
+    requestTtlMs: MAX_REQUEST_TTL_MS,
     maxRequestTtlMs: MAX_REQUEST_TTL_MS,
     maxControlTtlMs: MAX_CONTROL_TTL_MS,
     maxEnvelopeBytes: MAX_ENVELOPE_BYTES,
@@ -2621,6 +2656,37 @@ function validateTaskSnapshotInternal(
       'cancellationRequested',
     );
   }
+  const cancellationRequested = value.cancellationRequested as boolean;
+  const cancellationMayRemainRequested =
+    state === 'cancelling' ||
+    state === 'cancelled' ||
+    state === 'completed' ||
+    state === 'failed' ||
+    state === 'expired';
+  if ((state === 'cancelling' || state === 'cancelled') && !cancellationRequested) {
+    return issue(
+      'malformed',
+      `${path}.cancellationRequested`,
+      `${state} task snapshots require cancellationRequested`,
+      'cancellationRequested',
+    );
+  }
+  if (!cancellationMayRemainRequested && cancellationRequested) {
+    return issue(
+      'malformed',
+      `${path}.cancellationRequested`,
+      'non-cancelling task snapshots cannot claim cancellation',
+      'cancellationRequested',
+    );
+  }
+  if (cancellationRequested && !hasOwn(value, 'cancellation')) {
+    return issue(
+      'malformed',
+      `${path}.cancellation`,
+      'requested cancellation requires a cancellation snapshot',
+      'cancellation',
+    );
+  }
   if (hasOwn(value, 'cancellation')) {
     if (
       !isPlainObject(value.cancellation) ||
@@ -2635,12 +2701,20 @@ function validateTaskSnapshotInternal(
       );
     }
     const requested = value.cancellation.state === 'requested';
-    if (requested !== value.cancellationRequested) {
+    if (requested !== cancellationRequested) {
       return issue(
         'malformed',
         `${path}.cancellation.state`,
         'cancellation state does not match cancellationRequested',
         'state',
+      );
+    }
+    if (!requested && hasOwn(value.cancellation, 'requestedAt')) {
+      return issue(
+        'malformed',
+        `${path}.cancellation.requestedAt`,
+        'cancellation requestedAt requires a requested cancellation',
+        'requestedAt',
       );
     }
     if (
@@ -2701,20 +2775,85 @@ function validateTaskSnapshotInternal(
       'terminalOutcome',
     );
   }
-  if (hasOwn(value, 'content')) {
+  const hasContent = hasOwn(value, 'content');
+  const hasError = hasOwn(value, 'error');
+  if (hasContent) {
     const contentIssue = validateTypedContentInternal(value.content, `${path}.content`, options);
     if (contentIssue !== undefined) {
       return contentIssue;
     }
   }
-  if (hasOwn(value, 'error')) {
+  if (hasError) {
     const errorIssue = validateProtocolErrorValue(value.error, `${path}.error`, options);
     if (errorIssue !== undefined) {
       return errorIssue;
     }
   }
-  if (hasOwn(value, 'content') && hasOwn(value, 'error')) {
+  if (hasContent && hasError) {
     return issue('malformed', path, 'task snapshot cannot contain both content and error');
+  }
+  if (!terminal) {
+    return undefined;
+  }
+  switch (state) {
+    case 'completed':
+      if (!hasContent) {
+        return issue(
+          'invalid_content',
+          `${path}.content`,
+          'completed task snapshots require terminal content',
+          'content',
+        );
+      }
+      if (hasError) {
+        return issue(
+          'malformed',
+          `${path}.error`,
+          'completed task snapshots cannot include an error',
+          'error',
+        );
+      }
+      break;
+    case 'failed':
+    case 'rejected':
+      if (hasContent) {
+        return issue(
+          'malformed',
+          `${path}.content`,
+          `${state} task snapshots cannot include completed content`,
+          'content',
+        );
+      }
+      if (!hasError) {
+        return issue(
+          'malformed',
+          `${path}.error`,
+          `${state} task snapshots require structured failure information`,
+          'error',
+        );
+      }
+      break;
+    case 'cancelled':
+    case 'expired':
+      if (hasContent) {
+        return issue(
+          'malformed',
+          `${path}.content`,
+          `${state} task snapshots cannot include content`,
+          'content',
+        );
+      }
+      if (hasError && (value.error as UnknownRecord).code !== state) {
+        return issue(
+          'malformed',
+          `${path}.error.code`,
+          `${state} task snapshot errors must use the system-generated ${state} code`,
+          'code',
+        );
+      }
+      break;
+    default:
+      break;
   }
   return undefined;
 }
