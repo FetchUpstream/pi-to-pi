@@ -1,4 +1,11 @@
-import type { SessionEntry, SessionManager } from '@earendil-works/pi-coding-agent';
+import type {
+  ExtensionAPI,
+  InlineExtension,
+  SessionEntry,
+  SessionManager,
+  SessionStartEvent,
+  SessionShutdownEvent,
+} from '@earendil-works/pi-coding-agent';
 
 interface TaskSessionReader {
   getSessionId(): string;
@@ -12,11 +19,16 @@ export const TASK_STATES = ['accepted', 'completed', 'failed', 'expired', 'super
 
 export type TaskState = (typeof TASK_STATES)[number];
 
+/**
+ * The sessionId field is the immutable origin identity. ownerSessionId records
+ * which session wrote the latest record, so supersession can preserve origin
+ * ownership while still leaving an auditable destination record.
+ */
 export interface TaskMetadata {
   version: typeof P2P_TASK_METADATA_VERSION;
   requestId: string;
-  /** Session scope that owns this append-only state record. */
   sessionId: string;
+  ownerSessionId: string;
   runtimeId: string;
   peerId: string | null;
   state: TaskState;
@@ -33,18 +45,38 @@ export interface AppendTaskMetadataOptions {
   requestId: string;
   runtimeId: string;
   state: TaskState;
-  sessionId?: string;
   peerId?: string | null;
   updatedAt?: string;
   expiresAt?: string | null;
   reason?: string | null;
+  /** Evaluation time for expiry and terminal transition checks. Not persisted. */
+  now?: Date;
 }
 
 export interface SupersedeInheritedTaskMetadataOptions {
   runtimeId: string;
   reason: string;
-  peerId?: string | null;
   updatedAt?: string;
+  /** Evaluation time for expiry checks. Not persisted. */
+  now?: Date;
+}
+
+export interface TaskStateLifecycleOptions {
+  runtimeId: string;
+  now?: () => Date;
+}
+
+export interface TaskLifecycleSessionStart {
+  sessionId: string;
+  reason: SessionStartEvent['reason'];
+  recovered: TaskMetadataRecord[];
+  superseded: TaskMetadataRecord[];
+}
+
+export interface TaskLifecycleSessionShutdown {
+  sessionId: string;
+  reason: SessionShutdownEvent['reason'];
+  targetSessionFile?: string;
 }
 
 const TERMINAL_TASK_STATES: ReadonlySet<TaskState> = new Set([
@@ -54,6 +86,30 @@ const TERMINAL_TASK_STATES: ReadonlySet<TaskState> = new Set([
   'superseded',
 ]);
 
+const TASK_METADATA_FIELDS = [
+  'version',
+  'requestId',
+  'sessionId',
+  'ownerSessionId',
+  'runtimeId',
+  'peerId',
+  'state',
+  'updatedAt',
+  'expiresAt',
+  'reason',
+] as const;
+
+const APPEND_OPTION_FIELDS = [
+  'requestId',
+  'runtimeId',
+  'state',
+  'peerId',
+  'updatedAt',
+  'expiresAt',
+  'reason',
+  'now',
+] as const;
+const SUPERSEDE_OPTION_FIELDS = ['runtimeId', 'reason', 'updatedAt', 'now'] as const;
 const BODY_FIELD_NAMES = new Set([
   'body',
   'content',
@@ -63,13 +119,60 @@ const BODY_FIELD_NAMES = new Set([
   'response',
   'responseBody',
 ]);
+const ISO_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{3,})?(?:Z|[+-]\d{2}:\d{2})$/u;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
+interface AppendAuthorization {
+  allowInheritedSupersede?: boolean;
+}
+
+interface LatestTaskCache {
+  sessionId: string;
+  leafId: string | null;
+  latest: Map<string, TaskMetadataRecord>;
+}
+
+const latestTaskCache = new WeakMap<SessionManager, LatestTaskCache>();
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasExactKeys(value: Record<string, unknown>, fields: readonly string[]): boolean {
+  const expected = new Set(fields);
+  const actual = Object.keys(value);
+  return actual.length === fields.length && actual.every((key) => expected.has(key));
 }
 
 function isTimestamp(value: unknown): value is string {
-  return typeof value === 'string' && !Number.isNaN(Date.parse(value));
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const match = ISO_TIMESTAMP.exec(value);
+  if (!match) {
+    return false;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return (
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= daysInMonth &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function assertDate(value: Date, field: string): void {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+    throw new Error(`p2p.task ${field} must be a valid Date`);
+  }
 }
 
 function assertNonEmptyString(value: string, field: string): void {
@@ -78,43 +181,68 @@ function assertNonEmptyString(value: string, field: string): void {
   }
 }
 
-function assertNoTaskBody(value: unknown): void {
-  if (!isRecord(value)) {
-    return;
+function assertExactOptions(
+  value: unknown,
+  fields: readonly string[],
+  label: string,
+): asserts value is Record<string, unknown> {
+  if (!isPlainObject(value)) {
+    throw new Error(`p2p.task ${label} must be a plain object`);
   }
-  const bodyField = Object.keys(value).find((key) => BODY_FIELD_NAMES.has(key));
-  if (bodyField) {
-    throw new Error(`p2p.task metadata must not contain message bodies (${bodyField})`);
+  const unknownField = Object.keys(value).find((key) => !fields.includes(key));
+  if (unknownField && BODY_FIELD_NAMES.has(unknownField)) {
+    throw new Error(`p2p.task metadata must not contain message bodies (${unknownField})`);
+  }
+  if (unknownField === 'sessionId' || unknownField === 'ownerSessionId') {
+    throw new Error('p2p.task session ownership overrides are not allowed');
+  }
+  if (unknownField) {
+    throw new Error(`p2p.task ${label} contains unknown field ${unknownField}`);
+  }
+}
+
+function assertMetadataShape(value: unknown): asserts value is TaskMetadata {
+  if (!isPlainObject(value) || !hasExactKeys(value, TASK_METADATA_FIELDS)) {
+    throw new Error('p2p.task metadata must be an exact plain-object schema');
+  }
+  if (
+    value.version !== P2P_TASK_METADATA_VERSION ||
+    typeof value.requestId !== 'string' ||
+    value.requestId.trim().length === 0 ||
+    typeof value.sessionId !== 'string' ||
+    value.sessionId.trim().length === 0 ||
+    typeof value.ownerSessionId !== 'string' ||
+    value.ownerSessionId.trim().length === 0 ||
+    typeof value.runtimeId !== 'string' ||
+    value.runtimeId.trim().length === 0 ||
+    (value.peerId !== null &&
+      (typeof value.peerId !== 'string' || value.peerId.trim().length === 0)) ||
+    !isTaskState(value.state) ||
+    !isTimestamp(value.updatedAt) ||
+    (value.expiresAt !== null && !isTimestamp(value.expiresAt)) ||
+    (value.reason !== null && typeof value.reason !== 'string') ||
+    (value.state === 'superseded' &&
+      (typeof value.reason !== 'string' || value.reason.trim().length === 0)) ||
+    (value.state !== 'superseded' && value.reason !== null)
+  ) {
+    throw new Error('p2p.task metadata failed schema validation');
+  }
+}
+
+function isTaskMetadata(value: unknown): value is TaskMetadata {
+  if (!isPlainObject(value) || !hasExactKeys(value, TASK_METADATA_FIELDS)) {
+    return false;
+  }
+  try {
+    assertMetadataShape(value);
+    return true;
+  } catch {
+    return false;
   }
 }
 
 function isTaskState(value: unknown): value is TaskState {
   return typeof value === 'string' && (TASK_STATES as readonly string[]).includes(value);
-}
-
-function isTaskMetadata(value: unknown): value is TaskMetadata {
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (Object.keys(value).some((key) => BODY_FIELD_NAMES.has(key))) {
-    return false;
-  }
-  return (
-    value.version === P2P_TASK_METADATA_VERSION &&
-    typeof value.requestId === 'string' &&
-    value.requestId.trim().length > 0 &&
-    typeof value.sessionId === 'string' &&
-    value.sessionId.trim().length > 0 &&
-    typeof value.runtimeId === 'string' &&
-    value.runtimeId.trim().length > 0 &&
-    (value.peerId === null || typeof value.peerId === 'string') &&
-    isTaskState(value.state) &&
-    isTimestamp(value.updatedAt) &&
-    (value.expiresAt === null || isTimestamp(value.expiresAt)) &&
-    (value.reason === null || typeof value.reason === 'string') &&
-    (value.state !== 'superseded' ||
-      (typeof value.reason === 'string' && value.reason.trim().length > 0))
-  );
 }
 
 function entriesForFolding(
@@ -133,71 +261,67 @@ function taskRecordFromEntry(entry: SessionEntry): TaskMetadataRecord | undefine
   return { ...entry.data, entryId: entry.id };
 }
 
+/** Cache by leaf so repeated helper appends update one Map instead of refolding the branch. */
+function cacheForAppend(sessionManager: SessionManager): Map<string, TaskMetadataRecord> {
+  const sessionId = sessionManager.getSessionId();
+  const leafId = sessionManager.getLeafId();
+  const cached = latestTaskCache.get(sessionManager);
+  if (cached && cached.sessionId === sessionId && cached.leafId === leafId) {
+    return cached.latest;
+  }
+  const latest = foldLatestTaskMetadata(sessionManager);
+  latestTaskCache.set(sessionManager, { sessionId, leafId, latest });
+  return latest;
+}
+
+function cacheAppendedRecord(
+  sessionManager: SessionManager,
+  previousLatest: Map<string, TaskMetadataRecord>,
+  record: TaskMetadataRecord,
+): void {
+  previousLatest.set(record.requestId, record);
+  latestTaskCache.set(sessionManager, {
+    sessionId: sessionManager.getSessionId(),
+    leafId: record.entryId,
+    latest: previousLatest,
+  });
+}
+
+function assertTimestampOption(value: unknown, field: string): void {
+  if (value !== undefined && !isTimestamp(value)) {
+    throw new Error(`p2p.task ${field} must be an ISO timestamp`);
+  }
+}
+
+function assertExpiryOption(value: unknown): void {
+  if (value !== undefined && value !== null && !isTimestamp(value)) {
+    throw new Error('p2p.task expiresAt must be an ISO timestamp or null');
+  }
+}
+
+function assertTransitionTime(updatedAt: string, previous: TaskMetadata): void {
+  if (Date.parse(updatedAt) < Date.parse(previous.updatedAt)) {
+    throw new Error('p2p.task updatedAt must not move backwards');
+  }
+}
+
+function transitionError(requestId: string, message: string): Error {
+  return new Error(`p2p.task ${requestId} ${message}`);
+}
+
 export function isTerminalTaskState(state: TaskState): boolean {
   return TERMINAL_TASK_STATES.has(state);
 }
 
 export function isTaskExpired(record: TaskMetadata, now: Date): boolean {
+  assertDate(now, 'now');
   return record.expiresAt !== null && Date.parse(record.expiresAt) <= now.getTime();
 }
 
 /**
- * Append one compact state record. The only persisted payload is p2p.task
- * metadata; request and response bodies belong to custom-message entries.
- */
-export function appendTaskMetadata(
-  sessionManager: SessionManager,
-  options: AppendTaskMetadataOptions,
-): TaskMetadataRecord {
-  assertNoTaskBody(options);
-  assertNonEmptyString(options.requestId, 'requestId');
-  assertNonEmptyString(options.runtimeId, 'runtimeId');
-
-  const sessionId = options.sessionId ?? sessionManager.getSessionId();
-  const peerId = options.peerId ?? null;
-  const updatedAt = options.updatedAt ?? new Date().toISOString();
-  const expiresAt = options.expiresAt ?? null;
-  const reason = options.reason ?? null;
-
-  assertNonEmptyString(sessionId, 'sessionId');
-  if (!isTimestamp(updatedAt)) {
-    throw new Error('p2p.task updatedAt must be an ISO timestamp');
-  }
-  if (expiresAt !== null && !isTimestamp(expiresAt)) {
-    throw new Error('p2p.task expiresAt must be an ISO timestamp or null');
-  }
-  if (options.state === 'superseded' && (!reason || reason.trim().length === 0)) {
-    throw new Error('p2p.task superseded records require a reason');
-  }
-  if (options.state !== 'superseded' && reason !== null) {
-    throw new Error('p2p.task reason is only valid for superseded records');
-  }
-
-  const previous = foldLatestTaskMetadata(sessionManager).get(options.requestId);
-  if (previous && isTerminalTaskState(previous.state) && previous.state !== options.state) {
-    throw new Error(
-      `p2p.task ${options.requestId} is already terminal (${previous.state}) and cannot transition to ${options.state}`,
-    );
-  }
-
-  const metadata: TaskMetadata = {
-    version: P2P_TASK_METADATA_VERSION,
-    requestId: options.requestId,
-    sessionId,
-    runtimeId: options.runtimeId,
-    peerId,
-    state: options.state,
-    updatedAt,
-    expiresAt,
-    reason,
-  };
-  const entryId = sessionManager.appendCustomEntry(P2P_TASK_CUSTOM_TYPE, metadata);
-  return { ...metadata, entryId };
-}
-
-/**
  * Fold the active append-only branch by request ID. Later records replace
- * earlier records for the same request; no transcript position is consulted.
+ * earlier records for the same request; this is one linear pass over the
+ * selected branch and never inspects message bodies.
  */
 export function foldLatestTaskMetadata(
   source: TaskSessionReader | readonly SessionEntry[],
@@ -212,55 +336,381 @@ export function foldLatestTaskMetadata(
   return latest;
 }
 
+function appendTaskMetadataInternal(
+  sessionManager: SessionManager,
+  options: AppendTaskMetadataOptions,
+  authorization: AppendAuthorization = {},
+): TaskMetadataRecord {
+  assertExactOptions(options, APPEND_OPTION_FIELDS, 'append options');
+  const { requestId, runtimeId, state } = options;
+  if (typeof requestId !== 'string') {
+    throw new Error('p2p.task requestId must be a string');
+  }
+  if (typeof runtimeId !== 'string') {
+    throw new Error('p2p.task runtimeId must be a string');
+  }
+  if (!isTaskState(state)) {
+    throw new Error('p2p.task state is unknown');
+  }
+  assertNonEmptyString(requestId, 'requestId');
+  assertNonEmptyString(runtimeId, 'runtimeId');
+  if (
+    options.peerId !== undefined &&
+    options.peerId !== null &&
+    typeof options.peerId !== 'string'
+  ) {
+    throw new Error('p2p.task peerId must be a string or null');
+  }
+  if (options.peerId !== undefined && typeof options.peerId === 'string') {
+    assertNonEmptyString(options.peerId, 'peerId');
+  }
+  assertTimestampOption(options.updatedAt, 'updatedAt');
+  assertExpiryOption(options.expiresAt);
+  if (options.now !== undefined) {
+    assertDate(options.now, 'now');
+  }
+
+  const currentSessionId = sessionManager.getSessionId();
+  assertNonEmptyString(currentSessionId, 'sessionId');
+  const now = options.now ?? new Date();
+  const updatedAt = options.updatedAt ?? now.toISOString();
+  const latest = cacheForAppend(sessionManager);
+  const previous = latest.get(requestId);
+
+  if (!previous) {
+    if (state !== 'accepted') {
+      throw transitionError(requestId, `cannot transition unknown task to ${state}`);
+    }
+    if (options.reason !== undefined && options.reason !== null) {
+      throw new Error('p2p.task reason is only valid for superseded records');
+    }
+    const metadata: TaskMetadata = {
+      version: P2P_TASK_METADATA_VERSION,
+      requestId,
+      sessionId: currentSessionId,
+      ownerSessionId: currentSessionId,
+      runtimeId,
+      peerId: options.peerId ?? null,
+      state,
+      updatedAt,
+      expiresAt: options.expiresAt ?? null,
+      reason: null,
+    };
+    assertMetadataShape(metadata);
+    const entryId = sessionManager.appendCustomEntry(P2P_TASK_CUSTOM_TYPE, metadata);
+    const record = { ...metadata, entryId };
+    cacheAppendedRecord(sessionManager, latest, record);
+    return record;
+  }
+
+  if (previous.sessionId === currentSessionId && previous.ownerSessionId !== currentSessionId) {
+    throw transitionError(requestId, 'has inconsistent session ownership');
+  }
+  if (isTerminalTaskState(previous.state)) {
+    throw transitionError(requestId, `is already terminal (${previous.state})`);
+  }
+  if (previous.state !== 'accepted') {
+    throw transitionError(requestId, `has unsupported prior state ${previous.state}`);
+  }
+  assertTransitionTime(updatedAt, previous);
+  if (options.peerId !== undefined && options.peerId !== previous.peerId) {
+    throw new Error('p2p.task peer identity is immutable across transitions');
+  }
+  if (options.expiresAt !== undefined && options.expiresAt !== previous.expiresAt) {
+    throw new Error('p2p.task expiry is immutable across transitions');
+  }
+  if (state !== 'superseded' && options.reason !== undefined && options.reason !== null) {
+    throw new Error('p2p.task reason is only valid for superseded records');
+  }
+
+  const expired = isTaskExpired(previous, now);
+  if (state === 'accepted') {
+    throw transitionError(requestId, 'cannot be accepted more than once');
+  }
+  if (state === 'completed' || state === 'failed') {
+    if (previous.sessionId !== currentSessionId || previous.ownerSessionId !== currentSessionId) {
+      throw transitionError(requestId, 'is not owned by the current session');
+    }
+    if (expired) {
+      throw transitionError(requestId, `has expired and cannot transition to ${state}`);
+    }
+  } else if (state === 'expired') {
+    if (previous.sessionId !== currentSessionId || previous.ownerSessionId !== currentSessionId) {
+      throw transitionError(requestId, 'is not owned by the current session');
+    }
+    if (!expired) {
+      throw transitionError(requestId, 'cannot transition to expired before expiresAt');
+    }
+  } else if (state === 'superseded') {
+    if (!authorization.allowInheritedSupersede) {
+      throw transitionError(requestId, 'must be superseded by the session replacement lifecycle');
+    }
+    if (previous.sessionId === currentSessionId || previous.ownerSessionId === currentSessionId) {
+      throw transitionError(requestId, 'is not inherited by the current session');
+    }
+    if (expired) {
+      throw transitionError(requestId, 'has expired and cannot be superseded');
+    }
+    if (typeof options.reason !== 'string' || options.reason.trim().length === 0) {
+      throw new Error('p2p.task superseded records require a reason');
+    }
+  }
+
+  const metadata: TaskMetadata = {
+    version: P2P_TASK_METADATA_VERSION,
+    requestId,
+    sessionId: previous.sessionId,
+    ownerSessionId: currentSessionId,
+    runtimeId,
+    peerId: previous.peerId,
+    state,
+    updatedAt,
+    expiresAt: previous.expiresAt,
+    reason: state === 'superseded' ? options.reason! : null,
+  };
+  assertMetadataShape(metadata);
+  const entryId = sessionManager.appendCustomEntry(P2P_TASK_CUSTOM_TYPE, metadata);
+  const record = { ...metadata, entryId };
+  cacheAppendedRecord(sessionManager, latest, record);
+  return record;
+}
+
+/**
+ * Append one compact state record. The session manager supplies the origin and
+ * owner identities; callers cannot override either identity or copy bodies.
+ */
+export function appendTaskMetadata(
+  sessionManager: SessionManager,
+  options: AppendTaskMetadataOptions,
+): TaskMetadataRecord {
+  return appendTaskMetadataInternal(sessionManager, options);
+}
+
+export type TaskTransitionOptions = Omit<AppendTaskMetadataOptions, 'requestId' | 'state'>;
+
+export function completeTaskMetadata(
+  sessionManager: SessionManager,
+  requestId: string,
+  options: TaskTransitionOptions,
+): TaskMetadataRecord {
+  return appendTaskMetadata(sessionManager, { ...options, requestId, state: 'completed' });
+}
+
+export function failTaskMetadata(
+  sessionManager: SessionManager,
+  requestId: string,
+  options: TaskTransitionOptions,
+): TaskMetadataRecord {
+  return appendTaskMetadata(sessionManager, { ...options, requestId, state: 'failed' });
+}
+
+export function expireTaskMetadata(
+  sessionManager: SessionManager,
+  requestId: string,
+  options: TaskTransitionOptions,
+): TaskMetadataRecord {
+  return appendTaskMetadata(sessionManager, { ...options, requestId, state: 'expired' });
+}
+
 /**
  * Recover only live task state owned by the selected session. Reload may reuse
- * the session identity, while /new, /resume, fork, and clone must not migrate
- * an outgoing in-memory task map into another session.
+ * a session identity, while /new, /resume, fork, and clone do not migrate an
+ * outgoing in-memory task map into another session.
  */
 export function recoverTaskMetadata(
   sessionManager: TaskSessionReader,
   now: Date = new Date(),
 ): TaskMetadataRecord[] {
+  assertDate(now, 'now');
   const sessionId = sessionManager.getSessionId();
   return [...foldLatestTaskMetadata(sessionManager).values()].filter(
     (record) =>
       record.sessionId === sessionId &&
+      record.ownerSessionId === sessionId &&
       !isTerminalTaskState(record.state) &&
       !isTaskExpired(record, now),
   );
 }
 
 /**
- * Mark copied, non-terminal records from another session as inherited history. The
- * superseding record is written in the destination session and blocks later
- * completion attempts through appendTaskMetadata's terminal-state guard.
+ * Mark copied, live non-terminal records from another session as inherited
+ * history. The origin session identity remains unchanged in every superseding
+ * record. Expired records are deliberately left unrecovered rather than
+ * converted by a destination session.
  */
 export function supersedeInheritedTaskMetadata(
   sessionManager: SessionManager,
   options: SupersedeInheritedTaskMetadataOptions,
 ): TaskMetadataRecord[] {
+  assertExactOptions(options, SUPERSEDE_OPTION_FIELDS, 'supersede options');
+  if (typeof options.runtimeId !== 'string') {
+    throw new Error('p2p.task runtimeId must be a string');
+  }
+  if (typeof options.reason !== 'string') {
+    throw new Error('p2p.task superseded reason must be a string');
+  }
   assertNonEmptyString(options.runtimeId, 'runtimeId');
   assertNonEmptyString(options.reason, 'superseded reason');
+  assertTimestampOption(options.updatedAt, 'updatedAt');
+  if (options.now !== undefined) {
+    assertDate(options.now, 'now');
+  }
+  const now = options.now ?? new Date();
   const currentSessionId = sessionManager.getSessionId();
-  const inherited = [...foldLatestTaskMetadata(sessionManager).values()].filter(
-    (record) => record.sessionId !== currentSessionId && !isTerminalTaskState(record.state),
+  const inherited = [...cacheForAppend(sessionManager).values()].filter(
+    (record) =>
+      record.sessionId !== currentSessionId &&
+      record.ownerSessionId !== currentSessionId &&
+      !isTerminalTaskState(record.state) &&
+      !isTaskExpired(record, now),
   );
 
   return inherited.map((record) =>
-    appendTaskMetadata(sessionManager, {
-      requestId: record.requestId,
-      runtimeId: options.runtimeId,
-      sessionId: currentSessionId,
-      peerId: options.peerId ?? record.peerId,
-      state: 'superseded',
-      updatedAt: options.updatedAt,
-      expiresAt: record.expiresAt,
-      reason: options.reason,
-    }),
+    appendTaskMetadataInternal(
+      sessionManager,
+      {
+        requestId: record.requestId,
+        runtimeId: options.runtimeId,
+        state: 'superseded',
+        updatedAt: options.updatedAt,
+        expiresAt: record.expiresAt,
+        reason: options.reason,
+        now,
+      },
+      { allowInheritedSupersede: true },
+    ),
   );
+}
+
+/**
+ * Lifecycle binding used by the deterministic runtime fixture. It resets the
+ * active in-memory scope on shutdown, folds the selected branch at every
+ * session_start, and supersedes fork/clone history before any destination turn.
+ */
+export class TaskStateLifecycle {
+  readonly extension: InlineExtension = {
+    name: 'pi-p2p-task-state-lifecycle',
+    hidden: true,
+    factory: (pi) => this.install(pi),
+  };
+
+  private activeSessionId: string | undefined;
+  private activeTasks = new Map<string, TaskMetadataRecord>();
+  private readonly _starts: TaskLifecycleSessionStart[] = [];
+  private readonly _shutdowns: TaskLifecycleSessionShutdown[] = [];
+  private readonly now: () => Date;
+
+  constructor(private readonly options: TaskStateLifecycleOptions) {
+    if (!isNonEmptyString(options.runtimeId)) {
+      throw new Error('p2p.task lifecycle runtimeId must not be empty');
+    }
+    this.now = options.now ?? (() => new Date());
+  }
+
+  get runtimeId(): string {
+    return this.options.runtimeId;
+  }
+
+  get sessionId(): string | undefined {
+    return this.activeSessionId;
+  }
+
+  get recovered(): readonly TaskMetadataRecord[] {
+    return [...this.activeTasks.values()];
+  }
+
+  get starts(): readonly TaskLifecycleSessionStart[] {
+    return this._starts;
+  }
+
+  get shutdowns(): readonly TaskLifecycleSessionShutdown[] {
+    return this._shutdowns;
+  }
+
+  append(
+    sessionManager: SessionManager,
+    options: Omit<AppendTaskMetadataOptions, 'now'>,
+  ): TaskMetadataRecord {
+    this.assertActive(sessionManager);
+    const record = appendTaskMetadata(sessionManager, { ...options, now: this.now() });
+    if (isTerminalTaskState(record.state)) {
+      this.activeTasks.delete(record.requestId);
+    } else {
+      this.activeTasks.set(record.requestId, record);
+    }
+    return record;
+  }
+
+  complete(
+    sessionManager: SessionManager,
+    requestId: string,
+    options: TaskTransitionOptions,
+  ): TaskMetadataRecord {
+    return this.append(sessionManager, { ...options, requestId, state: 'completed' });
+  }
+
+  fail(
+    sessionManager: SessionManager,
+    requestId: string,
+    options: TaskTransitionOptions,
+  ): TaskMetadataRecord {
+    return this.append(sessionManager, { ...options, requestId, state: 'failed' });
+  }
+
+  private install(pi: ExtensionAPI): void {
+    pi.on('session_start', (event, ctx) => {
+      this.handleSessionStart(event, ctx.sessionManager as SessionManager);
+    });
+    pi.on('session_shutdown', (event, ctx) => {
+      this.handleSessionShutdown(event, ctx.sessionManager as SessionManager);
+    });
+  }
+
+  private handleSessionStart(event: SessionStartEvent, sessionManager: SessionManager): void {
+    const sessionId = sessionManager.getSessionId();
+    const now = this.now();
+    const inherited =
+      sessionManager.getHeader()?.parentSession !== undefined || event.reason === 'fork';
+    const superseded = inherited
+      ? supersedeInheritedTaskMetadata(sessionManager, {
+          runtimeId: this.options.runtimeId,
+          reason: `session ${event.reason} replacement`,
+          now,
+        })
+      : [];
+    const recovered = recoverTaskMetadata(sessionManager, now);
+    this.activeSessionId = sessionId;
+    this.activeTasks = new Map(recovered.map((record) => [record.requestId, record]));
+    this._starts.push({ sessionId, reason: event.reason, recovered, superseded });
+  }
+
+  private handleSessionShutdown(event: SessionShutdownEvent, sessionManager: SessionManager): void {
+    const sessionId = sessionManager.getSessionId();
+    this._shutdowns.push({
+      sessionId,
+      reason: event.reason,
+      targetSessionFile: event.targetSessionFile,
+    });
+    if (this.activeSessionId === sessionId) {
+      this.activeSessionId = undefined;
+      this.activeTasks = new Map();
+    }
+  }
+
+  private assertActive(sessionManager: SessionManager): void {
+    if (this.activeSessionId !== sessionManager.getSessionId()) {
+      throw new Error('p2p.task lifecycle session is no longer active');
+    }
+  }
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 export const appendP2PTaskMetadata = appendTaskMetadata;
 export const foldLatestP2PTaskMetadata = foldLatestTaskMetadata;
 export const recoverP2PTaskMetadata = recoverTaskMetadata;
 export const supersedeInheritedP2PTaskMetadata = supersedeInheritedTaskMetadata;
+export const createTaskStateLifecycle = (options: TaskStateLifecycleOptions): TaskStateLifecycle =>
+  new TaskStateLifecycle(options);

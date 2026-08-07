@@ -31,6 +31,7 @@ import {
   createPiProbe,
   type PiProbe,
 } from './pi-probe.js';
+import { TaskStateLifecycle } from './task-state.js';
 
 export const DEFAULT_FAUX_PROVIDER_ID = 'pi-p2p-fixture-faux';
 export const DEFAULT_FAUX_MODEL_ID = 'pi-p2p-fixture-model';
@@ -51,6 +52,7 @@ export interface CreatePiRuntimeFixtureOptions {
   model?: Model<string>;
   settingsManager?: SettingsManager;
   modelRuntime?: ModelRuntime;
+  taskStateLifecycle?: TaskStateLifecycle;
 }
 
 function assertSessionManagerPaths(options: CreatePiRuntimeFixtureOptions): void {
@@ -76,6 +78,7 @@ function assertSessionManagerPaths(options: CreatePiRuntimeFixtureOptions): void
 export interface PiRuntimeFixture {
   readonly runtime: AgentSessionRuntime;
   readonly probe: PiProbe;
+  readonly taskStateLifecycle: TaskStateLifecycle | undefined;
   readonly faux: FauxProviderHandle;
   readonly services: AgentSessionServices;
   readonly model: Model<string>;
@@ -243,6 +246,8 @@ export async function createPiRuntimeFixture(
 
   const sessionManager = options.sessionManager ?? PiSessionManager.inMemory(options.cwd);
   const extension = createInlineProbeExtension(probe);
+  const taskStateExtension = options.taskStateLifecycle?.extension;
+  const extensionFactories = taskStateExtension ? [taskStateExtension, extension] : [extension];
   const createRuntime: CreateAgentSessionRuntimeFactory = async ({
     cwd,
     sessionManager: replacementSessionManager,
@@ -254,7 +259,7 @@ export async function createPiRuntimeFixture(
       modelRuntime,
       settingsManager,
       resourceLoaderOptions: {
-        extensionFactories: [extension],
+        extensionFactories,
         noSkills: true,
         noPromptTemplates: true,
         noThemes: true,
@@ -317,6 +322,7 @@ export async function createPiRuntimeFixture(
       return runtime.services;
     },
     probe,
+    taskStateLifecycle: options.taskStateLifecycle,
     faux,
     get model() {
       return options.model ?? modelFromRuntime(modelRuntime, providerId, modelId);
