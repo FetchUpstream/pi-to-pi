@@ -3,12 +3,17 @@
  *
  * This module is deliberately not a durable database.  Task records,
  * deduplication reservations, operation retry guards, and unreachable results
- * all belong to one live runtime instance.  A replacement must construct a new
- * boundary; it cannot import or adopt any state from the old one.
+ * all belong to live runtime boundaries.  Active task/dedupe state is never
+ * adopted by a replacement; operation guards are the explicit bounded exception
+ * retained through the original deadline plus grace.
  */
 
 import { randomUUID } from 'node:crypto';
-import { DEFAULT_REQUEST_TTL_MS, DEDUPE_RETENTION_GRACE_MS } from '../config.js';
+import {
+  DEFAULT_REQUEST_TTL_MS,
+  DEDUPE_RETENTION_GRACE_MS,
+  MAX_REQUEST_TTL_MS,
+} from '../config.js';
 
 import {
   asRuntimeId,
@@ -69,7 +74,7 @@ export interface RuntimeShutdownOptions {
   readonly graceful?: boolean;
   readonly reason?: string;
   readonly onTask?: RuntimeShutdownTaskHook;
-  /** Maximum time allowed for one arbitrary shutdown hook. */
+  /** Overall bounded time allowed for shutdown hook draining. */
   readonly hookTimeoutMs?: number;
   /** Compatibility alias for hookTimeoutMs. */
   readonly shutdownHookTimeoutMs?: number;
@@ -86,11 +91,15 @@ export interface RuntimeShutdownReport {
 
 export type RuntimePersistenceSetTimeout = (callback: () => void, delayMs: number) => unknown;
 export type RuntimePersistenceClearTimeout = (handle: unknown) => void;
+export interface RuntimeOperationGuardState {
+  readonly acceptedOperations: Map<string, AcceptedOperationRecord>;
+  readonly unreachableResults: Map<string, UnreachableRecord>;
+}
+
 export interface RuntimeIdentityHistory {
   readonly issued: Map<string, number>;
   readonly retentionMs: number;
 }
-
 export interface RuntimePersistenceOptions {
   /** Use an already-created identity, without sharing any state with it. */
   readonly identity?: SessionRuntimeIdentity;
@@ -104,6 +113,8 @@ export interface RuntimePersistenceOptions {
   readonly now?: () => number;
   readonly setTimeout?: RuntimePersistenceSetTimeout;
   readonly clearTimeout?: RuntimePersistenceClearTimeout;
+  /** Shared operation guards retained across runtime replacement. */
+  readonly operationGuardState?: RuntimeOperationGuardState;
   /** Retention after an operation deadline; defaults to the v1 grace window. */
   readonly retentionGraceMs?: number;
   /** Retain issued runtime identities across the replacement chain. */
@@ -154,24 +165,28 @@ export class RuntimePersistenceError extends Error {
 }
 type RuntimeDeadlineInput = string | number | Date;
 
-interface AcceptedOperationRecord {
+export interface AcceptedOperationRecord {
   readonly value: AcceptedOperation;
   readonly retainedUntil: number;
   stale: boolean;
   timer?: unknown;
+  clearTimeout?: RuntimePersistenceClearTimeout;
 }
-
-interface UnreachableRecord {
+export interface UnreachableRecord {
   readonly value: RuntimeUnreachableResult;
   readonly recipientRuntimeId?: string;
   readonly message: string;
   readonly retainedUntil: number;
   timer?: unknown;
+  clearTimeout?: RuntimePersistenceClearTimeout;
 }
 
 const DEFAULT_SHUTDOWN_HOOK_TIMEOUT_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
-
+const MAX_IDENTIFIER_LENGTH = 256;
+const MAX_RETENTION_GRACE_MS = DEDUPE_RETENTION_GRACE_MS;
+const MAX_OPERATION_DEADLINE_HORIZON_MS = MAX_REQUEST_TTL_MS;
+const runtimeGuardStates = new WeakMap<object, RuntimeOperationGuardState>();
 function defaultSetTimeout(callback: () => void, delayMs: number): unknown {
   return globalThis.setTimeout(callback, delayMs);
 }
@@ -197,9 +212,23 @@ function finiteNow(value: number): number {
   return value;
 }
 
+function validateRetentionGrace(value: number | undefined, fallback: number): number {
+  const grace = value ?? fallback;
+  if (!Number.isSafeInteger(grace) || grace < 0 || grace > MAX_RETENTION_GRACE_MS) {
+    throw new RangeError(
+      `retentionGraceMs must be a non-negative safe integer no greater than ${MAX_RETENTION_GRACE_MS}`,
+    );
+  }
+  return grace;
+}
+
 function deadlineMs(value: RuntimeDeadlineInput | undefined, nowMs: number): number {
   if (value === undefined) {
-    return nowMs + DEFAULT_REQUEST_TTL_MS;
+    const defaultDeadline = nowMs + DEFAULT_REQUEST_TTL_MS;
+    if (!Number.isSafeInteger(defaultDeadline)) {
+      throw new RangeError('operation expiry must be a safe timestamp');
+    }
+    return defaultDeadline;
   }
   let parsed: number;
   if (value instanceof Date) {
@@ -209,8 +238,11 @@ function deadlineMs(value: RuntimeDeadlineInput | undefined, nowMs: number): num
   } else {
     parsed = Date.parse(value);
   }
-  if (!Number.isFinite(parsed)) {
-    throw new TypeError('operation expiry must be a finite timestamp');
+  if (!Number.isSafeInteger(parsed)) {
+    throw new TypeError('operation expiry must be a finite safe timestamp');
+  }
+  if (parsed > nowMs + MAX_OPERATION_DEADLINE_HORIZON_MS) {
+    throw new RangeError('operation expiry exceeds the v1 deadline horizon');
   }
   return parsed;
 }
@@ -220,10 +252,11 @@ function retainedDeadline(
   nowMs: number,
   graceMs: number,
 ): number {
+  const grace = validateRetentionGrace(graceMs, DEDUPE_RETENTION_GRACE_MS);
   const deadline = deadlineMs(value, nowMs);
-  const retainedUntil = deadline + graceMs;
-  if (!Number.isFinite(retainedUntil)) {
-    throw new RangeError('operation retention deadline must be finite');
+  const retainedUntil = deadline + grace;
+  if (!Number.isSafeInteger(retainedUntil)) {
+    throw new RangeError('operation retention deadline must be a safe timestamp');
   }
   return retainedUntil;
 }
@@ -235,11 +268,25 @@ export class RuntimeShutdownHookTimeout extends Error {
   }
 }
 function requireText(value: string | undefined, field: string): string {
-  if (typeof value !== 'string' || value.length === 0 || /\p{C}/u.test(value)) {
-    throw new TypeError(`${field} must be a non-empty string without control characters`);
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > MAX_IDENTIFIER_LENGTH ||
+    /\p{C}/u.test(value)
+  ) {
+    throw new TypeError(`${field} must be a bounded non-empty string without control characters`);
   }
   return value;
 }
+
+function createGuardState(): RuntimeOperationGuardState {
+  return {
+    acceptedOperations: new Map<string, AcceptedOperationRecord>(),
+    unreachableResults: new Map<string, UnreachableRecord>(),
+  };
+}
+
+export const sharedRuntimeOperationGuardState: RuntimeOperationGuardState = createGuardState();
 
 function identityFromOptions(options: RuntimePersistenceOptions): SessionRuntimeIdentity {
   const supplied = options.identity;
@@ -247,7 +294,9 @@ function identityFromOptions(options: RuntimePersistenceOptions): SessionRuntime
   const suppliedRuntimeId = options.runtimeId;
 
   if (supplied !== undefined) {
-    const identity = createRuntimeIdentity(supplied.sessionId, () => supplied.runtimeId);
+    const sessionId = requireText(supplied.sessionId, 'sessionId');
+    const runtimeId = requireText(supplied.runtimeId, 'runtimeId');
+    const identity = createRuntimeIdentity(sessionId, () => runtimeId);
     if (suppliedSessionId !== undefined && suppliedSessionId !== identity.sessionId) {
       throw new RuntimePersistenceError(
         'identity_conflict',
@@ -263,11 +312,14 @@ function identityFromOptions(options: RuntimePersistenceOptions): SessionRuntime
     return identity;
   }
 
-  const sessionId = suppliedSessionId ?? `session-${randomUUID()}`;
+  const sessionId = requireText(suppliedSessionId ?? `session-${randomUUID()}`, 'sessionId');
   if (suppliedRuntimeId !== undefined) {
-    return createRuntimeIdentity(sessionId, () => suppliedRuntimeId);
+    return createRuntimeIdentity(sessionId, () => requireText(suppliedRuntimeId, 'runtimeId'));
   }
-  return createRuntimeIdentity(sessionId, options.runtimeIdFactory ?? randomUUID);
+  return createRuntimeIdentity(sessionId, () => {
+    const runtimeId = (options.runtimeIdFactory ?? randomUUID)();
+    return requireText(runtimeId, 'runtimeId');
+  });
 }
 
 function pruneRuntimeIdentityHistory(history: RuntimeIdentityHistory, nowMs: number): void {
@@ -283,7 +335,8 @@ function assertFreshRuntimeId(
   runtimeId: string,
   history: RuntimeIdentityHistory,
 ): void {
-  if (runtimeId === current.runtimeId || history.issued.has(runtimeId)) {
+  const normalizedRuntimeId = requireText(runtimeId, 'runtimeId');
+  if (normalizedRuntimeId === current.runtimeId || history.issued.has(normalizedRuntimeId)) {
     throw new RuntimePersistenceError(
       'identity_conflict',
       'a replacement runtime must have a fresh runtimeId that has not been issued before',
@@ -300,28 +353,121 @@ function replacementIdentity(
   pruneRuntimeIdentityHistory(history, nowMs);
   const requested = options.identity;
   if (requested !== undefined) {
-    assertFreshRuntimeId(current, requested.runtimeId, history);
-    if (options.sessionId !== undefined && options.sessionId !== requested.sessionId) {
+    const sessionId = requireText(requested.sessionId, 'sessionId');
+    const runtimeId = requireText(requested.runtimeId, 'runtimeId');
+    assertFreshRuntimeId(current, runtimeId, history);
+    if (options.sessionId !== undefined && options.sessionId !== sessionId) {
       throw new RuntimePersistenceError(
         'identity_conflict',
         'sessionId does not match the replacement identity',
       );
     }
-    if (options.runtimeId !== undefined && options.runtimeId !== requested.runtimeId) {
+    if (options.runtimeId !== undefined && options.runtimeId !== runtimeId) {
       throw new RuntimePersistenceError(
         'identity_conflict',
         'runtimeId does not match the replacement identity',
       );
     }
-    return createRuntimeIdentity(requested.sessionId, () => requested.runtimeId);
+    return createRuntimeIdentity(sessionId, () => runtimeId);
   }
 
-  const sessionId = options.sessionId ?? current.sessionId;
-  const runtimeId =
+  const sessionId = requireText(options.sessionId ?? current.sessionId, 'sessionId');
+  const runtimeId = requireText(
     options.runtimeId ??
-    (options.runtimeIdFactory === undefined ? randomUUID() : options.runtimeIdFactory());
+      (options.runtimeIdFactory === undefined ? randomUUID() : options.runtimeIdFactory()),
+    'runtimeId',
+  );
   assertFreshRuntimeId(current, runtimeId, history);
   return createRuntimeIdentity(sessionId, () => runtimeId);
+}
+
+function sameReloadValue(left: unknown, right: unknown, seen = new Map<object, object>()): boolean {
+  if (Object.is(left, right)) {
+    return true;
+  }
+  if (typeof left !== 'object' || left === null || typeof right !== 'object' || right === null) {
+    return false;
+  }
+  if (Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)) {
+    return false;
+  }
+  if (left instanceof Map || left instanceof Set) {
+    return false;
+  }
+  const prior = seen.get(left);
+  if (prior === right) {
+    return true;
+  }
+  seen.set(left, right);
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    return left.every((value, index) => sameReloadValue(value, right[index], seen));
+  }
+  const leftKeys = Object.keys(left as Record<string, unknown>).sort();
+  const rightKeys = Object.keys(right as Record<string, unknown>).sort();
+  if (
+    leftKeys.length !== rightKeys.length ||
+    leftKeys.some((key, index) => key !== rightKeys[index])
+  ) {
+    return false;
+  }
+  return leftKeys.every((key) =>
+    sameReloadValue(
+      (left as Record<string, unknown>)[key],
+      (right as Record<string, unknown>)[key],
+      seen,
+    ),
+  );
+}
+
+function reloadOptionsEqual(left: RuntimeReloadOptions, right: RuntimeReloadOptions): boolean {
+  return sameReloadValue(left, right);
+}
+
+interface RuntimePersistenceLike {
+  readonly sessionId: string;
+  readonly runtimeId: string;
+}
+function assertCachedReplacementOptions(
+  requested: RuntimeReloadOptions,
+  cached: RuntimeReloadOptions,
+  replacement: RuntimePersistenceLike,
+): void {
+  if (
+    (requested.identity !== undefined &&
+      (requested.identity.sessionId !== replacement.sessionId ||
+        requested.identity.runtimeId !== replacement.runtimeId)) ||
+    (requested.sessionId !== undefined && requested.sessionId !== replacement.sessionId) ||
+    (requested.runtimeId !== undefined && requested.runtimeId !== replacement.runtimeId) ||
+    !reloadOptionsEqual(requested, cached)
+  ) {
+    throw new RuntimePersistenceError(
+      'identity_conflict',
+      'cached replacement does not match the requested runtime identity or options',
+    );
+  }
+}
+
+function validateReloadOptions(options: RuntimeReloadOptions): void {
+  validateShutdownOptions(options.shutdown);
+  if (options.retentionGraceMs !== undefined) {
+    validateRetentionGrace(options.retentionGraceMs, DEDUPE_RETENTION_GRACE_MS);
+  }
+  if (options.dedupeStoreOptions?.retentionGraceMs !== undefined) {
+    validateRetentionGrace(options.dedupeStoreOptions.retentionGraceMs, DEDUPE_RETENTION_GRACE_MS);
+  }
+  if (
+    options.runtimeIdRetentionMs !== undefined &&
+    (!Number.isSafeInteger(options.runtimeIdRetentionMs) ||
+      options.runtimeIdRetentionMs < 0 ||
+      options.runtimeIdRetentionMs > MAX_RETENTION_GRACE_MS)
+  ) {
+    throw new RangeError(
+      `runtimeIdRetentionMs must be a non-negative safe integer no greater than ${MAX_RETENTION_GRACE_MS}`,
+    );
+  }
 }
 
 function normalizeShutdownDelivery(value: unknown): RuntimeShutdownDelivery {
@@ -372,37 +518,76 @@ function shutdownHookTimeout(options: RuntimeShutdownOptions): number {
     options.timeoutMs ??
     options.shutdownTimeoutMs ??
     DEFAULT_SHUTDOWN_HOOK_TIMEOUT_MS;
-  if (!Number.isFinite(timeout) || timeout <= 0) {
-    throw new RangeError('shutdown hook timeout must be a finite positive number');
+  if (
+    !Number.isSafeInteger(timeout) ||
+    timeout <= 0 ||
+    timeout > MAX_OPERATION_DEADLINE_HORIZON_MS
+  ) {
+    throw new RangeError(
+      `shutdown hook timeout must be a positive safe integer no greater than ${MAX_OPERATION_DEADLINE_HORIZON_MS}`,
+    );
   }
   return timeout;
 }
 
-async function waitForShutdownHook<T>(
-  hook: () => T | PromiseLike<T>,
+function validateShutdownOptions(options: RuntimeShutdownOptions | undefined): void {
+  if (options === undefined) {
+    return;
+  }
+  if (options.graceful !== undefined && typeof options.graceful !== 'boolean') {
+    throw new TypeError('shutdown graceful must be a boolean');
+  }
+  if (options.onTask !== undefined && typeof options.onTask !== 'function') {
+    throw new TypeError('shutdown onTask must be a function');
+  }
+  shutdownReason(options.reason);
+  shutdownHookTimeout(options);
+}
+
+interface BoundedPromiseOutcome<T> {
+  settled: boolean;
+  value?: T;
+  error?: unknown;
+}
+
+async function settlePromisesWithin<T>(
+  promises: readonly Promise<T>[],
   timeoutMs: number,
   setTimeoutFn: RuntimePersistenceSetTimeout,
   clearTimeoutFn: RuntimePersistenceClearTimeout,
-): Promise<T> {
+): Promise<BoundedPromiseOutcome<T>[]> {
+  if (promises.length === 0) {
+    return [];
+  }
+  const outcomes: BoundedPromiseOutcome<T>[] = promises.map(() => ({ settled: false }));
+  const tracked = promises.map(async (promise, index) => {
+    try {
+      const value = await promise;
+      outcomes[index] = { settled: true, value };
+    } catch (error) {
+      outcomes[index] = { settled: true, error };
+    }
+  });
   let timer: unknown;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeoutFn(() => reject(new RuntimeShutdownHookTimeout(timeoutMs)), timeoutMs);
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeoutFn(resolve, timeoutMs);
   });
   try {
-    return await Promise.race([Promise.resolve().then(hook), timeout]);
+    await Promise.race([Promise.all(tracked), timeout]);
   } finally {
     if (timer !== undefined) {
       clearTimeoutFn(timer);
     }
   }
+  return outcomes;
 }
 
 /**
  * Owns all mutable task/dedupe state for exactly one live runtime.
  *
- * The class intentionally has no import/export or persistence adapter.  The
- * public replacement operation creates new stores, and shutdown clears the old
- * stores before any asynchronous notification hook runs.
+ * The public replacement operation creates new stores; it never adopts active
+ * task or deduplication state.  Shared operation guards remain bounded and
+ * survive shutdown until their original deadline plus grace.
  */
 export class RuntimePersistence {
   public readonly runtimeScoped = true;
@@ -423,8 +608,11 @@ export class RuntimePersistence {
   private readonly clearTimeout: RuntimePersistenceClearTimeout;
   private readonly retentionGraceMs: number;
   private readonly runtimeIdentityHistory: RuntimeIdentityHistory;
-  private readonly acceptedOperations = new Map<string, AcceptedOperationRecord>();
-  private readonly unreachableResults = new Map<string, UnreachableRecord>();
+  public readonly operationGuardState: RuntimeOperationGuardState;
+  private readonly acceptedOperations: Map<string, AcceptedOperationRecord>;
+  private readonly unreachableResults: Map<string, UnreachableRecord>;
+  private readonly shutdownHooks = new Set<Promise<unknown>>();
+  private replacementOptions: RuntimeReloadOptions | undefined;
   public constructor(options: RuntimePersistenceOptions = {}) {
     this.now = options.now ?? (() => Date.now());
     this.setTimeout = options.setTimeout ?? defaultSetTimeout;
@@ -435,12 +623,26 @@ export class RuntimePersistence {
         issued: new Map<string, number>(),
         retentionMs: options.runtimeIdRetentionMs ?? DEDUPE_RETENTION_GRACE_MS,
       } satisfies RuntimeIdentityHistory);
-    if (!Number.isFinite(history.retentionMs) || history.retentionMs < 0) {
-      throw new RangeError('runtimeIdRetentionMs must be a finite non-negative number');
+    if (
+      !Number.isSafeInteger(history.retentionMs) ||
+      history.retentionMs < 0 ||
+      history.retentionMs > MAX_RETENTION_GRACE_MS
+    ) {
+      throw new RangeError(
+        `runtimeIdRetentionMs must be a non-negative safe integer no greater than ${MAX_RETENTION_GRACE_MS}`,
+      );
     }
     const nowMs = finiteNow(this.now());
     pruneRuntimeIdentityHistory(history, nowMs);
     this.runtimeIdentityHistory = history;
+    const guardState =
+      options.operationGuardState ??
+      runtimeGuardStates.get(history) ??
+      sharedRuntimeOperationGuardState;
+    runtimeGuardStates.set(history, guardState);
+    this.operationGuardState = guardState;
+    this.acceptedOperations = guardState.acceptedOperations;
+    this.unreachableResults = guardState.unreachableResults;
     this.identity = identityFromOptions(options);
     if (history.issued.has(this.identity.runtimeId)) {
       throw new RuntimePersistenceError(
@@ -451,13 +653,10 @@ export class RuntimePersistence {
     this.sessionId = this.identity.sessionId;
     this.runtimeId = this.identity.runtimeId;
     this.onShutdownTask = options.onShutdownTask;
-    this.retentionGraceMs =
-      options.retentionGraceMs ??
-      options.dedupeStoreOptions?.retentionGraceMs ??
-      DEDUPE_RETENTION_GRACE_MS;
-    if (!Number.isFinite(this.retentionGraceMs) || this.retentionGraceMs < 0) {
-      throw new RangeError('retentionGraceMs must be a finite non-negative number');
-    }
+    this.retentionGraceMs = validateRetentionGrace(
+      options.retentionGraceMs ?? options.dedupeStoreOptions?.retentionGraceMs,
+      DEDUPE_RETENTION_GRACE_MS,
+    );
 
     const taskOptions = options.taskStoreOptions ?? {};
     if (
@@ -484,6 +683,7 @@ export class RuntimePersistence {
     }
     this.dedupeStore = new RuntimeScopedDedupeStore({
       ...dedupeOptions,
+      retentionGraceMs: this.retentionGraceMs,
       runtimeId: this.runtimeId,
     });
     this.dedupe = this.dedupeStore;
@@ -540,6 +740,25 @@ export class RuntimePersistence {
     const normalizedRecipient = requireText(recipientRuntimeId, 'recipientRuntimeId');
     const nowMs = finiteNow(this.now());
     this.prune(nowMs);
+    const requestedRetainedUntil =
+      expiresAt === undefined
+        ? undefined
+        : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
+    const previousUnreachable = this.unreachableResults.get(normalizedOperationId);
+    if (previousUnreachable !== undefined) {
+      if (previousUnreachable.recipientRuntimeId !== normalizedRecipient) {
+        throw new RuntimePersistenceError(
+          'identity_conflict',
+          'operationId is already bound to an unreachable destination',
+          { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+        );
+      }
+      throw new RuntimePersistenceError(
+        'stale_operation',
+        'an unreachable operation result is immutable; create a new operationId',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
     const previous = this.acceptedOperations.get(normalizedOperationId);
     if (previous !== undefined) {
       if (previous.stale || previous.value.recipientRuntimeId !== normalizedRecipient) {
@@ -557,13 +776,15 @@ export class RuntimePersistence {
       }
       return previous.value;
     }
+    const retainedUntil =
+      requestedRetainedUntil ?? retainedDeadline(undefined, nowMs, this.retentionGraceMs);
     const accepted = Object.freeze({
       operationId: normalizedOperationId,
       recipientRuntimeId: normalizedRecipient,
     });
     const record: AcceptedOperationRecord = {
       value: accepted,
-      retainedUntil: retainedDeadline(expiresAt, nowMs, this.retentionGraceMs),
+      retainedUntil,
       stale: false,
     };
     this.acceptedOperations.set(normalizedOperationId, record);
@@ -593,9 +814,14 @@ export class RuntimePersistence {
       return false;
     }
     const previous = this.acceptedOperations.get(normalizedOperationId);
+    const unreachable = this.unreachableResults.get(normalizedOperationId);
+    if (previous !== undefined && previous.value.recipientRuntimeId !== normalizedRecipient) {
+      previous.stale = true;
+    }
     return (
-      previous === undefined ||
-      (!previous.stale && previous.value.recipientRuntimeId === normalizedRecipient)
+      unreachable === undefined &&
+      (previous === undefined ||
+        (!previous.stale && previous.value.recipientRuntimeId === normalizedRecipient))
     );
   }
 
@@ -654,7 +880,10 @@ export class RuntimePersistence {
     const normalizedMessage = requireText(message, 'message');
     const nowMs = finiteNow(this.now());
     this.prune(nowMs);
-
+    const requestedRetainedUntil =
+      expiresAt === undefined
+        ? undefined
+        : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
     const accepted = this.acceptedOperations.get(normalizedOperationId);
     if (
       accepted !== undefined &&
@@ -690,12 +919,15 @@ export class RuntimePersistence {
       error: error as ProtocolError & { readonly code: 'unreachable' },
       ...(normalizedRecipient === undefined ? {} : { recipientRuntimeId: normalizedRecipient }),
     });
+    const retainedUntil =
+      accepted?.retainedUntil ??
+      requestedRetainedUntil ??
+      retainedDeadline(undefined, nowMs, this.retentionGraceMs);
     const record: UnreachableRecord = {
       value: result,
       recipientRuntimeId: normalizedRecipient,
       message: normalizedMessage,
-      retainedUntil:
-        accepted?.retainedUntil ?? retainedDeadline(expiresAt, nowMs, this.retentionGraceMs),
+      retainedUntil,
     };
     this.unreachableResults.set(normalizedOperationId, record);
     this.scheduleUnreachableResult(normalizedOperationId, record);
@@ -760,7 +992,7 @@ export class RuntimePersistence {
     if (this.shutdownPromise !== undefined) {
       return this.shutdownPromise;
     }
-
+    validateShutdownOptions(options);
     const graceful = options.graceful ?? true;
     const reason = shutdownReason(options.reason);
     const hookTimeoutMs = shutdownHookTimeout(options);
@@ -784,13 +1016,13 @@ export class RuntimePersistence {
       // attempt best-effort delivery, but it can never mutate this old runtime.
       this.taskStore.dispose();
       this.dedupeStore.close();
-      this.clearRuntimeGuards();
+      // Operation guards intentionally outlive this runtime through deadline + grace.
       this.lifecycleState = 'closed';
     } catch (error) {
       try {
         this.taskStore.dispose();
         this.dedupeStore.close();
-        this.clearRuntimeGuards();
+        // Operation guards intentionally outlive this runtime through deadline + grace.
       } finally {
         this.lifecycleState = 'closed';
       }
@@ -823,7 +1055,9 @@ export class RuntimePersistence {
    * synchronously by `shutdown`.
    */
   public reload(options: RuntimeReloadOptions = {}): RuntimePersistence {
-    if (this.replacementRuntime !== undefined) {
+    validateReloadOptions(options);
+    if (this.replacementRuntime !== undefined && this.replacementOptions !== undefined) {
+      assertCachedReplacementOptions(options, this.replacementOptions, this.replacementRuntime);
       return this.replacementRuntime;
     }
     const nowMs = finiteNow(this.now());
@@ -844,15 +1078,22 @@ export class RuntimePersistence {
       clearTimeout: options.clearTimeout ?? this.clearTimeout,
       retentionGraceMs: options.retentionGraceMs ?? this.retentionGraceMs,
       runtimeIdentityHistory: this.runtimeIdentityHistory,
+      operationGuardState: this.operationGuardState,
     });
     this.runtimeIdentityHistory.issued.set(
       this.runtimeId,
       nowMs + this.runtimeIdentityHistory.retentionMs,
     );
-    // Publish the sole replacement before invoking shutdown: a reentrant hook
-    // must observe and return this exact runtime rather than create another.
+    // Publish only after every replacement option and constructor check succeeds.
     this.replacementRuntime = replacement;
-    void this.shutdown(options.shutdown);
+    this.replacementOptions = options;
+    try {
+      void this.shutdown(options.shutdown);
+    } catch (error) {
+      this.replacementRuntime = undefined;
+      this.replacementOptions = undefined;
+      throw error;
+    }
     return replacement;
   }
 
@@ -870,6 +1111,7 @@ export class RuntimePersistence {
       this.removeAcceptedOperation(operationId, record);
       return;
     }
+    record.clearTimeout = this.clearTimeout;
     record.timer = this.setTimeout(
       () => {
         record.timer = undefined;
@@ -893,6 +1135,7 @@ export class RuntimePersistence {
       this.removeUnreachableResult(operationId, record);
       return;
     }
+    record.clearTimeout = this.clearTimeout;
     record.timer = this.setTimeout(
       () => {
         record.timer = undefined;
@@ -915,7 +1158,7 @@ export class RuntimePersistence {
       return;
     }
     if (record.timer !== undefined) {
-      this.clearTimeout(record.timer);
+      (record.clearTimeout ?? this.clearTimeout)(record.timer);
       record.timer = undefined;
     }
     this.acceptedOperations.delete(operationId);
@@ -926,19 +1169,16 @@ export class RuntimePersistence {
       return;
     }
     if (record.timer !== undefined) {
-      this.clearTimeout(record.timer);
+      (record.clearTimeout ?? this.clearTimeout)(record.timer);
       record.timer = undefined;
     }
     this.unreachableResults.delete(operationId);
   }
 
-  private clearRuntimeGuards(): void {
-    for (const [operationId, record] of this.acceptedOperations) {
-      this.removeAcceptedOperation(operationId, record);
-    }
-    for (const [operationId, record] of this.unreachableResults) {
-      this.removeUnreachableResult(operationId, record);
-    }
+  private trackShutdownHook<T>(promise: Promise<T>): Promise<T> {
+    const tracked = promise.finally(() => this.shutdownHooks.delete(tracked));
+    this.shutdownHooks.add(tracked);
+    return tracked;
   }
 
   private async finishShutdown(
@@ -947,31 +1187,38 @@ export class RuntimePersistence {
     hook: RuntimeShutdownTaskHook | undefined,
     hookTimeoutMs: number,
   ): Promise<RuntimeShutdownReport> {
-    const completedTasks: RuntimeShutdownTask[] = [];
-    for (const task of tasks) {
-      let delivery: RuntimeShutdownDelivery;
-      try {
-        delivery = normalizeShutdownDelivery(
-          hook === undefined
-            ? undefined
-            : await waitForShutdownHook(
-                () => hook(task),
-                hookTimeoutMs,
-                this.setTimeout,
-                this.clearTimeout,
-              ),
-        );
-      } catch (error) {
-        delivery = { status: 'unreachable', error };
+    const hookPromises = tasks.map((task) => {
+      if (hook === undefined) {
+        return Promise.resolve<RuntimeShutdownDelivery>({ status: 'skipped' });
       }
-      completedTasks.push(
-        Object.freeze({
-          ...task,
-          delivery: delivery.status,
-          ...(delivery.error === undefined ? {} : { deliveryError: delivery.error }),
-        }),
-      );
-    }
+      const invocation = Promise.resolve()
+        .then(() => hook(task))
+        .then((value) => normalizeShutdownDelivery(value));
+      return this.trackShutdownHook(invocation);
+    });
+    const outcomes = await settlePromisesWithin(
+      hookPromises,
+      hookTimeoutMs,
+      this.setTimeout,
+      this.clearTimeout,
+    );
+    const completedTasks = tasks.map((task, index) => {
+      const outcome = outcomes[index];
+      const delivery: RuntimeShutdownDelivery =
+        outcome === undefined || !outcome.settled
+          ? {
+              status: 'unreachable',
+              error: new RuntimeShutdownHookTimeout(hookTimeoutMs),
+            }
+          : outcome.error !== undefined
+            ? { status: 'unreachable', error: outcome.error }
+            : (outcome.value ?? { status: 'skipped' });
+      return Object.freeze({
+        ...task,
+        delivery: delivery.status,
+        ...(delivery.error === undefined ? {} : { deliveryError: delivery.error }),
+      });
+    });
     return Object.freeze({
       identity: this.identity,
       graceful,
