@@ -1,3 +1,5 @@
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -10,6 +12,31 @@ import {
   ManagedProcessTimeoutError,
 } from './process.js';
 import { createTestWorkspace, testWorkspaceExists, withTestWorkspace } from './workspace.js';
+
+type ManagedProcessKillRunner = {
+  runKill: (timeoutMs: number) => Promise<unknown>;
+};
+
+const createWorkspaceEnvironmentFixture = async (rootPath: string): Promise<string> => {
+  const fixturePath = join(rootPath, 'workspace-environment.mjs');
+  await writeFile(
+    fixturePath,
+    [
+      'const environment = {',
+      '  TEST_WORKSPACE_PATH: process.env.TEST_WORKSPACE_PATH ?? null,',
+      '  TEST_RUNTIME_PATH: process.env.TEST_RUNTIME_PATH ?? null,',
+      '  TEST_ROOM_PATH: process.env.TEST_ROOM_PATH ?? null,',
+      '  TEST_RUNTIME_ID: process.env.TEST_RUNTIME_ID ?? null,',
+      '  TEST_ROOM_ID: process.env.TEST_ROOM_ID ?? null,',
+      '};',
+      "process.stdout.write(JSON.stringify({ event: 'ready', type: 'ready', environment }) + String.fromCharCode(10));",
+      'setInterval(() => {}, 1_000_000);',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  return fixturePath;
+};
 
 describe('managed process support', () => {
   it('starts a fixture, exchanges JSON-lines commands, and observes close diagnostics', async () => {
@@ -105,6 +132,33 @@ describe('managed process support', () => {
       }
       expect(await testWorkspaceExists(workspace.rootPath)).toBe(true);
     });
+  });
+
+  it('forwards group workspace environment to every child with one cleanup owner', async () => {
+    const workspace = await createTestWorkspace();
+    const registerBeforeCleanup = vi.fn(workspace.registerBeforeCleanup);
+    const group = createManagedProcessGroup({
+      workspace: { env: workspace.env, registerBeforeCleanup },
+    });
+    const fixturePath = await createWorkspaceEnvironmentFixture(workspace.rootPath);
+    const first = group.spawn({ fixturePath, label: 'group environment first' });
+    const second = group.spawn({ fixturePath, label: 'group environment second' });
+
+    try {
+      const [firstReady, secondReady] = await Promise.all([
+        first.waitForReady(),
+        second.waitForReady(),
+      ]);
+      expect(firstReady).toMatchObject({ environment: workspace.env });
+      expect(secondReady).toMatchObject({ environment: workspace.env });
+      expect(registerBeforeCleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      await workspace.cleanup();
+    }
+
+    expect(first.state).toBe('closed');
+    expect(second.state).toBe('closed');
+    expect(group.processes).toEqual([]);
   });
 
   it('reports startup failures with identity and bounded diagnostics', async () => {
@@ -220,16 +274,17 @@ describe('managed process support', () => {
     const managed = createManagedProcess({ workspace });
     await managed.waitForReady();
     const terminationFailure = new Error('termination failed while child remained live');
-    const kill = vi.spyOn(managed, 'killAbruptly').mockRejectedValueOnce(terminationFailure);
+    const runKill = vi
+      .spyOn(managed as unknown as ManagedProcessKillRunner, 'runKill')
+      .mockRejectedValueOnce(terminationFailure);
 
     await expect(workspace.cleanup()).rejects.toBe(terminationFailure);
     expect(managed.state).toBe('running');
     expect(await testWorkspaceExists(workspace.rootPath)).toBe(true);
 
-    kill.mockRestore();
-    await managed.sendCommand({ command: 'shutdown' });
-    await managed.waitForClose();
+    runKill.mockRestore();
     await workspace.cleanup();
+    await managed.cleanup();
     expect(await testWorkspaceExists(workspace.rootPath)).toBe(false);
   });
 
@@ -240,7 +295,9 @@ describe('managed process support', () => {
     const closed = group.spawn({ label: 'successful teardown fixture' });
     await Promise.all([failed.waitForReady(), closed.waitForReady()]);
     const terminationFailure = new Error('group child termination failed');
-    const kill = vi.spyOn(failed, 'killAbruptly').mockRejectedValueOnce(terminationFailure);
+    const runKill = vi
+      .spyOn(failed as unknown as ManagedProcessKillRunner, 'runKill')
+      .mockRejectedValueOnce(terminationFailure);
 
     await expect(workspace.cleanup()).rejects.toBe(terminationFailure);
     expect(await testWorkspaceExists(workspace.rootPath)).toBe(true);
@@ -248,7 +305,7 @@ describe('managed process support', () => {
     expect(closed.state).toBe('closed');
     expect(group.processes).toEqual([failed]);
 
-    kill.mockRestore();
+    runKill.mockRestore();
     await group.teardown();
     await workspace.cleanup();
     expect(failed.state).toBe('closed');

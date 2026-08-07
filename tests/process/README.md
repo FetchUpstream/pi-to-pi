@@ -27,9 +27,9 @@ transport, routing, or Pi implementation code.
 - Wait for `ready` before sending a command; coordinate concurrent children with readiness events,
   not fixed sleeps. The lifecycle fixture accepts `shutdown`, `hang`, and `diagnostic` commands.
 - Wrap each test in `withTestWorkspace`; pass the workspace to each directly created managed child,
-  or once to `createManagedProcessGroup`. Children from `group.spawn()` are owned by their group and
-  do not receive a workspace themselves. Keep direct cleanup in `finally` when the test owns a process
-  explicitly.
+  or once to `createManagedProcessGroup`. Group-spawned children inherit the group's workspace
+  environment/configuration without registering child cleanup hooks; the group remains the sole cleanup owner.
+  Keep direct cleanup in `finally` when the test owns a process explicitly.
 - Await clean `waitForClose()` results in the normal path. On failure or timeout, managed cleanup
   must terminate every child before workspace removal; repeated `cleanup()` and `killAbruptly()` are
   safe.

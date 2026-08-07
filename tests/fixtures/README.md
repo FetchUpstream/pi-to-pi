@@ -29,8 +29,8 @@ reimplementing child-process control. From a test in `tests/process/` or `tests/
 Managed-harness consumers should give each managed child or group a test workspace. Create the
 workspace with `withTestWorkspace` (or call `workspace.cleanup()` explicitly), pass it to
 `createManagedProcess` for an individual child or to `createManagedProcessGroup` for a group, and
-let workspace cleanup terminate remaining children before removing runtime and room paths. Children
-created with `group.spawn()` are owned by the group and do not receive a workspace themselves.
+let workspace cleanup terminate remaining children before removing runtime and room paths. Group-spawned children inherit the group's workspace
+environment/configuration without registering child cleanup hooks; the group remains the sole cleanup owner.
 The standalone `tests/fixtures/lifecycle.test.ts` is a direct-fixture test exception: it launches
 `lifecycle.mjs` with Node's `spawn` and owns shutdown/cleanup itself in `finally`.
 Tests that own a process directly should keep cleanup in `finally`; repeated cleanup and
