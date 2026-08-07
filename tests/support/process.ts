@@ -686,8 +686,13 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       options.timeoutMs ?? this.defaultKillTimeoutMs,
       'managed process kill timeout',
     );
-    this.killPromise = this.runKill(timeoutMs);
-    return this.killPromise;
+    const killPromise = this.runKill(timeoutMs).catch((error: unknown) => {
+      // A bounded termination failure must not poison future teardown retries.
+      this.killPromise = undefined;
+      throw error;
+    });
+    this.killPromise = killPromise;
+    return killPromise;
   }
 
   /** Teardown alias used by workspace cleanup hooks. */
@@ -695,8 +700,14 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     if (this.cleanupPromise) {
       return this.cleanupPromise;
     }
-    this.cleanupPromise = this.killAbruptly();
-    return this.cleanupPromise;
+    const cleanupPromise = this.killAbruptly().catch((error: unknown) => {
+      // Keep the workspace-owned cleanup hook registered while the child is live,
+      // but allow a later workspace cleanup attempt to retry termination.
+      this.cleanupPromise = undefined;
+      throw error;
+    });
+    this.cleanupPromise = cleanupPromise;
+    return cleanupPromise;
   }
 
   /** Idempotent lifecycle teardown alias. */
@@ -1067,11 +1078,13 @@ export { ManagedProcess as ManagedChildProcess };
  */
 export class ManagedProcessGroup {
   private readonly managedProcesses = new Set<ManagedProcess>();
+  private readonly workspaceEnvironment: Readonly<Record<string, string>> | undefined;
   private teardownPromise: Promise<void> | undefined;
   private teardownStarted = false;
   private workspaceUnregister: (() => void) | undefined;
 
   constructor(options: ManagedProcessGroupOptions = {}) {
+    this.workspaceEnvironment = options.workspace?.env;
     if (options.workspace) {
       this.workspaceUnregister = options.workspace.registerBeforeCleanup(() => this.teardown());
     }
@@ -1096,7 +1109,12 @@ export class ManagedProcessGroup {
     if (this.teardownStarted) {
       throw new Error('Cannot spawn a managed process after group teardown started');
     }
-    const process = createManagedProcess<TEvent>({ ...options, workspace: undefined });
+    // The group owns cleanup; forward its workspace environment without registering each child.
+    const process = createManagedProcess<TEvent>({
+      ...options,
+      env: { ...this.workspaceEnvironment, ...options.workspace?.env, ...options.env },
+      workspace: undefined,
+    });
     try {
       return this.add(process);
     } catch (error) {

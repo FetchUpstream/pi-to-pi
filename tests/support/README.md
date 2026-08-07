@@ -34,9 +34,9 @@ test (`tests/process/harness.test.ts`) uses the public `../support/index.js` bar
 - Wrap each test in `withTestWorkspace` (or explicitly call `createTestWorkspace` and
   `workspace.cleanup()`). For an individual managed child, pass the workspace to
   `createManagedProcess` and await `waitForClose()` in the normal path. For a managed process group,
-  pass the workspace to `createManagedProcessGroup`; its `group.spawn()` children are owned by the
-  group and do not receive a workspace of their own. The workspace cleanup hook terminates any
-  remaining children before removing temporary runtime and room paths.
+  pass the workspace to `createManagedProcessGroup`; its `group.spawn()` children inherit the group's workspace
+  environment/configuration without registering their own cleanup hooks. The group remains the sole
+  workspace cleanup owner and terminates remaining children before removing temporary runtime and room paths.
 - Keep cleanup in a `finally` path when a test owns a process directly. Repeated cleanup and
   `killAbruptly()` calls are expected to be safe; do not remove a workspace while a child is still
   running.
