@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { fauxAssistantMessage } from '@earendil-works/pi-ai';
 import { SettingsManager, type AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import { createPersistedPiSessionFixture } from '../fixtures/index.js';
-import { createRequestCorrelation } from './request-correlation.js';
+import {
+  createRequestCorrelation,
+  type CorrelationEvent,
+  type RequestCorrelation,
+} from './request-correlation.js';
 
 const INBOUND_TYPE = 'p2p.inbound';
 type PersistedFixture = Awaited<ReturnType<typeof createPersistedPiSessionFixture>>;
@@ -58,6 +62,27 @@ function waitForCustomMessageStart(
   return waitForSessionEvent(fixture, (event) => isCustomMessageStart(event, requestId), timeoutMs);
 }
 
+function waitForCorrelationEvent(
+  correlation: RequestCorrelation,
+  predicate: (event: CorrelationEvent) => boolean,
+  timeoutMs = 2_000,
+): Promise<CorrelationEvent> {
+  return new Promise((resolve, reject) => {
+    const unsubscribe = correlation.subscribe((event) => {
+      if (!predicate(event)) {
+        return;
+      }
+      clearTimeout(timeout);
+      unsubscribe();
+      resolve(event);
+    });
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      reject(new Error('Timed out waiting for the expected correlation event'));
+    }, timeoutMs);
+  });
+}
+
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -69,9 +94,13 @@ function deferred<T>(): {
   return { promise, resolve: resolvePromise };
 }
 
-async function disposeFixture(fixture: PersistedFixture, pending?: Promise<void>): Promise<void> {
+async function disposeFixture(
+  fixture: PersistedFixture,
+  pending?: Promise<void> | readonly Promise<void>[],
+): Promise<void> {
+  const pendingPromises = pending === undefined ? [] : Array.isArray(pending) ? pending : [pending];
   try {
-    await pending?.catch(() => undefined);
+    await Promise.all(pendingPromises.map((promise) => promise.catch(() => undefined)));
     await fixture.waitForIdle().catch(() => undefined);
   } finally {
     await fixture.dispose();
@@ -126,12 +155,44 @@ describe('correlated inbound delivery', () => {
       await disposeFixture(fixture);
     }
   });
+  it('rejects duplicate delivery after a successful send', async () => {
+    const fixture = await createPersistedPiSessionFixture({
+      responses: [fauxAssistantMessage('duplicate response')],
+    });
+    const correlation = createRequestCorrelation();
+    const requestId = 'opaque/request-duplicate-after-send';
+    correlation.accept(fixture, requestId);
+    try {
+      await correlation.deliver(fixture, requestId, 'request body', { triggerTurn: true });
+      expect(correlation.events).toEqual([
+        { type: 'registered', requestId },
+        { type: 'delivered', requestId, stateAtDelivery: 'accepted' },
+      ]);
+      await expect(
+        correlation.deliver(fixture, requestId, 'duplicate request body'),
+      ).rejects.toThrow(`Request ID is already being delivered: ${requestId}`);
+      expect(correlation.state(requestId)).toBe('accepted');
+      expect(fixture.probe.byType('custom_message_start')).toHaveLength(1);
+      expect(fixture.probe.byType('custom_message_end')).toHaveLength(1);
+      expect(customInboundEntries(fixture)).toHaveLength(1);
+      expect(correlation.events).toEqual([
+        { type: 'registered', requestId },
+        { type: 'delivered', requestId, stateAtDelivery: 'accepted' },
+      ]);
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
 
   it('processes busy steering before follow-up while retaining independent request metadata', async () => {
     const firstResponse = deferred<ReturnType<typeof fauxAssistantMessage>>();
+    const responseRequested = deferred<void>();
     const fixture = await createPersistedPiSessionFixture({
       responses: [
-        () => firstResponse.promise,
+        () => {
+          responseRequested.resolve();
+          return firstResponse.promise;
+        },
         fauxAssistantMessage('steer response'),
         fauxAssistantMessage('follow-up response'),
       ],
@@ -145,36 +206,76 @@ describe('correlated inbound delivery', () => {
     correlation.accept(fixture, followUpId);
 
     let initialDelivery: Promise<void> | undefined;
+    let steerDelivery: Promise<void> | undefined;
+    let followUpDelivery: Promise<void> | undefined;
     try {
       initialDelivery = correlation.deliver(fixture, initialId, 'initial request body', {
         triggerTurn: true,
       });
       await waitForSessionEvent(fixture, (event) => event.type === 'agent_start');
+      await responseRequested.promise;
       expect(fixture.session.isStreaming).toBe(true);
       const steerStarted = waitForCustomMessageStart(fixture, steerId);
       const followUpStarted = waitForCustomMessageStart(fixture, followUpId);
-
+      const steerEnqueued = waitForCorrelationEvent(
+        correlation,
+        (event) =>
+          event.type === 'enqueued' && event.requestId === steerId && event.deliveryAs === 'steer',
+      );
+      const followUpEnqueued = waitForCorrelationEvent(
+        correlation,
+        (event) =>
+          event.type === 'enqueued' &&
+          event.requestId === followUpId &&
+          event.deliveryAs === 'followUp',
+      );
+      steerDelivery = correlation.deliver(fixture, steerId, 'steering request body', {
+        deliverAs: 'steer',
+      });
+      followUpDelivery = correlation.deliver(fixture, followUpId, 'follow-up request body', {
+        deliverAs: 'followUp',
+      });
+      await Promise.all([steerEnqueued, followUpEnqueued]);
+      expect(correlation.events.filter((event) => event.type === 'delivered')).toEqual([]);
+      expect(correlation.events.filter((event) => event.type === 'enqueued')).toEqual([
+        { type: 'enqueued', requestId: steerId, deliveryAs: 'steer' },
+        { type: 'enqueued', requestId: followUpId, deliveryAs: 'followUp' },
+      ]);
       await expect(
         correlation.deliver(fixture, initialId, 'duplicate initial request body', {
           deliverAs: 'steer',
         }),
       ).rejects.toThrow('Request ID is already being delivered: opaque/request-initial');
-
-      await correlation.deliver(fixture, steerId, 'steering request body', {
-        deliverAs: 'steer',
-      });
-      await correlation.deliver(fixture, followUpId, 'follow-up request body', {
-        deliverAs: 'followUp',
-      });
+      await expect(
+        correlation.deliver(fixture, steerId, 'duplicate steering request body', {
+          deliverAs: 'steer',
+        }),
+      ).rejects.toThrow('Request ID is already being delivered: opaque/request-steer');
+      await expect(
+        correlation.deliver(fixture, followUpId, 'duplicate follow-up request body', {
+          deliverAs: 'followUp',
+        }),
+      ).rejects.toThrow('Request ID is already being delivered: opaque/request-follow-up');
+      expect(() => correlation.reply(fixture, steerId, 'premature steering reply')).toThrow(
+        'Cannot reply while delivery is in flight: opaque/request-steer',
+      );
+      expect(() => correlation.reply(fixture, followUpId, 'premature follow-up reply')).toThrow(
+        'Cannot reply while delivery is in flight: opaque/request-follow-up',
+      );
       expect(correlation.events.filter((event) => event.type === 'registered')).toEqual([
         { type: 'registered', requestId: initialId },
         { type: 'registered', requestId: steerId },
         { type: 'registered', requestId: followUpId },
       ]);
-
       firstResponse.resolve(fauxAssistantMessage('initial response'));
-      await Promise.all([initialDelivery, steerStarted, followUpStarted]);
-
+      await Promise.all([
+        initialDelivery,
+        steerDelivery,
+        followUpDelivery,
+        steerStarted,
+        followUpStarted,
+      ]);
+      expect(correlation.events.filter((event) => event.type === 'delivered')).toHaveLength(3);
       const customStarts = fixture.probe.byType('custom_message_start');
       expect(customStarts.map((observation) => observation.details)).toEqual([
         { requestId: initialId },
@@ -192,7 +293,6 @@ describe('correlated inbound delivery', () => {
         return observation.details.requestId;
       });
       expect(customStartIds.indexOf(steerId)).toBeLessThan(customStartIds.indexOf(followUpId));
-
       const customEndIds = fixture.probe.byType('custom_message_end').map((observation) => {
         if (
           !observation.details ||
@@ -204,7 +304,6 @@ describe('correlated inbound delivery', () => {
         return observation.details.requestId;
       });
       expect(customEndIds).toEqual([initialId, steerId, followUpId]);
-
       const entries = customInboundEntries(fixture);
       expect(entries).toHaveLength(3);
       expect(
@@ -212,7 +311,12 @@ describe('correlated inbound delivery', () => {
       ).toEqual([{ requestId: initialId }, { requestId: steerId }, { requestId: followUpId }]);
     } finally {
       firstResponse.resolve(fauxAssistantMessage('initial response after cleanup'));
-      await disposeFixture(fixture, initialDelivery);
+      await disposeFixture(
+        fixture,
+        [initialDelivery, steerDelivery, followUpDelivery].filter(
+          (delivery): delivery is Promise<void> => delivery !== undefined,
+        ),
+      );
     }
   });
 
@@ -274,10 +378,19 @@ describe('correlated inbound delivery', () => {
         };
       },
     });
+    const deliveryRuntime = new Proxy(fixture.runtime, {
+      get(target, property, receiver) {
+        if (property === 'session') {
+          return barrierSession;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
     const deliveryFixture = {
-      runtime: fixture.runtime,
+      runtime: deliveryRuntime,
       session: barrierSession,
       sessionId: barrierSession.sessionId,
+      subscribeToSessionInvalidation: fixture.subscribeToSessionInvalidation,
     } as unknown as PersistedFixture;
     correlation.accept(deliveryFixture, requestId);
     let delivery: Promise<void> | undefined;
@@ -312,7 +425,11 @@ describe('correlated inbound delivery', () => {
     const requestId = 'opaque/request-session-bound';
     correlation.accept(fixture, requestId);
     const originalSessionId = fixture.sessionId;
-
+    const staleFixture = {
+      runtime: fixture.runtime,
+      session: fixture.session,
+      sessionId: fixture.sessionId,
+    } as unknown as PersistedFixture;
     try {
       await fixture.newSession();
       expect(fixture.sessionId).not.toBe(originalSessionId);
@@ -323,6 +440,15 @@ describe('correlated inbound delivery', () => {
         'Request ID belongs to another Pi session/runtime: opaque/request-session-bound',
       );
       expect(correlation.state(requestId)).toBe('accepted');
+      await expect(
+        correlation.deliver(staleFixture, requestId, 'stale wrapper body'),
+      ).rejects.toThrow(
+        'Request ID belongs to another Pi session/runtime: opaque/request-session-bound',
+      );
+      expect(() => correlation.reply(staleFixture, requestId, 'stale wrapper reply')).toThrow(
+        'Request ID belongs to another Pi session/runtime: opaque/request-session-bound',
+      );
+      expect(correlation.events).toEqual([{ type: 'registered', requestId }]);
     } finally {
       await disposeFixture(fixture);
     }
@@ -349,14 +475,23 @@ describe('correlated inbound delivery', () => {
       },
     });
     let activeSession = barrierSession;
+    const deliveryRuntime = new Proxy(fixture.runtime, {
+      get(target, property, receiver) {
+        if (property === 'session') {
+          return activeSession;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
     const deliveryFixture = {
-      runtime: fixture.runtime,
+      runtime: deliveryRuntime,
       get session() {
         return activeSession;
       },
       get sessionId() {
         return activeSession.sessionId;
       },
+      subscribeToSessionInvalidation: fixture.subscribeToSessionInvalidation,
     } as unknown as PersistedFixture;
     correlation.accept(deliveryFixture, requestId);
     let delivery: Promise<void> | undefined;
@@ -369,7 +504,9 @@ describe('correlated inbound delivery', () => {
       expect(fixture.sessionId).not.toBe(originalSessionId);
       expect(() =>
         correlation.reply(deliveryFixture, requestId, 'premature replacement reply'),
-      ).toThrow('Cannot reply while delivery is in flight: opaque/request-in-flight-replacement');
+      ).toThrow(
+        'Request ID belongs to another Pi session/runtime: opaque/request-in-flight-replacement',
+      );
       expect(() => correlation.reply(fixture, requestId, 'stale runtime reply')).toThrow(
         'Request ID belongs to another Pi session/runtime: opaque/request-in-flight-replacement',
       );

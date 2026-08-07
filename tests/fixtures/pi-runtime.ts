@@ -93,6 +93,7 @@ export interface PiRuntimeFixture {
   readonly sessionFile: string | undefined;
   readonly entries: ReturnType<SessionManager['getEntries']>;
   bindCurrentSession(): Promise<void>;
+  subscribeToSessionInvalidation?(listener: () => void): () => void;
   reload(): Promise<void>;
   newSession(
     options?: Parameters<AgentSessionRuntime['newSession']>[0],
@@ -284,6 +285,7 @@ export async function createPiRuntimeFixture(
 
   let runtime!: AgentSessionRuntime;
   let unsubscribe: (() => void) | undefined;
+  const sessionInvalidationListeners = new Set<() => void>();
   let disposed = false;
   const bindCurrentSession = async (): Promise<void> => {
     unsubscribe?.();
@@ -300,7 +302,11 @@ export async function createPiRuntimeFixture(
       agentDir: options.agentDir,
       sessionManager,
     });
-
+    runtime.setBeforeSessionInvalidate(() => {
+      for (const listener of [...sessionInvalidationListeners]) {
+        listener();
+      }
+    });
     runtime.setRebindSession(async () => {
       await bindCurrentSession();
     });
@@ -352,6 +358,12 @@ export async function createPiRuntimeFixture(
       return runtime.session.sessionManager.getEntries();
     },
     bindCurrentSession,
+    subscribeToSessionInvalidation(listener) {
+      sessionInvalidationListeners.add(listener);
+      return () => {
+        sessionInvalidationListeners.delete(listener);
+      };
+    },
     async reload() {
       await runtime.session.reload();
     },

@@ -13,9 +13,9 @@
 
 ## 3. Verify inbound delivery and correlation
 
-- [ ] 3.1 Test idle custom delivery with `triggerTurn: true`, asserting request registration occurs first and request ID details survive events and session entries.
-- [ ] 3.2 Test busy `steer` and `followUp` delivery, asserting steering is processed before follow-up and each message retains independent request metadata.
-- [ ] 3.3 Add a request-scoped correlation helper/test that completes only the explicitly named request and rejects unknown IDs without inspecting the latest assistant message.
+- [x] 3.1 Test idle custom delivery with `triggerTurn: true`, asserting request registration occurs first and request ID details survive events and session entries.
+- [x] 3.2 Test busy `steer` and `followUp` delivery, asserting steering is processed before follow-up and each message retains independent request metadata.
+- [x] 3.3 Add a request-scoped correlation helper/test that completes only the explicitly named request and rejects unknown IDs without inspecting the latest assistant message.
 
 ## 4. Verify task-state recovery and ownership
 

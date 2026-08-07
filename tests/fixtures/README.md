@@ -77,5 +77,6 @@ from the portable process harness above:
 The [inbound-delivery integration test](../integration/inbound-delivery.test.ts) and its correlation helper enforce these additional fixture invariants:
 
 - Reply transitions reject while the matching delivery is in flight; stale session/runtime attempts cannot emit `replied` or `delivered` correlation events.
-- Accepted requests capture the runtime object, exact session object, and session ID; delivery checks all three before sending and again after the asynchronous send. A session replacement during a send rejects the stale delivery and leaves the request accepted but undelivered.
-- Busy delivery establishes an `agent_start` barrier, queues steering and follow-up messages, and waits on explicit custom-message start events for both queued requests. It does not use timing delays, `setImmediate`, busy polling, or pending-queue counts to establish processing order.
+- Accepted requests capture the runtime object, exact session object, and session ID; every transition also verifies that the accepted runtime still exposes that exact session and identity. A replacement during a send rejects the stale delivery and leaves the request accepted but undelivered.
+- Busy `steer` and `followUp` calls emit an `enqueued` observation but keep the in-flight guard until their custom message has been processed and `agent_settled` has fired; `delivered` is emitted only then. The contract establishes queueing with explicit correlation events, preserves steering-before-follow-up ordering, and rejects duplicate IDs while queued or settled.
+- The correlation helper intentionally does not offer `deliverAs: "nextTurn"`; inbound delivery must either trigger an idle turn or use busy steering/follow-up processing.
