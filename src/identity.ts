@@ -45,6 +45,18 @@ export class IdentityInputError extends TypeError {
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function requireIdentifier(value: string, field: string): string {
   if (typeof value !== 'string' || value.length === 0) {
     throw new IdentityInputError(`${field} must be a non-empty string`);
@@ -109,12 +121,21 @@ export function createRuntimeIdentityFromSessionManager(
 
 /** Type guard for values received from discovery or a protocol boundary. */
 export function isSessionRuntimeIdentity(value: unknown): value is SessionRuntimeIdentity {
-  if (typeof value !== 'object' || value === null) {
+  if (!isPlainObject(value) || !hasOwn(value, 'sessionId') || !hasOwn(value, 'runtimeId')) {
     return false;
   }
 
-  const candidate = value as { sessionId?: unknown; runtimeId?: unknown };
+  const candidate = value as { sessionId: unknown; runtimeId: unknown };
   return isSafeIdentifier(candidate.sessionId) && isSafeIdentifier(candidate.runtimeId);
+}
+function runtimeIdForAddress(runtime: RuntimeId | SessionRuntimeIdentity): RuntimeId {
+  if (typeof runtime === 'string') {
+    return requireRuntimeId(runtime);
+  }
+  if (!isPlainObject(runtime) || !hasOwn(runtime, 'runtimeId')) {
+    throw new IdentityInputError('runtime identity must be a plain object with an own runtimeId');
+  }
+  return requireRuntimeId(runtime.runtimeId);
 }
 
 /** Create an exact runtime address; the runtime UUID and room are both required for routing. */
@@ -122,8 +143,7 @@ export function createRuntimeAddress(
   runtime: RuntimeId | SessionRuntimeIdentity,
   roomId: RoomId,
 ): RuntimeAddress {
-  const runtimeId =
-    typeof runtime === 'string' ? requireRuntimeId(runtime) : requireRuntimeId(runtime.runtimeId);
+  const runtimeId = runtimeIdForAddress(runtime);
   return Object.freeze({
     runtimeId,
     roomId: roomStorageKey(roomId),
@@ -132,11 +152,11 @@ export function createRuntimeAddress(
 
 /** Type guard for an exact runtime address. */
 export function isRuntimeAddress(value: unknown): value is RuntimeAddress {
-  if (typeof value !== 'object' || value === null) {
+  if (!isPlainObject(value) || !hasOwn(value, 'runtimeId') || !hasOwn(value, 'roomId')) {
     return false;
   }
 
-  const candidate = value as { runtimeId?: unknown; roomId?: unknown };
+  const candidate = value as { runtimeId: unknown; roomId: unknown };
   return isSafeIdentifier(candidate.runtimeId) && isRoomId(candidate.roomId);
 }
 

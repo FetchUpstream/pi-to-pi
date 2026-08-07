@@ -107,6 +107,8 @@ const SUPPORTED_REQUIRED_VOCABULARIES = new Set([
 ]);
 const LOCAL_REFERENCE_PATTERN = /^(?:|#(?:[^\s]*))$/u;
 const MAX_SAFE_REGEX_PATTERN_LENGTH = 1024;
+const MAX_SAFE_REGEX_REPETITIONS = 256;
+const MAX_SAFE_REGEX_VARIANTS = 256;
 const REQUIRED_ENVELOPE_FIELDS = [
   'protocolVersion',
   'operation',
@@ -222,12 +224,27 @@ function validationFailure<Value>(
   };
 }
 
+function messageForInternalCode(code: InternalCode): string {
+  switch (code) {
+    case 'incompatible':
+      return 'protocol value is not supported';
+    case 'expired':
+      return 'protocol value has expired';
+    case 'oversized':
+      return 'protocol value exceeds a configured size limit';
+    case 'invalid_content':
+      return 'protocol content is invalid';
+    case 'invalid_reply':
+      return 'protocol reply is invalid';
+    case 'malformed':
+      return 'protocol value is malformed';
+  }
+}
+
 function internalIssueFailure<Value>(issueValue: InternalIssue): ValidationResult<Value> {
   return validationFailure(
     issueValue.code,
-    issueValue.code === 'incompatible'
-      ? 'protocol value is not supported'
-      : 'protocol value is malformed',
+    messageForInternalCode(issueValue.code),
     issueValue.path,
     issueValue.reason,
     issueValue.keyword,
@@ -442,13 +459,13 @@ function measureJsonBytes(
     }
 
     if (candidate === null) {
-      return { kind: 'ok', bytes: 4 };
+      return addMeasuredBytes(0, 4, context);
     }
     if (typeof candidate === 'string') {
-      return { kind: 'ok', bytes: jsonStringByteLength(candidate) };
+      return addMeasuredBytes(0, jsonStringByteLength(candidate), context);
     }
     if (typeof candidate === 'boolean') {
-      return { kind: 'ok', bytes: candidate ? 4 : 5 };
+      return addMeasuredBytes(0, candidate ? 4 : 5, context);
     }
     if (typeof candidate === 'number') {
       if (!Number.isFinite(candidate)) {
@@ -457,7 +474,7 @@ function measureJsonBytes(
       const serialized = JSON.stringify(candidate);
       return serialized === undefined
         ? { kind: 'invalid', path, reason: 'value is not JSON serializable' }
-        : { kind: 'ok', bytes: Buffer.byteLength(serialized, 'utf8') };
+        : addMeasuredBytes(0, Buffer.byteLength(serialized, 'utf8'), context);
     }
     if (typeof candidate !== 'object') {
       return { kind: 'invalid', path, reason: 'value is not JSON serializable' };
@@ -493,7 +510,7 @@ function measureJsonBytes(
           bytes = comma.bytes;
         }
       }
-      result = { kind: 'ok', bytes };
+      result = addMeasuredBytes(0, bytes, context);
     } else if (isPlainObject(candidate)) {
       if (Object.getOwnPropertySymbols(candidate).length > 0) {
         context.seen.delete(candidate);
@@ -535,7 +552,7 @@ function measureJsonBytes(
           bytes = comma.bytes;
         }
       }
-      result = { kind: 'ok', bytes };
+      result = addMeasuredBytes(0, bytes, context);
     } else {
       result = { kind: 'invalid', path, reason: 'objects must be plain JSON objects' };
     }
@@ -557,7 +574,7 @@ function validateJsonValueInternal(
     return issue('malformed', measured.path, measured.reason);
   }
   if (measured.kind === 'too_large') {
-    return issue('malformed', path, 'JSON value exceeds the validation complexity bound');
+    return issue('oversized', path, 'JSON value exceeds the validation complexity bound');
   }
   return undefined;
 }
@@ -590,8 +607,12 @@ function validateTypedContentInternal(
     if (!hasOwn(value, 'value')) {
       return issue('invalid_content', `${path}.value`, 'JSON content requires a value');
     }
-    return validateJsonValueInternal(value.value, `${path}.value`, options) === undefined
-      ? undefined
+    const jsonIssue = validateJsonValueInternal(value.value, `${path}.value`, options);
+    if (jsonIssue === undefined) {
+      return undefined;
+    }
+    return jsonIssue.code === 'oversized'
+      ? issue('oversized', `${path}.value`, jsonIssue.reason, jsonIssue.keyword)
       : issue('invalid_content', `${path}.value`, 'value is not valid JSON');
   }
 
@@ -605,8 +626,7 @@ export function validateContent(
 ): ValidationResult<TypedContent> {
   const contentIssue = validateTypedContentInternal(value, '$', options);
   if (contentIssue !== undefined) {
-    const code: ValidationErrorCode =
-      contentIssue.code === 'malformed' ? 'malformed' : 'invalid_content';
+    const code: ValidationErrorCode = contentIssue.code;
     return validationFailure(
       code,
       'typed content is invalid',
@@ -633,8 +653,12 @@ function validateMetadataInternal(
   if (!isJsonObject(value)) {
     return issue('invalid_content', path, 'metadata must be a JSON object');
   }
-  return validateJsonValueInternal(value, path, options) === undefined
-    ? undefined
+  const jsonIssue = validateJsonValueInternal(value, path, options);
+  if (jsonIssue === undefined) {
+    return undefined;
+  }
+  return jsonIssue.code === 'oversized'
+    ? issue('oversized', path, jsonIssue.reason, jsonIssue.keyword)
     : issue('invalid_content', path, 'metadata must contain only JSON values');
 }
 
@@ -696,17 +720,104 @@ function validateRegexPattern(
   } catch {
     return issue('malformed', path, 'pattern is not a valid regular expression', keyword);
   }
-  if (
-    /\\(?:[1-9]\d*|k<[^>]+>)/u.test(pattern) ||
-    /\(\?(?:=|!|<=|<!)/u.test(pattern) ||
-    /\)[?+*{]/u.test(pattern)
-  ) {
+
+  function unsafe(): InternalIssue {
     return issue(
       'incompatible',
       path,
       'regular expression uses unsupported or unsafe constructs',
       keyword,
     );
+  }
+  let canQuantify = false;
+  let unboundedQuantifiers = 0;
+  let finiteVariants = 1;
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index];
+    if (character === '\\') {
+      const escaped = pattern[index + 1];
+      if (escaped === undefined) {
+        continue;
+      }
+      if (/[1-9]/u.test(escaped) || escaped === 'k') {
+        return unsafe();
+      }
+      if (escaped === 'p' || escaped === 'P' || (escaped === 'u' && pattern[index + 2] === '{')) {
+        const closingBrace = pattern.indexOf('}', index + 2);
+        if (closingBrace >= 0) {
+          index = closingBrace;
+        }
+      } else {
+        index += 1;
+      }
+      canQuantify = true;
+      continue;
+    }
+    if (character === '[') {
+      let closingBracket = -1;
+      for (let end = index + 1; end < pattern.length; end += 1) {
+        if (pattern[end] === '\\') {
+          end += 1;
+          continue;
+        }
+        if (pattern[end] === ']') {
+          closingBracket = end;
+          break;
+        }
+      }
+      if (closingBracket >= 0) {
+        index = closingBracket;
+      }
+      canQuantify = true;
+      continue;
+    }
+    if (character === '(' || character === ')' || character === '|' || character === '?') {
+      return unsafe();
+    }
+    if (character === '*' || character === '+') {
+      if (!canQuantify) {
+        return unsafe();
+      }
+      unboundedQuantifiers += 1;
+      if (unboundedQuantifiers > 1) {
+        return unsafe();
+      }
+      canQuantify = false;
+      continue;
+    }
+    if (character === '{' && canQuantify) {
+      const quantifier = /^\{(\d+)(?:,(\d*))?\}/u.exec(pattern.slice(index));
+      if (quantifier !== null) {
+        const minimum = Number(quantifier[1]);
+        const maximumText = quantifier[2];
+        const maximum = maximumText === undefined ? minimum : Number(maximumText);
+        if (
+          maximumText === '' ||
+          !Number.isSafeInteger(minimum) ||
+          !Number.isSafeInteger(maximum)
+        ) {
+          unboundedQuantifiers += 1;
+          if (unboundedQuantifiers > 1) {
+            return unsafe();
+          }
+        } else if (
+          minimum > maximum ||
+          maximum > MAX_SAFE_REGEX_REPETITIONS ||
+          minimum > MAX_SAFE_REGEX_REPETITIONS
+        ) {
+          return unsafe();
+        } else {
+          finiteVariants *= maximum - minimum + 1;
+          if (finiteVariants > MAX_SAFE_REGEX_VARIANTS) {
+            return unsafe();
+          }
+        }
+        index += quantifier[0].length - 1;
+        canQuantify = false;
+        continue;
+      }
+    }
+    canQuantify = true;
   }
   return undefined;
 }
@@ -736,9 +847,6 @@ function schemaRegex(context: SchemaContext, pattern: string): RegExp | undefine
   if (cached !== undefined) {
     return cached;
   }
-  if (!consumeEvaluationBudget(context.budget)) {
-    return undefined;
-  }
   try {
     const expression = new RegExp(pattern, 'u');
     context.regexCache.set(pattern, expression);
@@ -753,7 +861,8 @@ function testSchemaRegex(
   pattern: string,
   value: string,
 ): { readonly matched: boolean; readonly exhausted: boolean } {
-  if (!consumeEvaluationBudget(context.budget)) {
+  const cost = Math.min(Number.MAX_SAFE_INTEGER, pattern.length + value.length + 1);
+  if (!consumeEvaluationBudget(context.budget, cost)) {
     return { matched: false, exhausted: true };
   }
   const expression = schemaRegex(context, pattern);
@@ -1340,24 +1449,26 @@ function validateExpectedResponseInternal(
     return issue('malformed', `${path}.schema`, 'expected response schema is required', 'schema');
   }
   const result = validateJsonSchema(value.schema, options);
-  return result.ok
-    ? undefined
-    : {
-        code:
-          result.error.code === 'oversized'
-            ? 'oversized'
-            : result.error.code === 'incompatible'
-              ? 'incompatible'
-              : 'malformed',
-        path:
-          typeof result.error.details?.path === 'string'
-            ? result.error.details.path
-            : `${path}.schema`,
-        reason: result.error.message,
-        ...(typeof result.error.details?.keyword === 'string'
-          ? { keyword: result.error.details.keyword }
-          : {}),
-      };
+  if (result.ok) {
+    return undefined;
+  }
+  const code: InternalCode =
+    result.error.code === 'incompatible' ||
+    result.error.code === 'expired' ||
+    result.error.code === 'oversized' ||
+    result.error.code === 'invalid_content' ||
+    result.error.code === 'invalid_reply'
+      ? result.error.code
+      : 'malformed';
+  return {
+    code,
+    path:
+      typeof result.error.details?.path === 'string' ? result.error.details.path : `${path}.schema`,
+    reason: result.error.message,
+    ...(typeof result.error.details?.keyword === 'string'
+      ? { keyword: result.error.details.keyword }
+      : {}),
+  };
 }
 
 /** Validate expected JSON response metadata and its bounded local schema. */
@@ -1434,7 +1545,12 @@ function validateProtocolErrorValue(
   }
   if (hasOwn(value, 'details')) {
     const detailsIssue = validateJsonValueInternal(value.details, `${path}.details`, options);
-    if (detailsIssue !== undefined || !isJsonObject(value.details)) {
+    if (detailsIssue !== undefined) {
+      return detailsIssue.code === 'oversized'
+        ? issue('oversized', detailsIssue.path, detailsIssue.reason, 'details')
+        : issue('malformed', detailsIssue.path, 'error details must be a JSON object', 'details');
+    }
+    if (!isJsonObject(value.details)) {
       return issue(
         'malformed',
         `${path}.details`,
@@ -1892,6 +2008,14 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
       'supportedProtocolVersions',
     );
   }
+  if (new Set(value.supportedProtocolVersions).size !== value.supportedProtocolVersions.length) {
+    return issue(
+      'malformed',
+      `${path}.supportedProtocolVersions`,
+      'supportedProtocolVersions must not contain duplicates',
+      'supportedProtocolVersions',
+    );
+  }
   if (
     !hasOwn(value, 'operations') ||
     !Array.isArray(value.operations) ||
@@ -2106,6 +2230,46 @@ function validateTaskSnapshotInternal(
       'expiresAt',
     );
   }
+  const createdAt = timestamps.get('createdAt')!;
+  const updatedAt = timestamps.get('updatedAt')!;
+  const expiresAt = timestamps.get('expiresAt')!;
+  const limits = resolveLimits(options);
+  const now = resolveNow(options.now);
+  if (expiresAt - createdAt > limits.maxRequestTtlMs) {
+    return issue(
+      'malformed',
+      `${path}.expiresAt`,
+      'task snapshot lifetime exceeds the configured request limit',
+      'expiresAt',
+    );
+  }
+  if (createdAt > now + MAX_CLOCK_SKEW_MS) {
+    return issue(
+      'malformed',
+      `${path}.createdAt`,
+      'task snapshot creation time is too far in the future',
+      'createdAt',
+    );
+  }
+  if (updatedAt > now + MAX_CLOCK_SKEW_MS) {
+    return issue(
+      'malformed',
+      `${path}.updatedAt`,
+      'task snapshot update time is too far in the future',
+      'updatedAt',
+    );
+  }
+  if (expiresAt <= now) {
+    return issue('expired', `${path}.expiresAt`, 'task snapshot deadline has passed', 'expiresAt');
+  }
+  if (updatedAt > expiresAt && state !== 'expired') {
+    return issue(
+      'malformed',
+      `${path}.updatedAt`,
+      'task snapshot update time must not exceed its deadline',
+      'updatedAt',
+    );
+  }
   if (!hasOwn(value, 'cancellationRequested') || typeof value.cancellationRequested !== 'boolean') {
     return issue(
       'malformed',
@@ -2144,6 +2308,20 @@ function validateTaskSnapshotInternal(
         'malformed',
         `${path}.cancellation.requestedAt`,
         'cancellation requestedAt must be a valid timestamp',
+        'requestedAt',
+      );
+    }
+    const requestedAt = hasOwn(value.cancellation, 'requestedAt')
+      ? parseUtcTimestamp(value.cancellation.requestedAt)
+      : undefined;
+    if (
+      requestedAt !== undefined &&
+      (requestedAt < createdAt || requestedAt > now + MAX_CLOCK_SKEW_MS || requestedAt > expiresAt)
+    ) {
+      return issue(
+        'malformed',
+        `${path}.cancellation.requestedAt`,
+        'cancellation requestedAt is outside the task lifetime',
         'requestedAt',
       );
     }
@@ -2227,6 +2405,17 @@ function validateResultForOperation(
           'malformed',
           `${path}.requestId`,
           'request result requestId must match response operationId',
+          'requestId',
+        );
+      }
+      if (
+        options.expectedRequestId !== undefined &&
+        result.requestId !== options.expectedRequestId
+      ) {
+        return issue(
+          'malformed',
+          `${path}.requestId`,
+          'request result requestId does not match the expected request',
           'requestId',
         );
       }
@@ -2426,6 +2615,9 @@ function deepEqualJson(left: JsonValue, right: JsonValue, budget?: EvaluationBud
   if (budget !== undefined && !consumeEvaluationBudget(budget)) {
     return false;
   }
+  if (typeof left === 'number' && typeof right === 'number') {
+    return left === right;
+  }
   if (Object.is(left, right)) {
     return true;
   }
@@ -2495,7 +2687,7 @@ function matchesSchema(
   context: SchemaContext,
   path: string,
   depth: number,
-  activeRefs: Set<string>,
+  activeRefs: ReadonlyMap<string, number>,
 ): SchemaValidationResult {
   if (!consumeEvaluationBudget(context.budget)) {
     return budgetFailure(path);
@@ -2509,15 +2701,16 @@ function matchesSchema(
 
   const reference = schemaReference(schema);
   if (reference !== undefined) {
-    if (activeRefs.has(reference)) {
-      return { valid: false, path, reason: 'recursive schema reference did not terminate' };
+    const referenceDepth = activeRefs.get(reference) ?? 0;
+    if (referenceDepth >= context.maxDepth) {
+      return { valid: false, path, reason: 'maximum schema reference depth exceeded' };
     }
     const target = resolveSchemaReference(context, reference);
     if (target === undefined) {
       return { valid: false, path, reason: 'schema reference does not resolve locally' };
     }
-    const nextRefs = new Set(activeRefs);
-    nextRefs.add(reference);
+    const nextRefs = new Map(activeRefs);
+    nextRefs.set(reference, referenceDepth + 1);
     const referencedResult = matchesSchema(value, target, context, path, depth + 1, nextRefs);
     if (!referencedResult.valid) {
       return referencedResult;
@@ -2653,7 +2846,7 @@ function matchesSchema(
           context,
           `${path}[${index}]`,
           depth + 1,
-          new Set(activeRefs),
+          new Map(activeRefs),
         );
         if (!childResult.valid) {
           return childResult;
@@ -2672,7 +2865,7 @@ function matchesSchema(
           context,
           `${path}[${index}]`,
           depth + 1,
-          new Set(activeRefs),
+          new Map(activeRefs),
         );
         if (!childResult.valid) {
           return childResult;
@@ -2688,7 +2881,7 @@ function matchesSchema(
           context,
           `${path}[${index}]`,
           depth + 1,
-          new Set(activeRefs),
+          new Map(activeRefs),
         );
         if (childResult.valid) {
           matching += 1;
@@ -2746,7 +2939,7 @@ function matchesSchema(
             context,
             `${path}.${property}`,
             depth + 1,
-            new Set(activeRefs),
+            new Map(activeRefs),
           );
           if (!childResult.valid) {
             return childResult;
@@ -2768,7 +2961,7 @@ function matchesSchema(
               context,
               `${path}.${property}`,
               depth + 1,
-              new Set(activeRefs),
+              new Map(activeRefs),
             );
             if (!childResult.valid) {
               return childResult;
@@ -2816,7 +3009,7 @@ function matchesSchema(
           context,
           `${path}.${property}`,
           depth + 1,
-          new Set(activeRefs),
+          new Map(activeRefs),
         );
         if (!childResult.valid) {
           return childResult;
@@ -2847,7 +3040,7 @@ function matchesSchema(
             context,
             path,
             depth + 1,
-            new Set(activeRefs),
+            new Map(activeRefs),
           );
           if (!dependentResult.valid) {
             return dependentResult;
@@ -2863,7 +3056,7 @@ function matchesSchema(
           context,
           `${path}.${property}`,
           depth + 1,
-          new Set(activeRefs),
+          new Map(activeRefs),
         );
         if (!propertyResult.valid) {
           return propertyResult;
@@ -2880,7 +3073,7 @@ function matchesSchema(
         context,
         path,
         depth + 1,
-        new Set(activeRefs),
+        new Map(activeRefs),
       );
       if (!childResult.valid) {
         return childResult;
@@ -2896,7 +3089,7 @@ function matchesSchema(
         context,
         path,
         depth + 1,
-        new Set(activeRefs),
+        new Map(activeRefs),
       );
       if (childResult.valid) {
         matched = true;
@@ -2919,7 +3112,7 @@ function matchesSchema(
         context,
         path,
         depth + 1,
-        new Set(activeRefs),
+        new Map(activeRefs),
       );
       if (childResult.valid) {
         matches += 1;
@@ -2939,7 +3132,7 @@ function matchesSchema(
       context,
       path,
       depth + 1,
-      new Set(activeRefs),
+      new Map(activeRefs),
     );
     if (context.budget.exhausted) {
       return budgetFailure(path);
@@ -2955,7 +3148,7 @@ function matchesSchema(
       context,
       path,
       depth + 1,
-      new Set(activeRefs),
+      new Map(activeRefs),
     );
     if (context.budget.exhausted) {
       return budgetFailure(path);
@@ -2974,7 +3167,7 @@ function matchesSchema(
         context,
         path,
         depth + 1,
-        new Set(activeRefs),
+        new Map(activeRefs),
       );
       if (!conditionalResult.valid) {
         return conditionalResult;
@@ -2997,9 +3190,13 @@ export function validateJsonValueAgainstSchema(
   }
   const valueIssue = validateJsonValueInternal(value, '$', options);
   if (valueIssue !== undefined) {
+    const code: ValidationErrorCode =
+      valueIssue.code === 'oversized' ? 'oversized' : 'invalid_content';
     return validationFailure(
-      'invalid_content',
-      'JSON response content is invalid',
+      code,
+      code === 'oversized'
+        ? 'JSON response content exceeds a configured limit'
+        : 'JSON response content is invalid',
       valueIssue.path,
       valueIssue.reason,
     );
@@ -3018,7 +3215,7 @@ export function validateJsonValueAgainstSchema(
     context,
     '$',
     0,
-    new Set<string>(),
+    new Map<string, number>(),
   );
   if (!match.valid) {
     return validationFailure(
@@ -3275,6 +3472,9 @@ export function validateReplyContent(
     options,
   );
   if (!valueResult.ok) {
+    if (valueResult.error.code === 'oversized') {
+      return valueResult as ValidationResult<Content>;
+    }
     return {
       ok: false,
       error: createProtocolError(
