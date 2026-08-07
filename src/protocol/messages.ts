@@ -22,6 +22,7 @@ declare const traceIdBrand: unique symbol;
 declare const sessionIdBrand: unique symbol;
 declare const runtimeIdBrand: unique symbol;
 declare const roomIdBrand: unique symbol;
+declare const messageRequestEnvelopeBrand: unique symbol;
 
 /** A UUID version 4 value as it appears on the wire. */
 export type UUIDv4 = string & {
@@ -198,14 +199,59 @@ export type PeerDescribeEnvelope = ProtocolEnvelopeBase<'peer.describe', PeerDes
   readonly requestId?: never;
 };
 
-/** For an initial request, the logical request ID is exactly its operation ID. */
-export type MessageRequestEnvelope<Id extends UUIDv4 = UUIDv4> = ProtocolEnvelopeBase<
+type MessageRequestEnvelopeFields<Id extends UUIDv4> = ProtocolEnvelopeBase<
   'message.request',
   MessageRequestPayload
 > & {
   readonly operationId: Id;
   readonly requestId: Id;
 };
+
+/**
+ * A constructed initial request envelope. The nominal marker prevents an
+ * arbitrary pair of UUIDv4 values from being treated as correlated; callers
+ * must use the factory or the correlation validator below.
+ */
+export type MessageRequestEnvelope<Id extends UUIDv4 = UUIDv4> =
+  MessageRequestEnvelopeFields<Id> & {
+    readonly [messageRequestEnvelopeBrand]: Id;
+  };
+
+/** Fields accepted by the factory; requestId is derived from operationId. */
+export type MessageRequestEnvelopeInput<Id extends UUIDv4 = UUIDv4> = Omit<
+  MessageRequestEnvelopeFields<Id>,
+  'requestId'
+>;
+
+/** An unbranded candidate used after the rest of an envelope is validated. */
+export type MessageRequestEnvelopeCandidate = MessageRequestEnvelopeFields<UUIDv4>;
+
+/**
+ * Construct an initial request with the only valid correlation: requestId is
+ * always copied from operationId.
+ */
+export function createMessageRequestEnvelope<Id extends UUIDv4>(
+  input: MessageRequestEnvelopeInput<Id>,
+): MessageRequestEnvelope<Id> {
+  return {
+    ...input,
+    requestId: input.operationId,
+  } as MessageRequestEnvelope<Id>;
+}
+
+/**
+ * Brand a fully validated candidate after checking the request correlation.
+ * Other envelope validation remains the responsibility of validation.ts.
+ */
+export function validateMessageRequestEnvelope(
+  envelope: MessageRequestEnvelopeCandidate,
+): MessageRequestEnvelope {
+  if (envelope.operation !== 'message.request' || envelope.operationId !== envelope.requestId) {
+    throw new TypeError('message.request requestId must equal operationId');
+  }
+
+  return envelope as MessageRequestEnvelope;
+}
 
 export type MessageReplyEnvelope = ProtocolEnvelopeBase<'message.reply', MessageReplyPayload> & {
   /** A new operation ID targets an existing logical request. */

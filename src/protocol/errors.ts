@@ -32,14 +32,26 @@ export interface RetryMetadata {
   readonly retryAfterMs?: number;
 }
 
-export interface ProtocolError extends RetryMetadata {
-  readonly code: ProtocolErrorCode;
+interface ProtocolErrorCommon {
   readonly message: string;
-  readonly retryable: boolean;
   /** Safe, structured diagnostic data; credentials and secrets are excluded. */
   readonly details?: JsonObject;
 }
 
+/** A retryable error can only use one of the v1 transient error codes. */
+export type RetryableProtocolError = ProtocolErrorCommon &
+  RetryMetadata & {
+    readonly code: RetryableErrorCode;
+    readonly retryable: true;
+  };
+
+/** Permanent errors cannot advertise retryability or a retry delay. */
+export type NonRetryableProtocolError = ProtocolErrorCommon & {
+  readonly code: NonRetryableErrorCode;
+  readonly retryable: false;
+};
+
+export type ProtocolError = RetryableProtocolError | NonRetryableProtocolError;
 export type ProtocolErrorPayload = ProtocolError;
 export type OperationError = ProtocolError;
 
@@ -51,24 +63,59 @@ export const isRetryableCode = isRetryableErrorCode;
 
 export interface ProtocolErrorOptions extends RetryMetadata {
   readonly details?: JsonObject;
+  /**
+   * Kept for source compatibility, but it must agree with the stable code
+   * classification. The returned payload always derives this value from code.
+   */
   readonly retryable?: boolean;
 }
 
-/**
- * Create a stable error payload with the v1 default retry classification.
- * Callers may override retryability only for a binding-specific condition.
- */
-export function createProtocolError(
+type ProtocolErrorForCode<Code extends ProtocolErrorCode> = Code extends RetryableErrorCode
+  ? RetryableProtocolError
+  : NonRetryableProtocolError;
+
+function validateRetryMetadata(
   code: ProtocolErrorCode,
+  retryable: boolean,
+  retryAfterMs: number | undefined,
+): void {
+  if (retryAfterMs === undefined) {
+    return;
+  }
+
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs <= 0) {
+    throw new RangeError('retryAfterMs must be a finite positive number');
+  }
+
+  if (!retryable) {
+    throw new RangeError(`retryAfterMs is not valid for non-retryable error code ${code}`);
+  }
+}
+
+/**
+ * Create a stable error payload with retryability derived from the v1 code.
+ * A caller-supplied classification is accepted only when it agrees with that
+ * code, so permanent errors cannot become retryable and transient errors
+ * cannot become permanent.
+ */
+export function createProtocolError<Code extends ProtocolErrorCode>(
+  code: Code,
   message: string,
   options: ProtocolErrorOptions = {},
-): ProtocolError {
-  const retryable = options.retryable ?? isRetryableErrorCode(code);
+): ProtocolErrorForCode<Code> {
+  const retryable = isRetryableErrorCode(code);
+
+  if (options.retryable !== undefined && options.retryable !== retryable) {
+    throw new RangeError(`retryable must be ${retryable} for error code ${code}`);
+  }
+
+  validateRetryMetadata(code, retryable, options.retryAfterMs);
+
   return {
     code,
     message,
     retryable,
     ...(options.retryAfterMs === undefined ? {} : { retryAfterMs: options.retryAfterMs }),
     ...(options.details === undefined ? {} : { details: options.details }),
-  };
+  } as ProtocolErrorForCode<Code>;
 }

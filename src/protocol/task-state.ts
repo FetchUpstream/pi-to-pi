@@ -78,23 +78,34 @@ export function isTerminalOutcome(outcome: string): outcome is TerminalOutcome {
   return TERMINAL_OUTCOMES.some((candidate) => candidate === outcome);
 }
 
-export interface TaskSnapshot {
+interface TaskSnapshotFields {
   readonly requestId: RequestId;
-  readonly state: TaskState;
   readonly createdAt: UtcTimestamp;
   readonly updatedAt: UtcTimestamp;
   readonly expiresAt: UtcTimestamp;
   /** True once a cancellation request has been accepted for this task. */
   readonly cancellationRequested: boolean;
   readonly cancellation?: CancellationSnapshot;
-  readonly terminalOutcome?: TerminalOutcome;
   readonly content?: Content;
   readonly error?: ProtocolError;
 }
 
-export type TaskStateSnapshot = TaskSnapshot;
+/** A snapshot that has not committed a terminal outcome. */
+export type NonTerminalTaskSnapshot = TaskSnapshotFields & {
+  readonly state: NonTerminalTaskState;
+  readonly terminalOutcome?: never;
+};
 
-export interface TerminalTaskSnapshot extends TaskSnapshot {
-  readonly state: TerminalTaskState;
-  readonly terminalOutcome: TerminalOutcome;
-}
+/**
+ * Terminal snapshots are discriminated by both state and matching outcome.
+ * A terminal state cannot be represented with a different terminal outcome.
+ */
+export type TerminalTaskSnapshot = {
+  [Outcome in TerminalOutcome]: TaskSnapshotFields & {
+    readonly state: Outcome;
+    readonly terminalOutcome: Outcome;
+  };
+}[TerminalOutcome];
+
+export type TaskSnapshot = NonTerminalTaskSnapshot | TerminalTaskSnapshot;
+export type TaskStateSnapshot = TaskSnapshot;
