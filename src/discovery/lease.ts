@@ -336,6 +336,22 @@ function renewalTimes(
   return { issuedAt, lastRenewedAt, expiresAt };
 }
 
+interface Deferred<Value> {
+  readonly promise: Promise<Value>;
+  readonly resolve: (value: Value | PromiseLike<Value>) => void;
+  readonly reject: (reason?: unknown) => void;
+}
+
+function createDeferred<Value>(): Deferred<Value> {
+  let resolve!: (value: Value | PromiseLike<Value>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 const MAX_SNAPSHOT_DEPTH = 32;
 const MAX_SNAPSHOT_NODES = 4_096;
 const MAX_SNAPSHOT_ENTRIES = 256;
@@ -696,12 +712,18 @@ export class SerializedLease {
   private readonly scheduler: LeaseScheduler;
   private readonly now: LeaseClock;
   private inFlightRenewal: Promise<void> | undefined;
+  /** Reservation held from the first renewal preflight boundary through cleanup. */
+  private renewalSetupToken: object | undefined;
+  private renewalExpiryCheckInProgress = false;
   private timer: LeaseTimer | undefined;
+  private readonly renewalTimers = new Set<LeaseTimer>();
   private expiryTimer: LeaseTimer | undefined;
   private expiryTimerDeadline: number | null = null;
   private renewalExpiryReject: ((error: unknown) => void) | undefined;
   private state: LeaseState = 'idle';
   private startPromise: Promise<void> | undefined;
+  /** Reservation held before any clock/scheduler callback during start setup. */
+  private startSetupToken: object | undefined;
   private currentEndpoint: RoutingEndpoint | undefined;
   private lifecycleGeneration = 0;
   private endpointGeneration = 0;
@@ -761,7 +783,13 @@ export class SerializedLease {
       return Promise.reject(new LeaseExpiredError());
     }
     if (this.inFlightRenewal !== undefined) {
+      // The reservation is installed before any clock or scheduler boundary.
+      // Reentrant callers must share it without running another preflight.
+      if (this.renewalSetupToken !== undefined || this.renewalExpiryCheckInProgress) {
+        return this.inFlightRenewal;
+      }
       if (this.expiresAt !== null) {
+        this.renewalExpiryCheckInProgress = true;
         try {
           const lifecycleGeneration = this.lifecycleGeneration;
           const now = clockValue(this.now);
@@ -775,28 +803,18 @@ export class SerializedLease {
           // expiry may reject the attempt while this concurrent preflight observes
           // the same lifecycle transition; reporting here would duplicate it.
           return Promise.reject(error);
+        } finally {
+          this.renewalExpiryCheckInProgress = false;
         }
       }
       return this.inFlightRenewal;
     }
     const lifecycleGeneration = this.lifecycleGeneration;
-    try {
-      const now = clockValue(this.now);
-      this.assertLifecycle(lifecycleGeneration);
-      if (this.expiresAt !== null && now >= this.expiresAt) {
-        this.markExpired();
-        return Promise.reject(new LeaseExpiredError());
-      }
-      if (this.expiresAt === null) {
-        this.expiresAt = now + this.ttlMs;
-        this.armExpiryTimer(this.expiresAt);
-      } else {
-        this.armExpiryTimer(this.expiresAt);
-      }
-    } catch (error: unknown) {
-      this.reportError(error);
-      return Promise.reject(error);
-    }
+    const attempt = createDeferred<void>();
+    const operation = attempt.promise;
+    const setupToken = {};
+    this.inFlightRenewal = operation;
+    this.renewalSetupToken = setupToken;
     let operationErrorReported = false;
     const reportOperationError = (error: unknown): void => {
       if (operationErrorReported) {
@@ -805,21 +823,76 @@ export class SerializedLease {
       operationErrorReported = true;
       this.reportError(error);
     };
+    const releaseAttempt = (): void => {
+      if (this.inFlightRenewal === operation && this.renewalSetupToken === setupToken) {
+        this.inFlightRenewal = undefined;
+        this.renewalSetupToken = undefined;
+        this.renewalExpiryReject = undefined;
+      }
+    };
+    const assertAttempt = (generation: number): void => {
+      this.assertLifecycle(generation);
+      if (this.inFlightRenewal !== operation || this.renewalSetupToken !== setupToken) {
+        throw new LeaseStoppedError();
+      }
+    };
     let rejectOnExpiry: (error: unknown) => void = () => undefined;
     const expiry = new Promise<never>((_resolve, reject) => {
       rejectOnExpiry = reject;
     });
+    // Setup can fail before Promise.race is created; consume the rejection in
+    // that case while retaining the same rejection for the active attempt.
+    void expiry.catch(() => undefined);
     this.renewalExpiryReject = rejectOnExpiry;
-    const operation = Promise.resolve().then(async () => {
-      if (this.state === 'stopped') {
-        throw new LeaseStoppedError();
+    void operation.then(
+      () => {
+        releaseAttempt();
+      },
+      (error: unknown) => {
+        releaseAttempt();
+        reportOperationError(error);
+        try {
+          if (this.expiresAt !== null && clockValue(this.now) >= this.expiresAt) {
+            this.markExpired();
+          }
+        } catch (handlerError: unknown) {
+          this.reportError(handlerError);
+        }
+      },
+    );
+    let preflightExpired = false;
+    try {
+      const now = clockValue(this.now);
+      assertAttempt(lifecycleGeneration);
+      if (this.expiresAt !== null && now >= this.expiresAt) {
+        preflightExpired = true;
+        this.markExpired();
+        throw new LeaseExpiredError();
       }
-      const lifecycleGeneration = this.lifecycleGeneration;
+      if (this.expiresAt === null) {
+        this.expiresAt = now + this.ttlMs;
+        this.armExpiryTimer(this.expiresAt);
+      } else {
+        this.armExpiryTimer(this.expiresAt);
+      }
+      // The expiry scheduler may synchronously call back into renew/stop/expire.
+      assertAttempt(lifecycleGeneration);
+    } catch (error: unknown) {
+      attempt.reject(error);
+      if (preflightExpired) {
+        operationErrorReported = true;
+      } else {
+        reportOperationError(error);
+      }
+      return operation;
+    }
+    const operationBody = Promise.resolve().then(async () => {
+      assertAttempt(lifecycleGeneration);
       const ownerAtStart = this.ownerIdentity;
       const endpointGenerationAtStart = this.endpointGeneration;
       const endpointAuthorityAtStart = this.endpointGenerationAuthority;
       const now = clockValue(this.now);
-      this.assertLifecycle(lifecycleGeneration);
+      assertAttempt(lifecycleGeneration);
       if (this.expiresAt !== null && now >= this.expiresAt) {
         this.markExpired();
         throw new LeaseExpiredError();
@@ -829,6 +902,12 @@ export class SerializedLease {
       // A callback may have been in flight while the lease was explicitly
       // stopped/expired.  Such a callback is stale and must not mutate or
       // resurrect this lease (including the first renewal with no deadline).
+      const callbackNow = clockValue(this.now);
+      assertAttempt(lifecycleGeneration);
+      if (callbackNow >= (this.expiresAt ?? Number.POSITIVE_INFINITY)) {
+        this.markExpired();
+        throw new LeaseExpiredError();
+      }
       const stateAfterCallback = this.lifecycle;
       if (stateAfterCallback === 'stopped') {
         throw new LeaseStoppedError();
@@ -836,15 +915,15 @@ export class SerializedLease {
       if (stateAfterCallback === 'expired') {
         throw new LeaseExpiredError();
       }
-      if (this.lifecycleGeneration !== lifecycleGeneration) {
-        throw new LeaseStoppedError();
-      }
       const result = normalizeRenewalResult(rawResult);
+      assertAttempt(lifecycleGeneration);
       const metadata = normalizeRenewalMetadata(result);
+      assertAttempt(lifecycleGeneration);
       let nextIdentity: LeaseOwnerIdentity | undefined;
       let nextEndpoint: RoutingEndpoint | undefined;
       if (result?.identity !== undefined) {
         nextIdentity = cloneOwnerIdentity(result.identity);
+        assertAttempt(lifecycleGeneration);
         if (ownerAtStart !== undefined && !sameIdentity(ownerAtStart, nextIdentity)) {
           throw new LeaseConfigurationError('lease owner identity cannot be replaced');
         }
@@ -861,17 +940,16 @@ export class SerializedLease {
               this.endpointGenerationAuthority === endpointAuthorityAtStart;
         if (endpointIsCurrent) {
           nextEndpoint = cloneEndpoint(result.endpoint, effectiveRuntimeId);
+          assertAttempt(lifecycleGeneration);
         }
       }
+      assertAttempt(lifecycleGeneration);
       const stateBeforeCommit = this.lifecycle;
       if (stateBeforeCommit === 'stopped') {
         throw new LeaseStoppedError();
       }
       if (stateBeforeCommit === 'expired') {
         throw new LeaseExpiredError();
-      }
-      if (this.lifecycleGeneration !== lifecycleGeneration) {
-        throw new LeaseStoppedError();
       }
       // The owner is immutable after the first accepted identity, and the
       // callback generation must still be current immediately before commit.
@@ -898,11 +976,12 @@ export class SerializedLease {
         // still untrusted until it is checked against that identity.
         if (this.currentEndpoint !== undefined) {
           cloneEndpoint(this.currentEndpoint, nextIdentity.runtimeId);
+          assertAttempt(lifecycleGeneration);
         }
       }
       const committedOwner = this.ownerIdentity ?? nextIdentity;
       const renewedAt = clockValue(this.now);
-      this.assertLifecycle(lifecycleGeneration);
+      assertAttempt(lifecycleGeneration);
       if (this.ownerIdentity !== undefined && ownerAtStart !== undefined) {
         if (!sameIdentity(this.ownerIdentity, ownerAtStart)) {
           throw new LeaseConfigurationError('lease owner identity changed during renewal');
@@ -939,7 +1018,7 @@ export class SerializedLease {
       }
       // No callback is allowed between this final lifecycle/ownership check
       // and the active endpoint/renewal-state writes below.
-      this.assertLifecycle(lifecycleGeneration);
+      assertAttempt(lifecycleGeneration);
       if (this.ownerIdentity !== undefined && ownerAtStart !== undefined) {
         if (!sameIdentity(this.ownerIdentity, ownerAtStart)) {
           throw new LeaseConfigurationError('lease owner identity changed during renewal');
@@ -969,30 +1048,9 @@ export class SerializedLease {
       this.expiresAt = times.expiresAt;
       this.state = 'active';
       this.armExpiryTimer(this.expiresAt);
+      assertAttempt(lifecycleGeneration);
     });
-    this.inFlightRenewal = operation;
-    void operation.then(
-      () => {
-        if (this.inFlightRenewal === operation) {
-          this.inFlightRenewal = undefined;
-          this.renewalExpiryReject = undefined;
-        }
-      },
-      (error: unknown) => {
-        if (this.inFlightRenewal === operation) {
-          this.inFlightRenewal = undefined;
-          this.renewalExpiryReject = undefined;
-        }
-        reportOperationError(error);
-        try {
-          if (this.expiresAt !== null && clockValue(this.now) >= this.expiresAt) {
-            this.markExpired();
-          }
-        } catch (handlerError: unknown) {
-          this.reportError(handlerError);
-        }
-      },
-    );
+    void operationBody.then(attempt.resolve, attempt.reject);
     return operation;
   }
 
@@ -1008,10 +1066,23 @@ export class SerializedLease {
       return this.startPromise;
     }
     const lifecycleGeneration = this.lifecycleGeneration;
+    const setupToken = {};
+    const start = createDeferred<void>();
+    const startPromise = start.promise;
+    // Reserve start before touching the clock or scheduler.  Reentrant starts
+    // therefore return this exact promise instead of installing another timer.
+    this.startPromise = startPromise;
+    this.startSetupToken = setupToken;
+    const assertStart = (): void => {
+      this.assertLifecycle(lifecycleGeneration);
+      if (this.startPromise !== startPromise || this.startSetupToken !== setupToken) {
+        throw new LeaseStoppedError();
+      }
+    };
     let renewalTimer: LeaseTimer | undefined;
     try {
       const startedAt = clockValue(this.now);
-      this.assertLifecycle(lifecycleGeneration);
+      assertStart();
       if (this.expiresAt !== null && startedAt >= this.expiresAt) {
         this.markExpired();
         throw new LeaseExpiredError();
@@ -1021,6 +1092,7 @@ export class SerializedLease {
       this.expiresAt ??= startedAt + this.ttlMs;
       this.state = 'active';
       this.armExpiryTimer(this.expiresAt);
+      assertStart();
       renewalTimer = this.scheduler.setInterval(
         () => {
           if (this.state !== 'active') {
@@ -1048,44 +1120,65 @@ export class SerializedLease {
         },
         Math.min(this.renewalIntervalMs, this.ttlMs, MAX_LEASE_TIMER_DELAY_MS),
       );
-      const setupState: LeaseState = this.state;
-      if (setupState !== 'active' || this.lifecycleGeneration !== lifecycleGeneration) {
-        try {
-          this.scheduler.clearInterval(renewalTimer);
-        } catch (error: unknown) {
-          this.reportError(error);
-        }
-        this.assertLifecycle(lifecycleGeneration);
-        throw new LeaseStoppedError();
-      }
+      this.renewalTimers.add(renewalTimer);
+      // The scheduler may invoke its callback before returning the handle.
+      assertStart();
       this.timer = renewalTimer;
       const unrefTimer = renewalTimer as LeaseTimer & { unref?: () => void };
       unrefTimer.unref?.();
-      const postUnrefState: LeaseState = this.state;
-      if (postUnrefState !== 'active' || this.lifecycleGeneration !== lifecycleGeneration) {
-        this.assertLifecycle(lifecycleGeneration);
-        throw new LeaseStoppedError();
-      }
-      this.startPromise = this.renew().catch(async (error: unknown) => {
+      assertStart();
+      this.startSetupToken = undefined;
+      const initialRenewal = this.renew().catch(async (error: unknown) => {
         await this.stop();
         throw error;
       });
-      return this.startPromise;
+      void initialRenewal.then(start.resolve, start.reject);
+      return startPromise;
     } catch (error: unknown) {
-      if (renewalTimer !== undefined && this.timer === renewalTimer) {
-        this.timer = undefined;
-        try {
-          this.scheduler.clearInterval(renewalTimer);
-        } catch (clearError: unknown) {
-          this.reportError(clearError);
-        }
+      if (renewalTimer !== undefined) {
+        this.clearOwnedRenewalTimer(renewalTimer);
       }
       const cleanupState: LeaseState = this.state;
       if (cleanupState === 'active') {
         void this.stop();
       }
+      if (this.startPromise === startPromise && this.startSetupToken === setupToken) {
+        this.startSetupToken = undefined;
+      }
+      start.reject(error);
       this.reportError(error);
-      return Promise.reject(error);
+      return startPromise;
+    }
+  }
+  private clearOwnedRenewalTimer(timer: LeaseTimer): void {
+    const owned = this.renewalTimers.delete(timer) || this.timer === timer;
+    if (this.timer === timer) {
+      this.timer = undefined;
+    }
+    if (!owned) {
+      return;
+    }
+    try {
+      this.scheduler.clearInterval(timer);
+    } catch (error: unknown) {
+      this.reportError(error);
+    }
+  }
+
+  private clearOwnedRenewalTimers(): void {
+    const timers = [...this.renewalTimers];
+    this.renewalTimers.clear();
+    const currentTimer = this.timer;
+    this.timer = undefined;
+    if (currentTimer !== undefined && !timers.includes(currentTimer)) {
+      timers.push(currentTimer);
+    }
+    for (const timer of timers) {
+      try {
+        this.scheduler.clearInterval(timer);
+      } catch (error: unknown) {
+        this.reportError(error);
+      }
     }
   }
 
@@ -1100,15 +1193,7 @@ export class SerializedLease {
       this.rejectInFlight(new LeaseStoppedError());
       this.invalidateLifecycle();
     }
-    const timer = this.timer;
-    this.timer = undefined;
-    if (timer !== undefined) {
-      try {
-        this.scheduler.clearInterval(timer);
-      } catch (error: unknown) {
-        this.reportError(error);
-      }
-    }
+    this.clearOwnedRenewalTimers();
     this.clearExpiryTimer();
     return Promise.resolve();
   }
@@ -1526,15 +1611,7 @@ export class SerializedLease {
     this.state = 'expired';
     this.rejectInFlight(new LeaseExpiredError());
     this.invalidateLifecycle();
-    const timer = this.timer;
-    this.timer = undefined;
-    if (timer !== undefined) {
-      try {
-        this.scheduler.clearInterval(timer);
-      } catch (error: unknown) {
-        this.reportError(error);
-      }
-    }
+    this.clearOwnedRenewalTimers();
     this.clearExpiryTimer();
   }
 
