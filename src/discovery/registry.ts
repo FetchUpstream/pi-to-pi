@@ -1524,6 +1524,7 @@ export class RuntimeRegistry {
   private currentNetworkName: RegistryNetworkName;
   private readonly cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
+  private attemptedRecord: RuntimeRecord | undefined;
   private pendingPublication: Promise<void> = Promise.resolve();
   private shutdownRequested = false;
   private shutdownPromise: Promise<boolean> | undefined;
@@ -1616,6 +1617,7 @@ export class RuntimeRegistry {
       now: this.clock(),
       ttlMs: this.ttlMs,
     });
+    this.attemptedRecord = record;
     await publishRuntimeRecordAtomically(record, this.pathOptions);
     this.currentRecord = record;
   }
@@ -1624,17 +1626,22 @@ export class RuntimeRegistry {
     previousRecord: RuntimeRecord | undefined,
     failedRecord: RuntimeRecord | undefined,
   ): Promise<void> {
-    if (previousRecord !== undefined) {
-      await publishRuntimeRecordAtomically(previousRecord, this.pathOptions);
-    } else if (failedRecord !== undefined) {
-      await removeRuntimeRecord(this.roomId, this.runtimeId, {
-        ...this.pathOptions,
-        expectedSessionId: failedRecord.sessionId,
-        expectedEndpoint: failedRecord.endpoint,
-        expectedNetworkName: failedRecord.networkName,
-      });
+    try {
+      if (previousRecord !== undefined) {
+        await publishRuntimeRecordAtomically(previousRecord, this.pathOptions);
+      } else if (failedRecord !== undefined) {
+        await removeRuntimeRecord(this.roomId, this.runtimeId, {
+          ...this.pathOptions,
+          expectedSessionId: failedRecord.sessionId,
+          expectedEndpoint: failedRecord.endpoint,
+          expectedNetworkName: failedRecord.networkName,
+        });
+      }
+      this.currentRecord = previousRecord;
+    } catch (error) {
+      this.currentRecord = undefined;
+      throw error;
     }
-    this.currentRecord = previousRecord;
   }
 
   /** Publish one owner record with a fresh lease. */
@@ -1642,7 +1649,14 @@ export class RuntimeRegistry {
     if (this.shutdownRequested || this.lease.stopped) {
       return Promise.reject(new LeaseConfigurationError('cannot renew a stopped runtime registry'));
     }
-    return this.enqueuePublication(() => this.publishCurrentName());
+    return this.enqueuePublication(async () => {
+      this.attemptedRecord = undefined;
+      try {
+        await this.publishCurrentName();
+      } finally {
+        this.attemptedRecord = undefined;
+      }
+    });
   }
 
   public publish(): Promise<void> {
@@ -1664,15 +1678,19 @@ export class RuntimeRegistry {
       const previousNetworkName = this.networkName;
       const previousRecord = this.currentRecord;
       this.currentNetworkName = canonical;
+      this.attemptedRecord = undefined;
       try {
         await this.publishCurrentName();
       } catch (error) {
+        const failedRecord =
+          this.attemptedRecord ??
+          (this.currentRecord !== previousRecord ? this.currentRecord : undefined);
+        this.attemptedRecord = undefined;
         this.currentNetworkName = previousNetworkName;
-        const failedRecord = this.currentRecord;
-        if (failedRecord !== previousRecord) {
-          await this.restoreCommittedRecord(previousRecord, failedRecord);
-        }
+        await this.restoreCommittedRecord(previousRecord, failedRecord);
         throw error;
+      } finally {
+        this.attemptedRecord = undefined;
       }
     });
   }
