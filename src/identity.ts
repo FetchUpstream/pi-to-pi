@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { DEFAULT_REQUEST_TTL_MS, DEDUPE_RETENTION_GRACE_MS } from './config.js';
 import { asRuntimeId, asSessionId, type RuntimeId, type SessionId } from './protocol/messages.js';
 import { isRoomId, roomStorageKey, type RoomId } from './room.js';
 
@@ -44,6 +45,39 @@ export class IdentityInputError extends TypeError {
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
+const MAX_RUNTIME_ID_HISTORY_ENTRIES = 4_096;
+const DEFAULT_RUNTIME_ID_RETENTION_MS = DEFAULT_REQUEST_TTL_MS + DEDUPE_RETENTION_GRACE_MS;
+function finiteNow(now: () => number): number {
+  const value = now();
+  if (!Number.isFinite(value)) {
+    throw new RangeError('runtime identity clock must return a finite number');
+  }
+  return value;
+}
+
+function validateRuntimeIdRetention(value: number | undefined): number {
+  const retention = value ?? DEFAULT_RUNTIME_ID_RETENTION_MS;
+  if (
+    retention !== Infinity &&
+    (!Number.isSafeInteger(retention) || retention < DEFAULT_RUNTIME_ID_RETENTION_MS)
+  ) {
+    throw new RangeError(
+      `runtimeIdRetentionMs must be Infinity or a safe integer of at least ${DEFAULT_RUNTIME_ID_RETENTION_MS}`,
+    );
+  }
+  return retention;
+}
+
+function retainedUntil(nowMs: number, retentionMs: number): number {
+  if (retentionMs === Infinity) {
+    return Infinity;
+  }
+  const deadline = nowMs + retentionMs;
+  if (!Number.isSafeInteger(deadline)) {
+    throw new RangeError('runtime identity retention deadline must be a safe timestamp');
+  }
+  return deadline;
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -183,12 +217,17 @@ export const peerAddressesEqual = runtimeAddressesEqual;
  */
 export class RuntimeIdentityLifecycle {
   private readonly runtimeIdFactory: RuntimeIdFactory;
-  private readonly issuedRuntimeIds = new Set<RuntimeId>();
+  private readonly now: () => number;
+  private readonly runtimeIdRetentionMs: number;
+  private readonly issuedRuntimeIds = new Map<RuntimeId, number>();
   private currentIdentity: SessionRuntimeIdentity | undefined;
 
   constructor(options: RuntimeIdentityLifecycleOptions | RuntimeIdFactory = {}) {
-    this.runtimeIdFactory =
-      typeof options === 'function' ? options : (options.runtimeIdFactory ?? randomUUID);
+    const lifecycleOptions: RuntimeIdentityLifecycleOptions =
+      typeof options === 'function' ? { runtimeIdFactory: options } : options;
+    this.runtimeIdFactory = lifecycleOptions.runtimeIdFactory ?? randomUUID;
+    this.now = lifecycleOptions.now ?? (() => Date.now());
+    this.runtimeIdRetentionMs = validateRuntimeIdRetention(lifecycleOptions.runtimeIdRetentionMs);
   }
 
   get current(): SessionRuntimeIdentity | undefined {
@@ -202,19 +241,40 @@ export class RuntimeIdentityLifecycle {
   /** Start a runtime for the session ID read from Pi at `session_start`. */
   start(sessionId: string): SessionRuntimeIdentity {
     const stableSessionId = requireSessionId(sessionId);
+    const nowMs = finiteNow(this.now);
+    this.pruneIssuedRuntimeIds(nowMs);
     let runtimeId = createRuntimeId(this.runtimeIdFactory);
 
     // A custom test factory may return a duplicate. Do not allow a lifecycle
-    // to issue the same endpoint identity twice.
+    // to issue the same endpoint identity twice while its tombstone is retained.
     if (this.issuedRuntimeIds.has(runtimeId)) {
       do {
         runtimeId = createRuntimeId(randomUUID);
       } while (this.issuedRuntimeIds.has(runtimeId));
     }
 
-    this.issuedRuntimeIds.add(runtimeId);
+    if (this.issuedRuntimeIds.size >= MAX_RUNTIME_ID_HISTORY_ENTRIES) {
+      throw new IdentityInputError('runtime identity history has reached its bounded capacity');
+    }
+
+    const previousIdentity = this.currentIdentity;
+    if (previousIdentity !== undefined) {
+      this.issuedRuntimeIds.set(
+        previousIdentity.runtimeId,
+        retainedUntil(nowMs, this.runtimeIdRetentionMs),
+      );
+    }
+    this.issuedRuntimeIds.set(runtimeId, Infinity);
     this.currentIdentity = Object.freeze({ sessionId: stableSessionId, runtimeId });
     return this.currentIdentity;
+  }
+
+  private pruneIssuedRuntimeIds(nowMs: number): void {
+    for (const [runtimeId, retainedUntil] of this.issuedRuntimeIds) {
+      if (retainedUntil <= nowMs) {
+        this.issuedRuntimeIds.delete(runtimeId);
+      }
+    }
   }
 
   /** Start a runtime using a Pi-like native session manager. */
@@ -244,7 +304,12 @@ export class RuntimeIdentityLifecycle {
     if (runtimeId !== undefined && runtimeId !== this.currentIdentity.runtimeId) {
       return false;
     }
-
+    const nowMs = finiteNow(this.now);
+    this.pruneIssuedRuntimeIds(nowMs);
+    this.issuedRuntimeIds.set(
+      this.currentIdentity.runtimeId,
+      retainedUntil(nowMs, this.runtimeIdRetentionMs),
+    );
     this.currentIdentity = undefined;
     return true;
   }
@@ -264,6 +329,8 @@ export class RuntimeIdentityLifecycle {
 
 export interface RuntimeIdentityLifecycleOptions {
   readonly runtimeIdFactory?: RuntimeIdFactory;
+  readonly now?: () => number;
+  readonly runtimeIdRetentionMs?: number;
 }
 
 /** Factory form for consumers that prefer composition over class construction. */
