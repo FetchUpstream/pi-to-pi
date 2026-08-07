@@ -354,7 +354,14 @@ const FORBIDDEN_METADATA_KEYS = new Set([
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  try {
+    return !Array.isArray(value);
+  } catch {
+    return false;
+  }
 }
 
 function validateAuthenticatedEnvelope(value: unknown): ProtocolEnvelope {
@@ -607,6 +614,39 @@ function snapshotJsonBytes(value: unknown): number {
 }
 
 /** Clone and recursively freeze bounded canonical data at the binding boundary. */
+function safeSnapshotDescriptor(value: object, key: string): PropertyDescriptor | undefined {
+  try {
+    return Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    authenticatedSnapshotError('authenticated snapshot cannot be inspected safely');
+  }
+}
+
+function safeSnapshotKeys(value: object): string[] {
+  try {
+    return Object.keys(value);
+  } catch {
+    authenticatedSnapshotError('authenticated snapshot cannot be inspected safely');
+  }
+}
+
+function safeSnapshotPrototype(value: object): object | null {
+  try {
+    return Object.getPrototypeOf(value);
+  } catch {
+    authenticatedSnapshotError('authenticated snapshot cannot be inspected safely');
+  }
+}
+
+function safeSnapshotIsArray(value: object): boolean {
+  try {
+    return Array.isArray(value);
+  } catch {
+    authenticatedSnapshotError('authenticated snapshot cannot be inspected safely');
+  }
+}
+
+/** Clone and recursively freeze bounded canonical data at the binding boundary. */
 function cloneFrozenSnapshot<T>(
   value: T,
   budget: AuthenticatedSnapshotBudget = { nodes: 0, keys: 0, bytes: 0 },
@@ -653,13 +693,18 @@ function cloneFrozenSnapshot<T>(
   }
   active.add(value);
   try {
-    if (Array.isArray(value)) {
-      if (value.length > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+    if (safeSnapshotIsArray(value)) {
+      const lengthDescriptor = safeSnapshotDescriptor(value, 'length');
+      const length =
+        lengthDescriptor !== undefined && 'value' in lengthDescriptor
+          ? lengthDescriptor.value
+          : undefined;
+      if (!Number.isSafeInteger(length) || length < 0 || length > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
         authenticatedSnapshotError('authenticated snapshot array exceeds its key budget');
       }
       const copy: unknown[] = [];
       addSnapshotBytes(budget, 2);
-      for (let index = 0; index < value.length; index += 1) {
+      for (let index = 0; index < length; index += 1) {
         budget.keys += 1;
         if (budget.keys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
           authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
@@ -667,7 +712,7 @@ function cloneFrozenSnapshot<T>(
         if (index > 0) {
           addSnapshotBytes(budget, 1);
         }
-        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        const descriptor = safeSnapshotDescriptor(value, String(index));
         if (descriptor === undefined) {
           addSnapshotBytes(budget, 4);
           copy.push(null);
@@ -681,21 +726,17 @@ function cloneFrozenSnapshot<T>(
         const child = cloneFrozenSnapshot(descriptor.value, budget, depth + 1, active);
         copy.push(child === undefined ? null : child);
       }
-      let inspectedKeys = 0;
-      for (const key in value) {
-        inspectedKeys += 1;
-        if (inspectedKeys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
-          authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
-        }
-        if (!Object.prototype.hasOwnProperty.call(value, key)) {
-          continue;
-        }
+      const keys = safeSnapshotKeys(value);
+      if (keys.length > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+        authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
+      }
+      for (const key of keys) {
         const numericKey = Number(key);
         if (
           !Number.isSafeInteger(numericKey) ||
           numericKey < 0 ||
           String(numericKey) !== key ||
-          numericKey >= value.length
+          numericKey >= length
         ) {
           authenticatedSnapshotError('authenticated snapshot arrays cannot contain extra fields');
         }
@@ -703,27 +744,23 @@ function cloneFrozenSnapshot<T>(
       addSnapshotBytes(budget, 1);
       return Object.freeze(copy) as T;
     }
-    const prototype = Object.getPrototypeOf(value);
+    const prototype = safeSnapshotPrototype(value);
     if (prototype !== Object.prototype && prototype !== null) {
       authenticatedSnapshotError('authenticated snapshot must contain plain objects');
     }
     const copy = Object.create(null) as Record<string, unknown>;
     addSnapshotBytes(budget, 1);
     let first = true;
-    let inspectedKeys = 0;
-    for (const key in value) {
-      inspectedKeys += 1;
-      if (inspectedKeys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
-        authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
-      }
-      if (!Object.prototype.hasOwnProperty.call(value, key)) {
-        continue;
-      }
+    const keys = safeSnapshotKeys(value);
+    if (keys.length > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+      authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
+    }
+    for (const key of keys) {
       budget.keys += 1;
       if (budget.keys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
         authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
       }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      const descriptor = safeSnapshotDescriptor(value, key);
       if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
         authenticatedSnapshotError(
           'authenticated snapshot cannot contain accessors or hidden data',
@@ -858,32 +895,89 @@ function validateLeaseTiming(ttlMs: number, renewalIntervalMs: number): void {
   }
 }
 
+const BUILTIN_DATE = Date;
+const BUILTIN_DATE_GET_TIME = Date.prototype.getTime;
+const BUILTIN_DATE_TO_ISO_STRING = Date.prototype.toISOString;
+const BUILTIN_DATE_PARSE = Date.parse;
+
+function dateMilliseconds(value: unknown): number | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  try {
+    return BUILTIN_DATE_GET_TIME.call(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function isDateValue(value: unknown): value is Date {
+  return dateMilliseconds(value) !== undefined;
+}
+
 function resolveNow(value: number | Date | undefined, clock: LeaseClock): number {
-  const result = value instanceof Date ? value.getTime() : (value ?? clock());
-  if (!Number.isFinite(result)) {
+  let result: number | undefined;
+  if (value === undefined) {
+    try {
+      result = clock();
+    } catch {
+      throw new AgentCardRegistryError('malformed', 'registry time cannot be read safely');
+    }
+  } else if (typeof value === 'number') {
+    result = value;
+  } else {
+    result = dateMilliseconds(value);
+  }
+  if (typeof result !== 'number' || !Number.isFinite(result)) {
     throw new AgentCardRegistryError('malformed', 'registry time must be finite');
   }
   return result;
 }
 
 function parseExpiry(value: string | number | Date, label: string): number {
-  const result =
-    value instanceof Date ? value.getTime() : typeof value === 'number' ? value : Date.parse(value);
-  if (!Number.isFinite(result)) {
+  let result: number | undefined;
+  if (typeof value === 'number') {
+    result = value;
+  } else if (typeof value === 'string') {
+    try {
+      result = BUILTIN_DATE_PARSE(value);
+    } catch {
+      throw new AgentCardRegistryError('malformed', `${label} must be a finite timestamp`);
+    }
+  } else {
+    result = dateMilliseconds(value);
+  }
+  if (typeof result !== 'number' || !Number.isFinite(result)) {
     throw new AgentCardRegistryError('malformed', `${label} must be a finite timestamp`);
   }
   return result;
 }
 
 function isoTimestamp(value: number): UtcTimestamp {
-  const result = new Date(value);
-  if (!Number.isFinite(result.getTime())) {
+  const result = new BUILTIN_DATE(value);
+  let milliseconds: number;
+  try {
+    milliseconds = BUILTIN_DATE_GET_TIME.call(result);
+  } catch {
     throw new AgentCardRegistryError(
       'malformed',
       'lease expiry is outside the supported date range',
     );
   }
-  return result.toISOString() as UtcTimestamp;
+  if (!Number.isFinite(milliseconds)) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'lease expiry is outside the supported date range',
+    );
+  }
+  try {
+    return BUILTIN_DATE_TO_ISO_STRING.call(result) as UtcTimestamp;
+  } catch {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'lease expiry is outside the supported date range',
+    );
+  }
 }
 
 function cloneEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): RoutingEndpoint {
@@ -929,41 +1023,56 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): Rou
   if (!isRecord(endpoint)) {
     throw new AgentCardRegistryError('malformed', 'routing endpoint must be an opaque descriptor');
   }
-  const prototype = Object.getPrototypeOf(endpoint);
+  let prototype: object | null;
+  try {
+    prototype = Object.getPrototypeOf(endpoint);
+  } catch {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'routing endpoint descriptor cannot be inspected safely',
+    );
+  }
   if (prototype !== Object.prototype && prototype !== null) {
     throw new AgentCardRegistryError(
       'malformed',
       'routing endpoint descriptor must be a plain object',
     );
   }
-  let keyCount = 0;
-  let inspectedKeys = 0;
-  for (const key in endpoint) {
-    inspectedKeys += 1;
-    if (inspectedKeys > MAX_ENDPOINT_KEYS) {
+  let keys: string[];
+  let symbols: symbol[];
+  try {
+    keys = Object.getOwnPropertyNames(endpoint);
+    symbols = Object.getOwnPropertySymbols(endpoint);
+  } catch {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'routing endpoint descriptor cannot be inspected safely',
+    );
+  }
+  if (symbols.length > 0 || keys.length > MAX_ENDPOINT_KEYS) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'routing endpoint descriptor has too many fields',
+    );
+  }
+  const allowedKeys = new Set(['address', 'kind', 'transport', 'runtimeId']);
+  for (const key of keys) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    } catch {
       throw new AgentCardRegistryError(
         'malformed',
-        'routing endpoint descriptor has too many fields',
+        'routing endpoint descriptor cannot be inspected safely',
       );
     }
-    if (!Object.prototype.hasOwnProperty.call(endpoint, key)) {
-      continue;
-    }
-    keyCount += 1;
-    if (keyCount > MAX_ENDPOINT_KEYS) {
-      throw new AgentCardRegistryError(
-        'malformed',
-        'routing endpoint descriptor has too many fields',
-      );
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
     if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
       throw new AgentCardRegistryError(
         'malformed',
-        'routing endpoint descriptor cannot contain accessors',
+        'routing endpoint descriptor cannot contain accessors or hidden fields',
       );
     }
-    if (!['address', 'kind', 'transport', 'runtimeId'].includes(key)) {
+    if (!allowedKeys.has(key)) {
       throw new AgentCardRegistryError(
         'malformed',
         FORBIDDEN_METADATA_KEYS.has(key)
@@ -973,7 +1082,15 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): Rou
     }
   }
   const ownValue = (key: string): unknown => {
-    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    } catch {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'routing endpoint descriptor cannot be inspected safely',
+      );
+    }
     if (descriptor === undefined) {
       return undefined;
     }
@@ -1272,13 +1389,13 @@ function publicationField(value: Record<string, unknown>, key: string): Publicat
   if (descriptor === undefined) {
     return { present: false, value: undefined };
   }
-  if (!('value' in descriptor)) {
+  if (!('value' in descriptor) || !descriptor.enumerable) {
     throw new AgentCardRegistryError(
       'malformed',
-      'Agent Card publication cannot contain accessors',
+      'Agent Card publication cannot contain accessors or hidden fields',
     );
   }
-  return { present: true, value: descriptor.enumerable ? descriptor.value : undefined };
+  return { present: true, value: descriptor.value };
 }
 function publicationOptionsSnapshot(options: Record<string, unknown>): Record<string, unknown> {
   if (!isRecord(options)) {
@@ -1338,7 +1455,7 @@ function extractPublication(input: AgentCardPublication | AgentCard): Publicatio
     leaseExpiresAt !== undefined &&
     typeof leaseExpiresAt !== 'string' &&
     typeof leaseExpiresAt !== 'number' &&
-    !(leaseExpiresAt instanceof Date)
+    !isDateValue(leaseExpiresAt)
   ) {
     throw new AgentCardRegistryError('malformed', 'leaseExpiresAt must be a timestamp');
   }
@@ -2002,14 +2119,38 @@ export class AgentCardRegistry {
         }
         const ttlMs = effectiveTtlMs;
         const renewalNow = this.clock();
-        record = this.renewExact(
-          owner,
-          expectedGeneration,
-          effectiveParts,
-          ttlMs,
-          renewalNow + ttlMs,
-          effectiveRenewalIntervalMs,
-        );
+        const renewalDeadline = renewalNow + ttlMs;
+        try {
+          record = this.renewExact(
+            owner,
+            expectedGeneration,
+            effectiveParts,
+            ttlMs,
+            renewalDeadline,
+            effectiveRenewalIntervalMs,
+          );
+        } catch (error: unknown) {
+          // An endpoint update may have committed while the source callback
+          // was pending.  Rebase onto that still-owned generation so the
+          // callback's completed source endpoint can become the next winner.
+          const latest = this.records.get(owner.runtimeId);
+          if (
+            !(error instanceof AgentCardRegistryAuthorizationError) ||
+            error.message !== 'runtime advertisement owner generation is stale' ||
+            latest === undefined ||
+            !runtimeIdentitiesEqual(latest.owner, owner)
+          ) {
+            throw error;
+          }
+          record = this.renewExact(
+            owner,
+            latest.generation,
+            effectiveParts,
+            ttlMs,
+            renewalDeadline,
+            effectiveRenewalIntervalMs,
+          );
+        }
       }
       const currentAfterRenewal = this.records.get(owner.runtimeId);
       registrationGeneration = currentAfterRenewal?.generation;
@@ -2020,9 +2161,19 @@ export class AgentCardRegistry {
       if (endpointOverride !== undefined && endpointOverrideBaseline === undefined) {
         endpointOverrideBaseline = sourceEndpoint;
       }
-      return { endpoint: record.endpoint, identity: owner };
+      const result: LeaseRenewalResult = {
+        endpoint: record.endpoint,
+        identity: owner,
+        endpointGeneration: registrationGeneration,
+        ...(record.lease.issuedAt === null ? {} : { issuedAt: record.lease.issuedAt }),
+        ...(record.lease.lastRenewedAt === null
+          ? {}
+          : { lastRenewedAt: record.lease.lastRenewedAt }),
+        ...(record.lease.expiresAt === null ? {} : { expiresAt: record.lease.expiresAt }),
+      };
+      return result;
     };
-    const persistEndpoint = (endpoint: RoutingEndpoint): void => {
+    const persistEndpoint = (endpoint: RoutingEndpoint): LeaseRenewalResult | undefined => {
       assertLeaseActive();
       const expectedOwner = owner;
       if (committedOwner === undefined || registrationGeneration === undefined) {
@@ -2035,7 +2186,7 @@ export class AgentCardRegistry {
         }
         endpointOverride = endpoint;
         endpointOverrideBaseline = undefined;
-        return;
+        return undefined;
       }
       const current = this.records.get(committedOwner.runtimeId);
       if (
@@ -2053,9 +2204,23 @@ export class AgentCardRegistry {
       endpointOverrideBaseline = baseline;
       const currentAfterUpdate = this.records.get(committedOwner.runtimeId);
       registrationGeneration = currentAfterUpdate?.generation;
-      if (registrationGeneration === undefined) {
-        throw new AgentCardRegistryError('not_found', 'lease owner record was removed');
+      if (currentAfterUpdate === undefined || registrationGeneration === undefined) {
+        throw new AgentCardRegistryError('not_found', 'runtime owner record was removed');
       }
+      return {
+        endpoint: currentAfterUpdate.record.endpoint,
+        identity: committedOwner,
+        endpointGeneration: registrationGeneration,
+        ...(currentAfterUpdate.record.lease.issuedAt === null
+          ? {}
+          : { issuedAt: currentAfterUpdate.record.lease.issuedAt }),
+        ...(currentAfterUpdate.record.lease.lastRenewedAt === null
+          ? {}
+          : { lastRenewedAt: currentAfterUpdate.record.lease.lastRenewedAt }),
+        ...(currentAfterUpdate.record.lease.expiresAt === null
+          ? {}
+          : { expiresAt: currentAfterUpdate.record.lease.expiresAt }),
+      };
     };
     const onStop = (): void => {
       if (stopHandled) {

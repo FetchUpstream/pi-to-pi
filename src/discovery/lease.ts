@@ -47,10 +47,16 @@ export interface LeaseScheduler {
 export interface LeaseRenewalResult {
   readonly endpoint?: RoutingEndpoint;
   readonly identity?: LeaseOwnerIdentity;
+  /** Generation assigned by an owning registry to the committed endpoint state. */
+  readonly endpointGeneration?: number;
+  /** Authoritative lease timing returned by an owning registry. */
+  readonly issuedAt?: number;
+  readonly lastRenewedAt?: number;
+  readonly expiresAt?: number;
 }
 
 export type LeaseRenewal = () => void | LeaseRenewalResult | PromiseLike<void | LeaseRenewalResult>;
-export type LeaseEndpointUpdate = (endpoint: RoutingEndpoint) => void;
+export type LeaseEndpointUpdate = (endpoint: RoutingEndpoint) => void | LeaseRenewalResult;
 export type LeaseErrorHandler = (error: unknown) => void;
 
 /** The identity that is allowed to renew one lease. */
@@ -150,12 +156,37 @@ function clockValue(clock: LeaseClock): number {
   return value;
 }
 
+const BUILTIN_DATE = Date;
+const BUILTIN_DATE_GET_TIME = Date.prototype.getTime;
+const BUILTIN_DATE_TO_ISO_STRING = Date.prototype.toISOString;
+
+function dateMilliseconds(value: unknown): number | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  try {
+    return BUILTIN_DATE_GET_TIME.call(value);
+  } catch {
+    return undefined;
+  }
+}
+
 function asTimestamp(value: number): UtcTimestamp {
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) {
+  const date = new BUILTIN_DATE(value);
+  let milliseconds: number;
+  try {
+    milliseconds = BUILTIN_DATE_GET_TIME.call(date);
+  } catch {
     throw new LeaseConfigurationError('lease expiry is outside the supported Date range');
   }
-  return date.toISOString() as UtcTimestamp;
+  if (!Number.isFinite(milliseconds)) {
+    throw new LeaseConfigurationError('lease expiry is outside the supported Date range');
+  }
+  try {
+    return BUILTIN_DATE_TO_ISO_STRING.call(date) as UtcTimestamp;
+  } catch {
+    throw new LeaseConfigurationError('lease expiry is outside the supported Date range');
+  }
 }
 
 function sameIdentity(left: LeaseOwnerIdentity, right: LeaseOwnerIdentity): boolean {
@@ -198,10 +229,111 @@ function cloneEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): Routin
   });
 }
 
-function isRenewalResult(value: unknown): value is LeaseRenewalResult {
-  return (
-    typeof value === 'object' && value !== null && ('endpoint' in value || 'identity' in value)
-  );
+const RENEWAL_RESULT_FIELDS = [
+  'endpoint',
+  'identity',
+  'endpointGeneration',
+  'issuedAt',
+  'lastRenewedAt',
+  'expiresAt',
+] as const;
+
+function normalizeRenewalResult(value: unknown): LeaseRenewalResult | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const result: Record<string, unknown> = {};
+  let present = false;
+  for (const key of RENEWAL_RESULT_FIELDS) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      throw new LeaseConfigurationError('lease renewal result cannot be inspected safely');
+    }
+    if (descriptor === undefined) {
+      continue;
+    }
+    present = true;
+    if (!('value' in descriptor)) {
+      throw new LeaseConfigurationError('lease renewal result cannot contain accessors');
+    }
+    result[key] = descriptor.value;
+  }
+  return present ? (result as LeaseRenewalResult) : undefined;
+}
+
+interface RenewalMetadata {
+  readonly endpointGeneration?: number;
+  readonly issuedAt?: number;
+  readonly lastRenewedAt?: number;
+  readonly expiresAt?: number;
+}
+
+function normalizeRenewalMetadata(result: LeaseRenewalResult | undefined): RenewalMetadata {
+  if (result === undefined) {
+    return {};
+  }
+  const metadata: RenewalMetadata = {
+    ...(result.endpointGeneration === undefined
+      ? {}
+      : { endpointGeneration: result.endpointGeneration }),
+    ...(result.issuedAt === undefined ? {} : { issuedAt: result.issuedAt }),
+    ...(result.lastRenewedAt === undefined ? {} : { lastRenewedAt: result.lastRenewedAt }),
+    ...(result.expiresAt === undefined ? {} : { expiresAt: result.expiresAt }),
+  };
+  if (
+    metadata.endpointGeneration !== undefined &&
+    (!Number.isSafeInteger(metadata.endpointGeneration) || metadata.endpointGeneration < 0)
+  ) {
+    throw new LeaseConfigurationError('lease renewal endpoint generation must be non-negative');
+  }
+  for (const [label, value] of [
+    ['issuedAt', metadata.issuedAt],
+    ['lastRenewedAt', metadata.lastRenewedAt],
+    ['expiresAt', metadata.expiresAt],
+  ] as const) {
+    if (value !== undefined && !Number.isFinite(value)) {
+      throw new LeaseConfigurationError(`lease renewal ${label} must be finite`);
+    }
+  }
+  if (
+    metadata.issuedAt !== undefined &&
+    metadata.lastRenewedAt !== undefined &&
+    metadata.issuedAt > metadata.lastRenewedAt
+  ) {
+    throw new LeaseConfigurationError('lease renewal issuedAt must not exceed lastRenewedAt');
+  }
+  if (
+    metadata.lastRenewedAt !== undefined &&
+    metadata.expiresAt !== undefined &&
+    metadata.expiresAt <= metadata.lastRenewedAt
+  ) {
+    throw new LeaseConfigurationError('lease renewal expiresAt must exceed lastRenewedAt');
+  }
+  return metadata;
+}
+
+function renewalTimes(
+  metadata: RenewalMetadata,
+  fallbackRenewedAt: number,
+  ttlMs: number,
+  currentIssuedAt: number | null,
+): { readonly issuedAt: number; readonly lastRenewedAt: number; readonly expiresAt: number } {
+  const lastRenewedAt = metadata.lastRenewedAt ?? fallbackRenewedAt;
+  const expiresAt = metadata.expiresAt ?? lastRenewedAt + ttlMs;
+  if (
+    !Number.isFinite(lastRenewedAt) ||
+    !Number.isFinite(expiresAt) ||
+    expiresAt <= lastRenewedAt
+  ) {
+    throw new LeaseConfigurationError('lease renewal timing is invalid');
+  }
+  const issuedAt = metadata.issuedAt ?? currentIssuedAt ?? lastRenewedAt;
+  if (!Number.isFinite(issuedAt) || issuedAt > lastRenewedAt) {
+    throw new LeaseConfigurationError('lease renewal issuedAt is invalid');
+  }
+  return { issuedAt, lastRenewedAt, expiresAt };
 }
 
 const MAX_SNAPSHOT_DEPTH = 32;
@@ -307,11 +439,7 @@ function diagnosticIsError(value: object): boolean {
 }
 
 function diagnosticIsDate(value: object): boolean {
-  try {
-    return value instanceof Date;
-  } catch {
-    return false;
-  }
+  return dateMilliseconds(value) !== undefined;
 }
 
 function diagnosticErrorField(
@@ -577,6 +705,7 @@ export class SerializedLease {
   private currentEndpoint: RoutingEndpoint | undefined;
   private lifecycleGeneration = 0;
   private endpointGeneration = 0;
+  private endpointGenerationAuthority: 'local' | 'registry' = 'local';
   private issuedAt: number | null = null;
   private lastRenewedAt: number | null = null;
   private expiresAt: number | null = null;
@@ -639,6 +768,7 @@ export class SerializedLease {
             return Promise.reject(new LeaseExpiredError());
           }
         } catch (error: unknown) {
+          this.reportError(error);
           return Promise.reject(error);
         }
       }
@@ -656,6 +786,7 @@ export class SerializedLease {
         this.armExpiryTimer(this.expiresAt);
       }
     } catch (error: unknown) {
+      this.reportError(error);
       return Promise.reject(error);
     }
     let rejectOnExpiry: (error: unknown) => void = () => undefined;
@@ -669,14 +800,15 @@ export class SerializedLease {
       }
       const lifecycleGeneration = this.lifecycleGeneration;
       const ownerAtStart = this.ownerIdentity;
-      const endpointGeneration = this.endpointGeneration;
+      const endpointGenerationAtStart = this.endpointGeneration;
+      const endpointAuthorityAtStart = this.endpointGenerationAuthority;
       const now = clockValue(this.now);
       if (this.state === 'expired' || (this.expiresAt !== null && now >= this.expiresAt)) {
         this.markExpired();
         throw new LeaseExpiredError();
       }
       const renewalResult = Promise.resolve().then(() => this.renewal());
-      const result = await Promise.race([renewalResult, expiry]);
+      const rawResult = await Promise.race([renewalResult, expiry]);
       // A callback may have been in flight while the lease was explicitly
       // stopped/expired.  Such a callback is stale and must not mutate or
       // resurrect this lease (including the first renewal with no deadline).
@@ -690,22 +822,27 @@ export class SerializedLease {
       if (this.lifecycleGeneration !== lifecycleGeneration) {
         throw new LeaseStoppedError();
       }
-      const renewedAt = clockValue(this.now);
-      if (this.expiresAt !== null && renewedAt >= this.expiresAt) {
-        this.markExpired();
-        throw new LeaseExpiredError();
-      }
+      const result = normalizeRenewalResult(rawResult);
+      const metadata = normalizeRenewalMetadata(result);
       let nextIdentity: LeaseOwnerIdentity | undefined;
       let nextEndpoint: RoutingEndpoint | undefined;
-      if (isRenewalResult(result)) {
-        if (result.identity !== undefined) {
-          nextIdentity = cloneOwnerIdentity(result.identity);
-          if (ownerAtStart !== undefined && !sameIdentity(ownerAtStart, nextIdentity)) {
-            throw new LeaseConfigurationError('lease owner identity cannot be replaced');
-          }
+      if (result?.identity !== undefined) {
+        nextIdentity = cloneOwnerIdentity(result.identity);
+        if (ownerAtStart !== undefined && !sameIdentity(ownerAtStart, nextIdentity)) {
+          throw new LeaseConfigurationError('lease owner identity cannot be replaced');
         }
-        const effectiveRuntimeId = (ownerAtStart ?? nextIdentity)?.runtimeId;
-        if (result.endpoint !== undefined) {
+      }
+      const effectiveRuntimeId = (ownerAtStart ?? nextIdentity)?.runtimeId;
+      const hasFreshRegistryGeneration =
+        metadata.endpointGeneration !== undefined &&
+        metadata.endpointGeneration >= this.endpointGeneration;
+      if (result?.endpoint !== undefined) {
+        const endpointIsCurrent =
+          metadata.endpointGeneration !== undefined
+            ? hasFreshRegistryGeneration
+            : this.endpointGeneration === endpointGenerationAtStart &&
+              this.endpointGenerationAuthority === endpointAuthorityAtStart;
+        if (endpointIsCurrent) {
           nextEndpoint = cloneEndpoint(result.endpoint, effectiveRuntimeId);
         }
       }
@@ -728,6 +865,14 @@ export class SerializedLease {
       } else if (this.ownerIdentity !== ownerAtStart) {
         throw new LeaseConfigurationError('lease owner identity changed during renewal');
       }
+      if (
+        metadata.endpointGeneration !== undefined &&
+        metadata.endpointGeneration < this.endpointGeneration
+      ) {
+        // The registry has already committed a newer endpoint/lease state;
+        // retain that winning local snapshot instead of replaying stale data.
+        return;
+      }
       if (nextIdentity !== undefined) {
         if (this.ownerIdentity !== undefined && !sameIdentity(this.ownerIdentity, nextIdentity)) {
           throw new LeaseConfigurationError('lease owner identity cannot be replaced');
@@ -737,14 +882,44 @@ export class SerializedLease {
         if (this.currentEndpoint !== undefined) {
           cloneEndpoint(this.currentEndpoint, nextIdentity.runtimeId);
         }
-        this.ownerIdentity ??= nextIdentity;
       }
-      if (nextEndpoint !== undefined && endpointGeneration === this.endpointGeneration) {
+      const committedOwner = this.ownerIdentity ?? nextIdentity;
+      const renewedAt = clockValue(this.now);
+      const commitMetadata =
+        metadata.endpointGeneration !== undefined &&
+        metadata.endpointGeneration < this.endpointGeneration
+          ? {}
+          : metadata;
+      const times = renewalTimes(commitMetadata, renewedAt, this.ttlMs, this.issuedAt);
+      const registryRenewedBeyondLocalDeadline =
+        commitMetadata.endpointGeneration !== undefined &&
+        commitMetadata.endpointGeneration >= endpointGenerationAtStart;
+      if (
+        !registryRenewedBeyondLocalDeadline &&
+        this.expiresAt !== null &&
+        renewedAt >= this.expiresAt
+      ) {
+        this.markExpired();
+        throw new LeaseExpiredError();
+      }
+      if (clockValue(this.now) >= times.expiresAt) {
+        this.markExpired();
+        throw new LeaseExpiredError();
+      }
+      if (commitMetadata.endpointGeneration !== undefined) {
+        this.endpointGeneration = commitMetadata.endpointGeneration;
+        this.endpointGenerationAuthority = 'registry';
+      } else if (nextEndpoint !== undefined) {
+        this.endpointGeneration += 1;
+        this.endpointGenerationAuthority = 'local';
+      }
+      this.ownerIdentity ??= committedOwner;
+      if (nextEndpoint !== undefined) {
         this.currentEndpoint = nextEndpoint;
       }
-      this.issuedAt ??= renewedAt;
-      this.lastRenewedAt = renewedAt;
-      this.expiresAt = renewedAt + this.ttlMs;
+      this.issuedAt = times.issuedAt;
+      this.lastRenewedAt = times.lastRenewedAt;
+      this.expiresAt = times.expiresAt;
       this.state = 'active';
       this.armExpiryTimer(this.expiresAt);
     });
@@ -761,13 +936,13 @@ export class SerializedLease {
           this.inFlightRenewal = undefined;
           this.renewalExpiryReject = undefined;
         }
-        this.lastError = error;
+        this.reportError(error);
         try {
           if (this.expiresAt !== null && clockValue(this.now) >= this.expiresAt) {
             this.markExpired();
           }
         } catch (handlerError: unknown) {
-          this.lastError = handlerError;
+          this.reportError(handlerError);
         }
       },
     );
@@ -805,13 +980,11 @@ export class SerializedLease {
             return;
           }
         } catch (error: unknown) {
-          this.lastError = error;
-          this.onError?.(error);
+          this.reportError(error);
           return;
         }
         void this.renew().catch((error: unknown) => {
-          this.lastError = error;
-          this.onError?.(error);
+          this.reportError(error);
         });
       },
       Math.min(this.renewalIntervalMs, this.ttlMs, MAX_LEASE_TIMER_DELAY_MS),
@@ -828,19 +1001,25 @@ export class SerializedLease {
 
   /** Stop timer work without waiting for a potentially hung owner renewal. */
   public stop(): Promise<void> {
-    if (this.state !== 'stopped') {
-      const wasExpired = this.state === 'expired';
-      if (!wasExpired) {
-        this.state = 'stopped';
-        this.rejectInFlight(new LeaseStoppedError());
-        this.invalidateLifecycle();
-      }
-      if (this.timer !== undefined) {
-        this.scheduler.clearInterval(this.timer);
-        this.timer = undefined;
-      }
-      this.clearExpiryTimer();
+    if (this.state === 'stopped') {
+      return Promise.resolve();
     }
+    const wasExpired = this.state === 'expired';
+    if (!wasExpired) {
+      this.state = 'stopped';
+      this.rejectInFlight(new LeaseStoppedError());
+      this.invalidateLifecycle();
+    }
+    const timer = this.timer;
+    this.timer = undefined;
+    if (timer !== undefined) {
+      try {
+        this.scheduler.clearInterval(timer);
+      } catch (error: unknown) {
+        this.reportError(error);
+      }
+    }
+    this.clearExpiryTimer();
     return Promise.resolve();
   }
 
@@ -874,17 +1053,15 @@ export class SerializedLease {
       throw new LeaseExpiredError();
     }
     const lifecycleGeneration = this.lifecycleGeneration;
-    const endpointGeneration = this.endpointGeneration;
+    const endpointGenerationAtStart = this.endpointGeneration;
+    const endpointAuthorityAtStart = this.endpointGenerationAuthority;
     const ownerAtStart = this.ownerIdentity;
-    const now = clockValue(this.now);
-    if (this.expiresAt !== null && now >= this.expiresAt) {
-      this.markExpired();
-      throw new LeaseExpiredError();
-    }
     const endpointCopy = cloneEndpoint(endpoint, ownerAtStart?.runtimeId);
     // Persist through the owning registry before changing this lease's local
     // snapshot.  A failed publication therefore cannot create divergent state.
-    this.onEndpointUpdate?.(endpointCopy);
+    const callbackResult = this.onEndpointUpdate?.(endpointCopy);
+    const result = normalizeRenewalResult(callbackResult);
+    const metadata = normalizeRenewalMetadata(result);
     const stateAfterCallback = this.lifecycle;
     if (stateAfterCallback === 'stopped') {
       throw new LeaseStoppedError();
@@ -895,16 +1072,63 @@ export class SerializedLease {
     if (this.lifecycleGeneration !== lifecycleGeneration) {
       throw new LeaseStoppedError();
     }
-    if (this.endpointGeneration !== endpointGeneration) {
-      throw new LeaseConfigurationError('endpoint update became stale during callback');
+    let nextIdentity: LeaseOwnerIdentity | undefined;
+    if (result?.identity !== undefined) {
+      nextIdentity = cloneOwnerIdentity(result.identity);
+      if (ownerAtStart !== undefined && !sameIdentity(ownerAtStart, nextIdentity)) {
+        throw new LeaseConfigurationError('lease owner identity cannot be replaced');
+      }
     }
-    if (this.ownerIdentity !== ownerAtStart) {
+    if (this.ownerIdentity !== undefined && ownerAtStart !== undefined) {
+      if (!sameIdentity(this.ownerIdentity, ownerAtStart)) {
+        throw new LeaseConfigurationError('lease owner changed during endpoint update');
+      }
+    } else if (this.ownerIdentity !== ownerAtStart) {
       throw new LeaseConfigurationError('lease owner changed during endpoint update');
     }
-    // Recheck ownership after the callback before committing the endpoint.
-    const committedEndpoint = cloneEndpoint(endpointCopy, this.ownerIdentity?.runtimeId);
-    this.endpointGeneration += 1;
+    if (nextIdentity !== undefined) {
+      if (this.ownerIdentity !== undefined && !sameIdentity(this.ownerIdentity, nextIdentity)) {
+        throw new LeaseConfigurationError('lease owner cannot be replaced during endpoint update');
+      }
+    }
+    const committedOwner = this.ownerIdentity ?? nextIdentity;
+    const returnedEndpoint = result?.endpoint;
+    const returnedRuntimeId = committedOwner?.runtimeId;
+    let committedEndpoint: RoutingEndpoint;
+    if (metadata.endpointGeneration !== undefined) {
+      if (metadata.endpointGeneration < this.endpointGeneration) {
+        throw new LeaseConfigurationError('endpoint update became stale during callback');
+      }
+      committedEndpoint = cloneEndpoint(returnedEndpoint ?? endpointCopy, returnedRuntimeId);
+    } else {
+      if (
+        this.endpointGeneration !== endpointGenerationAtStart ||
+        this.endpointGenerationAuthority !== endpointAuthorityAtStart
+      ) {
+        throw new LeaseConfigurationError('endpoint update became stale during callback');
+      }
+      committedEndpoint = cloneEndpoint(returnedEndpoint ?? endpointCopy, returnedRuntimeId);
+    }
+    const renewedAt = clockValue(this.now);
+    const times = renewalTimes(metadata, renewedAt, this.ttlMs, this.issuedAt);
+    if (clockValue(this.now) >= times.expiresAt) {
+      this.markExpired();
+      throw new LeaseExpiredError();
+    }
+    if (metadata.endpointGeneration !== undefined) {
+      this.endpointGeneration = metadata.endpointGeneration;
+      this.endpointGenerationAuthority = 'registry';
+    } else {
+      this.endpointGeneration += 1;
+      this.endpointGenerationAuthority = 'local';
+    }
+    this.ownerIdentity ??= committedOwner;
     this.currentEndpoint = committedEndpoint;
+    this.issuedAt = times.issuedAt;
+    this.lastRenewedAt = times.lastRenewedAt;
+    this.expiresAt = times.expiresAt;
+    this.state = 'active';
+    this.armExpiryTimer(this.expiresAt);
   }
 
   public get running(): boolean {
@@ -969,6 +1193,16 @@ export class SerializedLease {
     return this.stop();
   }
 
+  private reportError(error: unknown): void {
+    this.lastError = error;
+    try {
+      this.onError?.(error);
+    } catch {
+      // Error observers are isolated from lease lifecycle cleanup.  The
+      // original error remains the deterministic diagnostic in the snapshot.
+    }
+  }
+
   private armExpiryTimer(deadline: number): void {
     this.clearExpiryTimer();
     if (this.state === 'stopped' || this.state === 'expired') {
@@ -986,7 +1220,11 @@ export class SerializedLease {
       this.expiryTimer = undefined;
       this.expiryTimerDeadline = null;
       if (activeTimer !== undefined) {
-        this.scheduler.clearInterval(activeTimer);
+        try {
+          this.scheduler.clearInterval(activeTimer);
+        } catch (error: unknown) {
+          this.reportError(error);
+        }
       }
       try {
         if (clockValue(this.now) >= deadline) {
@@ -995,12 +1233,7 @@ export class SerializedLease {
           this.armExpiryTimer(deadline);
         }
       } catch (error: unknown) {
-        this.lastError = error;
-        try {
-          this.onError?.(error);
-        } catch (handlerError: unknown) {
-          this.lastError = handlerError;
-        }
+        this.reportError(error);
       }
     };
     let timer: LeaseTimer;
@@ -1018,20 +1251,33 @@ export class SerializedLease {
       this.lifecycle === 'expired' ||
       this.expiryTimerDeadline !== deadline
     ) {
-      this.scheduler.clearInterval(timer);
+      try {
+        this.scheduler.clearInterval(timer);
+      } catch (error: unknown) {
+        this.reportError(error);
+      }
       return;
     }
     this.expiryTimer = timer;
     const unrefTimer = timer as LeaseTimer & { unref?: () => void };
-    unrefTimer.unref?.();
+    try {
+      unrefTimer.unref?.();
+    } catch (error: unknown) {
+      this.reportError(error);
+    }
   }
 
   private clearExpiryTimer(): void {
-    if (this.expiryTimer !== undefined) {
-      this.scheduler.clearInterval(this.expiryTimer);
-      this.expiryTimer = undefined;
-    }
+    const timer = this.expiryTimer;
+    this.expiryTimer = undefined;
     this.expiryTimerDeadline = null;
+    if (timer !== undefined) {
+      try {
+        this.scheduler.clearInterval(timer);
+      } catch (error: unknown) {
+        this.reportError(error);
+      }
+    }
   }
 
   private rejectInFlight(error: unknown): void {
@@ -1047,20 +1293,26 @@ export class SerializedLease {
     this.state = 'expired';
     this.rejectInFlight(new LeaseExpiredError());
     this.invalidateLifecycle();
-    if (this.timer !== undefined) {
-      this.scheduler.clearInterval(this.timer);
-      this.timer = undefined;
+    const timer = this.timer;
+    this.timer = undefined;
+    if (timer !== undefined) {
+      try {
+        this.scheduler.clearInterval(timer);
+      } catch (error: unknown) {
+        this.reportError(error);
+      }
     }
     this.clearExpiryTimer();
   }
 
   private invalidateLifecycle(): void {
+    // Invalidate before invoking user code so a callback that is still
+    // resolving cannot commit stale endpoint or lease state.
     this.lifecycleGeneration += 1;
     try {
       this.onStop?.();
     } catch (error: unknown) {
-      this.lastError = error;
-      this.onError?.(error);
+      this.reportError(error);
     }
   }
 }
@@ -1085,32 +1337,46 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): Rou
     }
     return endpoint;
   }
-  if (typeof endpoint !== 'object' || endpoint === null || Array.isArray(endpoint)) {
+  if (typeof endpoint !== 'object' || endpoint === null) {
     throw new LeaseConfigurationError('routing endpoint must be an opaque string or descriptor');
   }
-  const prototype = Object.getPrototypeOf(endpoint);
+  let isArray: boolean;
+  let prototype: object | null;
+  let keys: string[];
+  let symbols: symbol[];
+  try {
+    isArray = Array.isArray(endpoint);
+    prototype = Object.getPrototypeOf(endpoint);
+    keys = Object.getOwnPropertyNames(endpoint);
+    symbols = Object.getOwnPropertySymbols(endpoint);
+  } catch {
+    throw new LeaseConfigurationError('routing endpoint descriptor cannot be inspected safely');
+  }
+  if (isArray) {
+    throw new LeaseConfigurationError('routing endpoint must be an opaque string or descriptor');
+  }
   if (prototype !== Object.prototype && prototype !== null) {
     throw new LeaseConfigurationError('routing endpoint descriptor must be a plain object');
   }
-  let keyCount = 0;
-  let inspectedKeys = 0;
-  for (const key in endpoint) {
-    inspectedKeys += 1;
-    if (inspectedKeys > MAX_ENDPOINT_KEYS) {
-      throw new LeaseConfigurationError('routing endpoint descriptor has too many fields');
+  if (symbols.length > 0 || keys.length > MAX_ENDPOINT_KEYS) {
+    throw new LeaseConfigurationError('routing endpoint descriptor has too many fields');
+  }
+  const allowedKeys = new Set(['address', 'kind', 'transport', 'runtimeId']);
+  const descriptors = new Map<string, PropertyDescriptor>();
+  for (const key of keys) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    } catch {
+      throw new LeaseConfigurationError('routing endpoint descriptor cannot be inspected safely');
     }
-    if (!Object.prototype.hasOwnProperty.call(endpoint, key)) {
-      continue;
-    }
-    keyCount += 1;
-    if (keyCount > MAX_ENDPOINT_KEYS) {
-      throw new LeaseConfigurationError('routing endpoint descriptor has too many fields');
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
     if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
-      throw new LeaseConfigurationError('routing endpoint descriptor cannot contain accessors');
+      throw new LeaseConfigurationError(
+        'routing endpoint descriptor cannot contain accessors or hidden fields',
+      );
     }
-    if (!['address', 'kind', 'transport', 'runtimeId'].includes(key)) {
+    descriptors.set(key, descriptor);
+    if (!allowedKeys.has(key)) {
       throw new LeaseConfigurationError(
         FORBIDDEN_ENDPOINT_KEYS.has(key)
           ? 'routing endpoint cannot carry credentials'
@@ -1118,18 +1384,7 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): Rou
       );
     }
   }
-  const ownValue = (key: string): unknown => {
-    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
-    if (descriptor === undefined) {
-      return undefined;
-    }
-    if (!('value' in descriptor) || !descriptor.enumerable) {
-      throw new LeaseConfigurationError(
-        'routing endpoint descriptor cannot contain accessors or hidden fields',
-      );
-    }
-    return descriptor.value;
-  };
+  const ownValue = (key: string): unknown => descriptors.get(key)?.value;
   const address = ownValue('address');
   if (
     typeof address !== 'string' ||
@@ -1199,8 +1454,13 @@ export interface LeaseExpiryOptions {
 
 /** Return an RFC 3339 UTC expiry for a wall-clock timestamp and TTL. */
 export function leaseExpiration(options: LeaseExpiryOptions = {}): UtcTimestamp {
-  const now = options.now instanceof Date ? options.now.getTime() : (options.now ?? Date.now());
-  if (!Number.isFinite(now)) {
+  const now =
+    options.now === undefined
+      ? Date.now()
+      : typeof options.now === 'number'
+        ? options.now
+        : dateMilliseconds(options.now);
+  if (typeof now !== 'number' || !Number.isFinite(now)) {
     throw new LeaseConfigurationError('lease timestamp must be finite');
   }
   const ttl = duration(options.ttlMs, DEFAULT_LEASE_TTL_MS, 'ttlMs');
