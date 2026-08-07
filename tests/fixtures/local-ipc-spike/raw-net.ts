@@ -6,7 +6,8 @@
  * connection. It does not import production transport or Pi protocol modules.
  */
 import { randomUUID } from 'node:crypto';
-import { lstatSync, linkSync, promises as fs, renameSync, unlinkSync } from 'node:fs';
+import { promises as fs } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { basename } from 'node:path';
 import { createConnection, createServer } from 'node:net';
 import type { Server, Socket } from 'node:net';
@@ -269,55 +270,146 @@ async function lstatSocket(endpoint: string): Promise<PosixSocketIdentity | unde
  * The endpoint is atomically renamed to a private quarantine path before it is
  * unlinked. If the inode changed while the probe was running, the quarantine is
  * linked back only when the endpoint is still vacant; an existing replacement is
- * never overwritten or removed.
+ * never overwritten or removed. Quarantine cleanup is identity-checked and is
+ * bounded by the caller's absolute cleanup deadline.
  */
-function restoreQuarantinedSocket(endpoint: string, quarantine: string): void {
+type QuarantineRelinkHook = () => void | PromiseLike<void>;
+
+interface QuarantineRestoreOptions {
+  readonly deadline?: Deadline;
+  readonly ownedIdentity?: PosixSocketIdentity;
+  readonly beforeRelink?: QuarantineRelinkHook;
+}
+
+function cleanupDeadline(options: QuarantineRestoreOptions): Deadline {
+  return (
+    options.deadline ??
+    createPhaseDeadline('endpoint-quarantine-recovery', DEFAULT_RAW_NET_SHUTDOWN_TIMEOUT_MS)
+  );
+}
+
+async function lstatWithinDeadline(
+  endpoint: string,
+  deadline: Deadline,
+): Promise<Stats | undefined> {
   try {
-    lstatSync(quarantine);
+    return await withDeadline(fs.lstat(endpoint, { bigint: false }), deadline);
   } catch (error: unknown) {
     if (errorCode(error) === 'ENOENT') {
-      return;
+      return undefined;
     }
     throw error;
-  }
-  try {
-    linkSync(quarantine, endpoint);
-  } catch (error: unknown) {
-    if (errorCode(error) === 'EEXIST') {
-      try {
-        unlinkSync(quarantine);
-      } catch (cleanupError: unknown) {
-        if (errorCode(cleanupError) !== 'ENOENT') {
-          throw cleanupError;
-        }
-      }
-      return;
-    }
-    throw error;
-  }
-  try {
-    unlinkSync(quarantine);
-  } catch (error: unknown) {
-    if (errorCode(error) !== 'ENOENT') {
-      throw error;
-    }
   }
 }
-/** Test-only seam for exercising replacement-safe quarantine recovery. */
-export const restoreQuarantinedSocketForTest = restoreQuarantinedSocket;
 
-function unlinkOwnedSocket(endpoint: string, expected?: PosixSocketIdentity): boolean {
-  if (!isPosixRuntime()) {
+async function unlinkOwnedQuarantine(
+  quarantine: string,
+  expected: PosixSocketIdentity,
+  deadline: Deadline,
+  observedStats?: Stats,
+): Promise<boolean> {
+  const stats = observedStats ?? (await lstatWithinDeadline(quarantine, deadline));
+  if (stats === undefined || !stats.isSocket()) {
     return false;
   }
-  let stats: ReturnType<typeof lstatSync>;
+  const observed = socketIdentity(stats);
+  if (!sameSocketObjectIdentity(observed, expected)) {
+    return false;
+  }
+  const probeRemaining = remainingMs(deadline);
+  if (probeRemaining === 0) {
+    await withDeadline(Promise.resolve(), deadline);
+    return false;
+  }
+  const listenerState = await probePosixEndpoint(quarantine, probeRemaining);
+  if (listenerState !== 'stale') {
+    return false;
+  }
+  const finalStats = await lstatWithinDeadline(quarantine, deadline);
+  if (
+    finalStats === undefined ||
+    !finalStats.isSocket() ||
+    !sameSocketObjectIdentity(socketIdentity(finalStats), expected)
+  ) {
+    return false;
+  }
   try {
-    stats = lstatSync(endpoint);
+    await withDeadline(fs.unlink(quarantine), deadline);
   } catch (error: unknown) {
     if (errorCode(error) === 'ENOENT') {
       return false;
     }
     throw error;
+  }
+  return true;
+}
+
+async function restoreQuarantinedSocket(
+  endpoint: string,
+  quarantine: string,
+  options: QuarantineRestoreOptions = {},
+): Promise<void> {
+  const deadline = cleanupDeadline(options);
+  const quarantinedStats = await lstatWithinDeadline(quarantine, deadline);
+  if (quarantinedStats === undefined) {
+    return;
+  }
+  const quarantineIdentity = socketIdentity(quarantinedStats);
+  let endpointStats = await lstatWithinDeadline(endpoint, deadline);
+  if (endpointStats === undefined) {
+    await options.beforeRelink?.();
+    try {
+      await withDeadline(fs.link(quarantine, endpoint), deadline);
+      // A successful hard-link proves that the endpoint and quarantine refer to
+      // the same moved entry. Only an entry already proven to be ours may have
+      // its quarantine link removed; replacements remain preserved.
+      if (options.ownedIdentity !== undefined) {
+        await unlinkOwnedQuarantine(quarantine, options.ownedIdentity, deadline);
+      }
+      return;
+    } catch (error: unknown) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw error;
+      }
+      endpointStats = await lstatWithinDeadline(endpoint, deadline);
+    }
+  }
+  if (
+    endpointStats !== undefined &&
+    sameSocketObjectIdentity(socketIdentity(endpointStats), quarantineIdentity)
+  ) {
+    if (options.ownedIdentity !== undefined) {
+      await unlinkOwnedQuarantine(quarantine, options.ownedIdentity, deadline);
+    }
+    return;
+  }
+  if (options.ownedIdentity !== undefined) {
+    await unlinkOwnedQuarantine(quarantine, options.ownedIdentity, deadline, quarantinedStats);
+  }
+  // The endpoint is occupied by a different entry. Preserve the quarantine
+  // unless the moved object is ours and was independently proven stale above.
+}
+/** Test-only seam for exercising replacement-safe quarantine recovery. */
+export const restoreQuarantinedSocketForTest = (
+  endpoint: string,
+  quarantine: string,
+  beforeRelink?: QuarantineRelinkHook,
+): Promise<void> =>
+  restoreQuarantinedSocket(endpoint, quarantine, {
+    beforeRelink,
+  });
+
+async function unlinkOwnedSocket(
+  endpoint: string,
+  expected?: PosixSocketIdentity,
+  deadline = createPhaseDeadline('endpoint-cleanup', DEFAULT_RAW_NET_SHUTDOWN_TIMEOUT_MS),
+): Promise<boolean> {
+  if (!isPosixRuntime()) {
+    return false;
+  }
+  const stats = await lstatWithinDeadline(endpoint, deadline);
+  if (stats === undefined) {
+    return false;
   }
   if (!stats.isSocket()) {
     throw new RawNetError(
@@ -334,7 +426,7 @@ function unlinkOwnedSocket(endpoint: string, expected?: PosixSocketIdentity): bo
   let quarantineCreated = false;
   try {
     try {
-      renameSync(endpoint, quarantine);
+      await withDeadline(fs.rename(endpoint, quarantine), deadline);
     } catch (error: unknown) {
       if (errorCode(error) === 'ENOENT') {
         return false;
@@ -343,46 +435,46 @@ function unlinkOwnedSocket(endpoint: string, expected?: PosixSocketIdentity): bo
     }
     quarantineCreated = true;
 
-    let quarantinedStats: ReturnType<typeof lstatSync>;
-    try {
-      quarantinedStats = lstatSync(quarantine);
-    } catch (error: unknown) {
-      if (errorCode(error) === 'ENOENT') {
-        quarantineCreated = false;
-        return false;
-      }
-      throw error;
-    }
-    if (
-      !quarantinedStats.isSocket() ||
-      (expected !== undefined &&
-        !sameSocketObjectIdentity(socketIdentity(quarantinedStats), expected))
-    ) {
-      restoreQuarantinedSocket(endpoint, quarantine);
+    const quarantinedStats = await lstatWithinDeadline(quarantine, deadline);
+    if (quarantinedStats === undefined) {
       quarantineCreated = false;
       return false;
     }
-
-    try {
-      unlinkSync(quarantine);
-    } catch (error: unknown) {
-      if (errorCode(error) === 'ENOENT') {
+    const quarantinedIdentity = socketIdentity(quarantinedStats);
+    const ownedIdentity =
+      expected !== undefined && sameSocketObjectIdentity(quarantinedIdentity, expected)
+        ? expected
+        : undefined;
+    if (!quarantinedStats.isSocket() || ownedIdentity === undefined) {
+      try {
+        await restoreQuarantinedSocket(endpoint, quarantine, { deadline });
+      } finally {
         quarantineCreated = false;
-        return false;
       }
-      throw error;
+      return false;
     }
+    const removed = await unlinkOwnedQuarantine(
+      quarantine,
+      ownedIdentity,
+      deadline,
+      quarantinedStats,
+    );
     quarantineCreated = false;
-    return true;
+    return removed;
   } catch (error: unknown) {
     if (quarantineCreated) {
       try {
-        restoreQuarantinedSocket(endpoint, quarantine);
+        await restoreQuarantinedSocket(endpoint, quarantine, {
+          deadline,
+          ownedIdentity: expected,
+        });
       } catch (recoveryError: unknown) {
         throw new AggregateError(
           [error, recoveryError],
           'Raw node:net endpoint quarantine recovery failed',
         );
+      } finally {
+        quarantineCreated = false;
       }
     }
     throw error;
@@ -810,17 +902,18 @@ export async function removeStalePosixEndpoint(
       `Refusing stale cleanup for an unowned endpoint path ${endpoint}`,
     );
   }
-  const observed = await lstatSocket(endpoint);
+  const deadline = createPhaseDeadline('stale-cleanup', timeoutMs);
+  const observed = await withDeadline(lstatSocket(endpoint), deadline);
   if (observed === undefined) {
     return false;
   }
 
-  const state = await probePosixEndpoint(endpoint, timeoutMs);
+  const state = await withDeadline(probePosixEndpoint(endpoint, remainingMs(deadline)), deadline);
   if (state === 'live') {
     throw new RawNetError('endpoint-in-use', `A live listener owns endpoint ${endpoint}`);
   }
 
-  return unlinkOwnedSocket(endpoint, observed);
+  return await unlinkOwnedSocket(endpoint, observed, deadline);
 }
 
 interface SocketClosureState {
@@ -1287,7 +1380,7 @@ export class RawNetTransport {
       (server === undefined || !server.listening)
     ) {
       try {
-        unlinkOwnedSocket(ownedEndpoint.endpoint, ownedEndpoint.identity);
+        await unlinkOwnedSocket(ownedEndpoint.endpoint, ownedEndpoint.identity, deadline);
       } catch (error: unknown) {
         closeError ??= error;
       }

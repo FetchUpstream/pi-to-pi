@@ -75,7 +75,7 @@ npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=v
 The same one-line commands are valid in Bash, PowerShell, and `cmd.exe`. The Node
 guard must exit with status `0`; `node --version` records the exact runtime, and
 the verbose output must be retained. Canonical raw evidence is indexed as
-`raw-run-1.txt`, `raw-run-2.txt`, and `raw-run-3.txt` (70 tests in 6 files each);
+`raw-run-1.txt`, `raw-run-2.txt`, and `raw-run-3.txt` (71 tests in 6 files each);
 canonical HTTP evidence is `http-run-1.txt`, `http-run-2.txt`, and `http-run-3.txt`
 (14 tests in 1 file each). `cleanup-baseline-delta.txt` is a separate pre/post
 inventory around the third pair, not an additional test run. Non-native platform
@@ -84,7 +84,7 @@ claimed from the Ubuntu run.
 
 | Candidate                      | Ubuntu/Linux, Node `v25.0.0`                                                                  | macOS, Node `>=22.19.0`                                      | Windows, Node `>=22.19.0`                                              |
 | ------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| Raw length-prefixed `node:net` | **PASS** — 70/70 tests per run; native Unix socket                                            | **UNAVAILABLE** — native macOS run required; no pass claimed | **UNAVAILABLE** — native named-pipe run required; no pass claimed      |
+| Raw length-prefixed `node:net` | **PASS** — 71/71 tests per run; native Unix socket                                            | **UNAVAILABLE** — native macOS run required; no pass claimed | **UNAVAILABLE** — native named-pipe run required; no pass claimed      |
 | HTTP/local IPC comparison      | **PASS** — 14/14 tests per run; native Unix socket                                            | **UNAVAILABLE** — native macOS run required; no pass claimed | **UNAVAILABLE** — native named-pipe HTTP run required; no pass claimed |
 | Repeated cleanup               | **PASS** — three focused repetitions, empty pre/post artifact delta and zero fixture children | **UNAVAILABLE** — native filesystem/process run required     | **UNAVAILABLE** — native named-pipe/process run required               |
 
@@ -93,7 +93,7 @@ normal opaque round trips, split/coalesced framing, one-operation closure,
 malformed/truncated/trailing/oversized request and response frames, unavailable
 endpoints, connect/write/read deadlines, slow-drip reads, cancellation,
 backpressure, concurrency, clean shutdown, abrupt child exit, stale endpoint
-probing, endpoint ownership, child diagnostics, and platform limitations. The
+probing, endpoint ownership and quarantine replacement races, child diagnostics, and platform limitations. The
 HTTP matrix covers native round trips, request/response limits, bounded writes
 and close, connect/write/read deadlines, cancellation, split/chunked and
 malformed parser input, concurrency, keep-alive/cleanup, endpoint replacement
@@ -101,7 +101,7 @@ safety, and the Windows endpoint limitation. The evidence matrix maps each
 scenario to its exact test name and retained output file.
 
 Repository checks are recorded in `evidence/ubuntu-node-25.0.0/repository-checks.txt`:
-`npm run typecheck` and focused ESLint both pass, and `npm test` passes all 85
+`npm run typecheck` and focused ESLint both pass, and `npm test` passes all 86
 tests in 8 files. `npm run format:check` exits 1 because the coordinator
 snapshot has 13 pre-existing formatting warnings in `.pi/prompts/*.md`,
 `.pi/skills/**/*.md`, and `AGENTS.md`; the changed ADR and evidence Markdown
@@ -128,7 +128,10 @@ Normal close removes only the exact POSIX socket identity owned by the current
 runtime and releases the server and active sockets. A crashed POSIX process can
 leave a stale socket. Recovery is allowed only for a default-generated socket
 whose `lstat` identity and bounded no-live-listener probe establish ownership;
-the path is quarantined and identity-checked before removal or restoration. A
+the path is atomically quarantined and identity-checked before removal or
+restoration. If another listener claims the vacant endpoint during relink, the
+moved replacement remains at its quarantine path; only an owned quarantine entry
+proven stale within the caller's absolute cleanup deadline may be removed. A
 non-socket, a live listener, an arbitrary root, or an inconclusive probe is not
 blindly unlinked. Windows named-pipe lifetime is delegated to the operating
 system and requires native Windows evidence.

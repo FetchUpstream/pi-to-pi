@@ -113,7 +113,7 @@ describe('raw node:net candidate unit boundaries', () => {
       phase: 'read',
     });
   });
-  it('removes a quarantined socket when a replacement owns the endpoint', async () => {
+  it('preserves a moved replacement when another listener claims the vacant endpoint before relink', async () => {
     if (process.platform === 'win32') {
       expect({
         platform: process.platform,
@@ -128,14 +128,16 @@ describe('raw node:net candidate unit boundaries', () => {
     const quarantine = `${endpoint}.cleanup-test`;
     const replacement = createServer((socket) => socket.resume());
     const quarantined = createServer((socket) => socket.resume());
-
-    await listenUnitServer(replacement, endpoint);
-    await listenUnitServer(quarantined, quarantine);
+    await listenUnitServer(quarantined, endpoint);
+    await fs.rename(endpoint, quarantine);
     try {
-      restoreQuarantinedSocketForTest(endpoint, quarantine);
-      await expect(fs.lstat(quarantine)).rejects.toMatchObject({ code: 'ENOENT' });
+      await restoreQuarantinedSocketForTest(endpoint, quarantine, async () => {
+        await listenUnitServer(replacement, endpoint);
+      });
       expect(replacement.listening).toBe(true);
+      expect((await fs.lstat(quarantine)).isSocket()).toBe(true);
       await expect(assertUnitEndpointConnectable(endpoint)).resolves.toBeUndefined();
+      await expect(assertUnitEndpointConnectable(quarantine)).resolves.toBeUndefined();
     } finally {
       await closeUnitServer(quarantined);
       await closeUnitServer(replacement);

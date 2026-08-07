@@ -21,12 +21,12 @@ $ node --version
 v25.0.0
 $ npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-ipc-spike --reporter=verbose
 
- RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p-003-spike-and-choose-the-local-ipc-framing-s
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-raw-ownership-evidence-fix
 
  ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > generates a short linux socket path 1ms
  ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > generates a short darwin socket path 0ms
  ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > generates a named-pipe namespace value on Windows 0ms
- ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > generates distinct endpoint values for concurrent runtimes 1ms
+ ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > generates distinct endpoint values for concurrent runtimes 2ms
  ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > uses collision-resistant, short runtime identifiers 0ms
  ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > enforces POSIX endpoint limits by UTF-8 byte length 0ms
  ✓ tests/fixtures/local-ipc/endpoint.test.ts > local IPC endpoint fixture > accepts the exact configured boundary and rejects one byte over it 0ms
@@ -40,10 +40,6 @@ $ npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-
  ✓ tests/fixtures/local-ipc-spike/frame-codec.test.ts > local IPC frame codec > rejects truncated headers and bodies at end of stream 0ms
  ✓ tests/fixtures/local-ipc-spike/frame-codec.test.ts > local IPC frame codec > rejects trailing bytes after the one frame allowed per connection 0ms
  ✓ tests/fixtures/local-ipc-spike/frame-codec.test.ts > local IPC frame codec > rejects malformed input chunks and decodes exactly one buffered frame 0ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > keeps the default transport payload path opaque while exposing JSON validation for the spike 2ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > normalizes finite phase defaults and rejects invalid bounds before binding 1ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > exports stable cancellation and deadline error types used by request callers 0ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > removes a quarantined socket when a replacement owns the endpoint 3ms
  ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > represents phase deadlines as finite absolute timestamps 1ms
  ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > rejects at an absolute deadline and aborts the operation signal 2ms
  ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > chains timer delays for absolute deadlines beyond Node timer limits 1ms
@@ -65,8 +61,12 @@ $ npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-
  ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > does not signal a child after a matching close is observed 0ms
  ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > does not let stale close state skip cleanup for a reused child 0ms
  ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > bounds post-kill cleanup when close never arrives 0ms
- ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > captures bounded child diagnostics and renders a diagnostic error 17ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.process.test.ts > raw node:net process lifecycle evidence > proves abrupt POSIX termination leaves only a safely probed stale socket 23ms
+ ✓ tests/fixtures/local-ipc-spike/test-helpers.test.ts > local IPC spike test helpers > captures bounded child diagnostics and renders a diagnostic error 13ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > keeps the default transport payload path opaque while exposing JSON validation for the spike 2ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > normalizes finite phase defaults and rejects invalid bounds before binding 4ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > exports stable cancellation and deadline error types used by request callers 0ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.unit.test.ts > raw node:net candidate unit boundaries > preserves a moved replacement when another listener claims the vacant endpoint before relink 3ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.process.test.ts > raw node:net process lifecycle evidence > proves abrupt POSIX termination leaves only a safely probed stale socket 19ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.process.test.ts > raw node:net process lifecycle evidence > does not remove a live POSIX endpoint during an address-in-use probe 2ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.process.test.ts > raw node:net process lifecycle evidence > rejects stale cleanup outside the default endpoint policy 0ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.process.test.ts > raw node:net process lifecycle evidence > refuses to unlink a non-socket path during stale cleanup 1ms
@@ -79,52 +79,53 @@ $ npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > resolves a complete response before the peer half-closes 1ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > force-closes the server side after a response to a peer that stays open 1ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > closes a connection when trailing request bytes arrive after response dispatch 1ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > rejects trailing response bytes that arrive before completion settles 1ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > rejects malformed, truncated, trailing, and oversized responses 2ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > fails an unavailable endpoint within the connect deadline 1ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > enforces a deterministic connect deadline on a socket that never connects 26ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > enforces an absolute write deadline while waiting for drain backpressure 26ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > exercises real write backpressure for a bounded large request and response 317ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > enforces an absolute write deadline while waiting for drain backpressure 25ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > exercises real write backpressure for a bounded large request and response 295ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > enforces an absolute read deadline against a peer that never responds 36ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > fails a slow-drip response even when each byte arrives before an idle timeout 56ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > fails a slow-drip response even when each byte arrives before an idle timeout 57ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > cancels an in-flight request and destroys the underlying socket 20ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > rechecks sockets added while shutdown is draining 0ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > waits for the close event after forcing a destroyed socket during shutdown 1ms
- ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > serializes bind with close and rejects requests after shutdown 1ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > waits for the close event after forcing a destroyed socket during shutdown 0ms
+ ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > serializes bind with close and rejects requests after shutdown 0ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > stops accepting and releases active sockets on clean shutdown 1ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > tests endpoint byte-length boundaries without embedding a working-directory path 0ms
  ✓ tests/fixtures/local-ipc-spike/raw-net.test.ts > raw node:net local IPC candidate > records the native-only Windows named-pipe cleanup limitation explicitly 0ms
 
  Test Files  6 passed (6)
-      Tests  70 passed (70)
-   Start at  16:12:12
-   Duration  639ms (transform 137ms, setup 0ms, import 272ms, tests 599ms, environment 0ms)
+      Tests  71 passed (71)
+   Start at  17:08:24
+   Duration  622ms (transform 158ms, setup 0ms, import 288ms, tests 574ms, environment 0ms)
 
 RAW_EXIT_STATUS=0
 $ node --version
 v25.0.0
 $ npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
 
- RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p-003-spike-and-choose-the-local-ipc-framing-s
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-raw-ownership-evidence-fix
 
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > round-trips one request and one response over the native POSIX endpoint 12ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > round-trips one request and one response over the native POSIX endpoint 11ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized request before invoking the handler 2ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized response without retaining an unbounded body 4ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds server response writes and completes resource cleanup 2ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized response without retaining an unbounded body 3ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds server response writes and completes resource cleanup 1ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds raw HTTP response capture 2ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > applies finite connect, write, and read phase deadlines 19ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > destroys the request when the caller aborts 11ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > destroys the request when the caller aborts 12ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > handles split HTTP headers/body and rejects malformed HTTP through the parser 3ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > supports concurrent one-operation requests and preserves response association 22ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > closes the HTTP server, disables keep-alive, and removes its POSIX socket 18ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved regular-file replacement without following it 15ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved symlink replacement without following it 14ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > supports concurrent one-operation requests and preserves response association 21ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > closes the HTTP server, disables keep-alive, and removes its POSIX socket 17ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved regular-file replacement without following it 16ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved symlink replacement without following it 13ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds close by the caller deadline and preserves a failed close 1ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > represents Windows named pipes explicitly even when this run is not Windows 0ms
 
  Test Files  1 passed (1)
       Tests  14 passed (14)
-   Start at  16:12:13
-   Duration  236ms (transform 40ms, setup 0ms, import 59ms, tests 124ms, environment 0ms)
+   Start at  17:08:25
+   Duration  233ms (transform 39ms, setup 0ms, import 58ms, tests 121ms, environment 0ms)
 
 HTTP_EXIT_STATUS=0
 --- artifact delta (post-run minus pre-run) ---

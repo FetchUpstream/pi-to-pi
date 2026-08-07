@@ -3,9 +3,10 @@
 ## Scope and provenance
 
 This record closes OpenSpec tasks 4.1–4.4 for the approved, fixture-only
-candidates. The candidate snapshot exercised below is the coordinator worktree
-at commit `6956017` (`docs: correct HTTP comparison test count`), after the
-raw `node:net`, helper, and HTTP lifecycle review fixes were merged. The
+candidates. The candidate snapshot exercised below starts at coordinator baseline
+`f56b5cb` (`docs: close HTTP platform evidence gaps`); this worktree applies the
+raw ownership-safe cleanup fix and evidence rerun after the raw `node:net`, helper,
+and HTTP lifecycle review fixes were merged. The
 fixtures remain under `tests/fixtures/`; no production `src/` transport or Pi
 message/task module is imported.
 
@@ -43,11 +44,11 @@ The canonical test commands and per-test output captured on the available runner
 stored beside this record:
 
 - [`raw-run-1.txt`](evidence/ubuntu-node-25.0.0/raw-run-1.txt) — canonical raw run 1;
-  6 files, 70 tests passed.
+  6 files, 71 tests passed.
 - [`raw-run-2.txt`](evidence/ubuntu-node-25.0.0/raw-run-2.txt) — canonical raw run 2;
-  6 files, 70 tests passed.
+  6 files, 71 tests passed.
 - [`raw-run-3.txt`](evidence/ubuntu-node-25.0.0/raw-run-3.txt) — canonical raw run 3;
-  6 files, 70 tests passed.
+  6 files, 71 tests passed.
 - [`http-run-1.txt`](evidence/ubuntu-node-25.0.0/http-run-1.txt) — canonical HTTP run 1;
   1 file, 14 tests passed.
 - [`http-run-2.txt`](evidence/ubuntu-node-25.0.0/http-run-2.txt) — canonical HTTP run 2;
@@ -71,7 +72,7 @@ macOS or Windows support.
 
 | Platform and runtime         | Raw `node:net` candidate                                                                  | HTTP comparison                                                                                                                    | Cleanup/process evidence                                                                 | Limitation                                                                                                                                                                          |
 | ---------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ubuntu/Linux, Node `v25.0.0` | **PASS** — 6 files, 70 tests, including native Unix-socket bind/request/close             | **PASS** — 1 file, 14 tests, including native Unix-socket HTTP bind/request/close                                                  | **PASS** on three repeated focused runs; artifact delta is empty and child count is zero | Three unrelated pre-existing `/tmp/p2p-*.sock` files and eleven `/tmp/p2p-*` directories were present in the baseline. They were not removed because ownership was not established. |
+| Ubuntu/Linux, Node `v25.0.0` | **PASS** — 6 files, 71 tests, including native Unix-socket bind/request/close             | **PASS** — 1 file, 14 tests, including native Unix-socket HTTP bind/request/close                                                  | **PASS** on three repeated focused runs; artifact delta is empty and child count is zero | Three unrelated pre-existing `/tmp/p2p-*.sock` files and eleven `/tmp/p2p-*` directories were present in the baseline. They were not removed because ownership was not established. |
 | macOS, Node `>=22.19.0`      | **UNAVAILABLE — native run required**; no macOS result is claimed from Linux              | **UNAVAILABLE — native run required**; no macOS result is claimed from Linux                                                       | **UNAVAILABLE — native filesystem/process cleanup requires macOS**                       | The source uses the same POSIX path API and includes a Darwin endpoint-generation assertion, but that is not a native macOS bind or lifecycle result.                               |
 | Windows, Node `>=22.19.0`    | **UNAVAILABLE — native run required**; no Windows named-pipe result is claimed from Linux | **UNAVAILABLE — native run required**; `socketPath` capability shape is tested, but no Windows HTTP bind/request result is claimed | **UNAVAILABLE — native named-pipe/process cleanup requires Windows**                     | Named pipes are OS-managed objects rather than POSIX files. The Linux run cannot enumerate or prove Windows pipe cleanup, and the fixture records that limitation explicitly.       |
 
@@ -101,12 +102,12 @@ unavailable as stated above.
 | Concurrency and association               | `raw-net.test.ts`: six concurrent clients preserve response/request association                                                                                                                                                                                                    | **PASS**                                                                                 |
 | Bind/close lifecycle                      | `raw-net.test.ts`: rechecks sockets during shutdown, waits for forced socket close, serializes bind with close, rejects post-shutdown requests, and releases active sockets                                                                                                        | **PASS**                                                                                 |
 | Child-process cleanup and diagnostics     | `test-helpers.test.ts`: bounded terminate/escalate/close, null close state, reused child generations, late errors, bounded output; `raw-net.process.test.ts`: abrupt child termination, diagnostics, and cleanup                                                                   | **PASS**                                                                                 |
-| POSIX stale endpoint safety               | `raw-net.process.test.ts`: safely probes an abrupt stale socket, preserves a live listener, rejects unowned roots, and refuses non-socket unlink                                                                                                                                   | **PASS** on Linux; macOS unavailable                                                     |
+| POSIX stale endpoint safety               | `raw-net.process.test.ts`: safely probes an abrupt stale socket, preserves a live listener, rejects unowned roots, and refuses non-socket unlink; `raw-net.unit.test.ts`: preserves a moved replacement when another listener claims the vacant endpoint before relink             | **PASS** on Linux; macOS unavailable                                                     |
 | Windows cleanup boundary                  | `raw-net.test.ts` and `raw-net.process.test.ts`: explicit native-only Windows named-pipe limitations                                                                                                                                                                               | **PASS as an explicit limitation assertion** on Linux; native Windows result unavailable |
 
 The raw run totals are stable across runs 1, 2, and 3: endpoint 9, frame codec
-8, raw lifecycle 22, raw unit 4, process lifecycle 5, and helper lifecycle 22,
-for 70 passing tests in 6 files.
+8, raw lifecycle 23, raw unit 4, process lifecycle 5, and helper lifecycle 22,
+for 71 passing tests in 6 files.
 
 ## HTTP comparison acceptance matrix
 
@@ -130,7 +131,7 @@ slow-drip response peer was exercised for HTTP; therefore no HTTP slow-drip resu
 ## Repeated-run cleanup evidence
 
 The canonical test records are `raw-run-1.txt`, `raw-run-2.txt`, and `raw-run-3.txt`
-for raw (70 tests each), plus `http-run-1.txt`, `http-run-2.txt`, and `http-run-3.txt`
+for raw (71 tests each), plus `http-run-1.txt`, `http-run-2.txt`, and `http-run-3.txt`
 for HTTP (14 tests each). `cleanup-baseline-delta.txt` is a separate cleanup inventory
 captured around the third pair; it runs the raw command and then the HTTP command
 with a pre-run and post-run inventory of:
@@ -157,7 +158,7 @@ Ubuntu inventory and remains a required native Windows run.
 ## Evidence status
 
 - Ubuntu/Linux raw candidate: **PASS** — `raw-run-1.txt`, `raw-run-2.txt`, and
-  `raw-run-3.txt` each contain all 70 passing scenarios.
+  `raw-run-3.txt` each contain all 71 passing scenarios.
 - Ubuntu/Linux HTTP candidate: **PASS** — `http-run-1.txt`, `http-run-2.txt`, and
   `http-run-3.txt` each contain all 14 passing scenarios.
 - Ubuntu/Linux repeated cleanup delta: **PASS** — `cleanup-baseline-delta.txt` records
