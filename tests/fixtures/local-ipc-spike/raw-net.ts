@@ -6,7 +6,7 @@
  * connection. It does not import production transport or Pi protocol modules.
  */
 import { lstatSync, promises as fs, unlinkSync } from 'node:fs';
-import { basename, dirname } from 'node:path';
+import { basename } from 'node:path';
 import { createConnection, createServer } from 'node:net';
 import type { Server, Socket } from 'node:net';
 import { TextDecoder } from 'node:util';
@@ -31,6 +31,7 @@ import {
 import type { FrameCodecErrorCode } from './frame-codec.js';
 import {
   createIpcEndpoint,
+  DEFAULT_POSIX_ENDPOINT_ROOT,
   POSIX_ENDPOINT_PREFIX,
   POSIX_ENDPOINT_SUFFIX,
 } from '../local-ipc/endpoint.js';
@@ -40,6 +41,7 @@ export const DEFAULT_RAW_NET_WRITE_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_READ_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_SHUTDOWN_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_STALE_PROBE_TIMEOUT_MS = 250;
+const DEFAULT_GENERATED_RUNTIME_ID_PATTERN = /^[a-f0-9]{24}$/;
 
 interface PosixSocketIdentity {
   readonly dev: number;
@@ -493,7 +495,25 @@ function readResponse(
       cleanup();
       callback();
     };
-    const fail = (error: Error): void => settle(() => reject(error));
+    const settleSuccess = (payload: Buffer): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      // Keep the stream listeners until the socket closes so late bytes cannot
+      // be silently accepted after a successful frame.
+      removeAbort();
+      resolve(payload);
+    };
+    const fail = (error: Error): void => {
+      if (settled) {
+        // The response is already delivered, but a later trailing byte still
+        // invalidates this one-operation connection.
+        destroySocket(socket);
+        return;
+      }
+      settle(() => reject(error));
+    };
     const onError = (error: Error): void =>
       fail(new RawNetError('read-error', error.message, error));
     const finish = (payload: Buffer): void => {
@@ -511,15 +531,12 @@ function readResponse(
       }
       Promise.resolve(validation)
         .then(
-          () => settle(() => resolve(payload)),
+          () => settleSuccess(payload),
           (error: unknown) => fail(protocolError(error)),
         )
         .catch((error: unknown) => fail(protocolError(error)));
     };
     const onData = (chunk: Buffer): void => {
-      if (settled) {
-        return;
-      }
       try {
         const payload = decoder.push(chunk);
         if (payload !== undefined) {
@@ -541,7 +558,11 @@ function readResponse(
       }
     };
     const onClose = (): void => {
-      if (settled || settling || complete) {
+      if (settled) {
+        cleanup();
+        return;
+      }
+      if (settling || complete) {
         return;
       }
       fail(new RawNetError('premature-close', 'Socket closed before a complete response'));
@@ -614,11 +635,14 @@ function isGeneratedPosixEndpoint(endpoint: string): boolean {
     POSIX_ENDPOINT_PREFIX.length,
     name.length - POSIX_ENDPOINT_SUFFIX.length,
   );
+  if (!DEFAULT_GENERATED_RUNTIME_ID_PATTERN.test(runtimeId)) {
+    return false;
+  }
   try {
     return (
       createIpcEndpoint({
         platform: 'linux',
-        posixRoot: dirname(endpoint),
+        posixRoot: DEFAULT_POSIX_ENDPOINT_ROOT,
         runtimeId,
       }) === endpoint
     );
@@ -628,7 +652,7 @@ function isGeneratedPosixEndpoint(endpoint: string): boolean {
 }
 
 /**
- * Probe and remove a generated POSIX endpoint only after verifying it is a
+ * Probe and remove a default-generated POSIX endpoint only after verifying it is a
  * socket path with no live listener. Windows named pipes are managed by the OS
  * and therefore do not enter this cleanup path.
  */
@@ -909,9 +933,6 @@ export class RawNetTransport {
       socket.off('close', onClose);
     };
     const fail = (): void => {
-      if (settled) {
-        return;
-      }
       settled = true;
       // Keep the socket in serverSockets until close confirms resource release.
       if (readTimer !== undefined) {
@@ -971,9 +992,6 @@ export class RawNetTransport {
       }
     };
     const onData = (chunk: Buffer): void => {
-      if (settled) {
-        return;
-      }
       try {
         const request = decoder.push(chunk);
         if (request !== undefined) {
@@ -1016,31 +1034,62 @@ export class RawNetTransport {
     this.ownedEndpoint = undefined;
     this.handler = undefined;
 
-    const sockets = new Set([...this.clientSockets, ...this.serverSockets]);
-    const socketClosures = [...sockets].map((socket) => waitForSocketClosure(socket));
-    for (const socket of sockets) {
-      destroySocket(socket);
-    }
-
     let closeError: unknown;
     const deadline = createPhaseDeadline('shutdown', this.options.shutdownTimeoutMs);
+    let serverClosed = server === undefined;
+    let serverCloseError: unknown;
+    const serverCloseCompletion = (async (): Promise<void> => {
+      if (server === undefined) {
+        return;
+      }
+      try {
+        await closeServer(server);
+      } catch (error: unknown) {
+        serverCloseError = error;
+      } finally {
+        serverClosed = true;
+      }
+    })();
+    const drainResources = async (): Promise<void> => {
+      for (;;) {
+        const sockets = new Set([...this.clientSockets, ...this.serverSockets]);
+        if (sockets.size > 0) {
+          const socketClosures = [...sockets].map((socket) => waitForSocketClosure(socket));
+          for (const socket of sockets) {
+            destroySocket(socket);
+          }
+          await Promise.all(socketClosures);
+          continue;
+        }
+        if (!serverClosed) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          continue;
+        }
+        // Give a pending connection callback one turn to register its socket before
+        // declaring the tracked resource sets drained.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (this.clientSockets.size === 0 && this.serverSockets.size === 0) {
+          return;
+        }
+      }
+    };
+    const closeAllConnections = (): void => {
+      for (const socket of new Set([...this.clientSockets, ...this.serverSockets])) {
+        destroySocket(socket);
+      }
+      (
+        server as (Server & { closeAllConnections?: () => void }) | undefined
+      )?.closeAllConnections?.();
+    };
     try {
       await withDeadline(
-        Promise.all([
-          server === undefined ? Promise.resolve() : closeServer(server),
-          ...socketClosures,
-        ]),
+        Promise.all([serverCloseCompletion, drainResources()]).then(() => {
+          if (serverCloseError !== undefined) {
+            throw serverCloseError;
+          }
+        }),
         deadline,
-        {
-          onTimeout: () => {
-            for (const socket of sockets) {
-              destroySocket(socket);
-            }
-            (
-              server as (Server & { closeAllConnections?: () => void }) | undefined
-            )?.closeAllConnections?.();
-          },
-        },
+        { onTimeout: closeAllConnections },
       );
     } catch (error: unknown) {
       closeError = error;

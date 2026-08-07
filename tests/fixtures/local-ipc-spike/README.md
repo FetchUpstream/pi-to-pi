@@ -27,6 +27,6 @@ phase deadlines, supports cancellation, and closes owned resources. Binding and
 shutdown transitions are serialized; shutdown rejects new requests and waits for
 tracked socket closure. A complete frame dispatches immediately without requiring
 peer EOF, while trailing bytes remain a protocol error. POSIX stale-path cleanup
-only removes a generated socket after `lstat` confirms a socket, a bounded
+only removes a default-generated socket after `lstat` confirms a socket, a bounded
 connection probe confirms no live listener, and a final inode identity check
 still matches, so a replacement path is left untouched.

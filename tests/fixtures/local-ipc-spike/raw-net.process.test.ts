@@ -183,6 +183,29 @@ describe('raw node:net process lifecycle evidence', () => {
       expect(await endpointExists(endpoint)).toBe(false);
     }
   });
+  it('rejects stale cleanup outside the default endpoint policy', async () => {
+    if (process.platform === 'win32') {
+      expect({
+        platform: process.platform,
+        limitation: 'POSIX stale-path ownership requires a Linux or macOS runner',
+      }).toEqual({
+        platform: process.platform,
+        limitation: 'POSIX stale-path ownership requires a Linux or macOS runner',
+      });
+      return;
+    }
+    const arbitraryRootEndpoint = createIpcEndpoint({
+      posixRoot: '/tmp/raw-net-review-arbitrary-root',
+      runtimeId: 'fixture',
+    });
+    const arbitraryRuntimeEndpoint = createIpcEndpoint({ runtimeId: 'fixture' });
+    await expect(removeStalePosixEndpoint(arbitraryRootEndpoint, 50)).rejects.toMatchObject({
+      code: 'endpoint-not-owned',
+    });
+    await expect(removeStalePosixEndpoint(arbitraryRuntimeEndpoint, 50)).rejects.toMatchObject({
+      code: 'endpoint-not-owned',
+    });
+  });
 
   it('refuses to unlink a non-socket path during stale cleanup', async () => {
     if (process.platform === 'win32') {

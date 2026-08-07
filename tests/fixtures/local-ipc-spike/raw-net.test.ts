@@ -409,6 +409,54 @@ describe('raw node:net local IPC candidate', () => {
       await closeServer(fixture.server, fixture.sockets);
     }
   });
+  it('closes a connection when trailing request bytes arrive after response dispatch', async () => {
+    const endpoint = createIpcEndpoint();
+    let handlerCalls = 0;
+    const transport = new RawNetTransport();
+    await transport.bind(endpoint, (payload) => {
+      handlerCalls += 1;
+      return payload;
+    });
+    const socket = createConnection(endpoint);
+    socket.on('error', () => undefined);
+    const responseDecoder = new FrameDecoder();
+    const response = new Promise<Buffer>((resolve, reject) => {
+      socket.on('data', (chunk) => {
+        try {
+          const payload = responseDecoder.push(chunk);
+          if (payload !== undefined) {
+            resolve(payload);
+          }
+        } catch (error: unknown) {
+          reject(error);
+        }
+      });
+    });
+    const closed = new Promise<void>((resolve) => socket.once('close', resolve));
+    try {
+      await withPhaseDeadline(
+        'late-trailing-connect',
+        TEST_TIMEOUT_MS,
+        new Promise<void>((resolve) => socket.once('connect', resolve)),
+        { onTimeout: () => socket.destroy() },
+      );
+      socket.write(encodeFrame(Buffer.from('request')));
+      await expect(
+        withPhaseDeadline('late-trailing-response', TEST_TIMEOUT_MS, response, {
+          onTimeout: () => socket.destroy(),
+        }),
+      ).resolves.toEqual(Buffer.from('request'));
+      await nextTurn();
+      socket.write(Buffer.from([0]));
+      await withPhaseDeadline('late-trailing-close', TEST_TIMEOUT_MS, closed, {
+        onTimeout: () => socket.destroy(),
+      });
+      expect(handlerCalls).toBe(1);
+    } finally {
+      socket.destroy();
+      await transport.close();
+    }
+  });
 
   it('rejects malformed, truncated, trailing, and oversized responses', async () => {
     const cases: readonly { response: Buffer; code: string; maxPayloadBytes?: number }[] = [
@@ -614,6 +662,20 @@ describe('raw node:net local IPC candidate', () => {
     } finally {
       await transport.close();
     }
+  });
+  it('rechecks sockets added while shutdown is draining', async () => {
+    const transport = new RawNetTransport();
+    const serverSockets = (transport as unknown as { serverSockets: Set<Socket> }).serverSockets;
+    const lateSocket = new FakeSocket(false, false) as unknown as Socket;
+    let closed = false;
+    lateSocket.once('close', () => {
+      closed = true;
+      serverSockets.delete(lateSocket);
+    });
+    const closing = transport.close();
+    queueMicrotask(() => serverSockets.add(lateSocket));
+    await expect(closing).resolves.toBeUndefined();
+    expect(closed).toBe(true);
   });
   it('serializes bind with close and rejects requests after shutdown', async () => {
     const endpoint = createIpcEndpoint();
