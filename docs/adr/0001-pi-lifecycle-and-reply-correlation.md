@@ -102,39 +102,74 @@ semantic request ownership to it. Correlation remains the extension's job.
 
 ## Persistence and replacement rule
 
-Persist only task metadata, not a second copy of the request body. A compact
-append-only custom entry such as `p2p.task` can record state transitions:
+Persist only task metadata, not a second copy of the request body. The
+fixture exercises an exact version-1, body-free `p2p.task` metadata shape:
 
 ```json
 {
   "version": 1,
   "requestId": "...",
-  "originSessionId": "...",
-  "originRuntimeId": "...",
-  "peerSessionId": "...",
-  "state": "accepted|completed|failed|expired|superseded",
+  "sessionId": "...",
+  "ownerSessionId": "...",
+  "runtimeId": "...",
+  "peerId": null,
+  "state": "accepted",
   "updatedAt": "...",
-  "expiresAt": "..."
+  "expiresAt": null,
+  "reason": null
 }
 ```
 
+`sessionId` is the immutable origin session identity captured when the request
+is accepted. `ownerSessionId` is the current session identity that wrote the
+latest record; it starts equal to `sessionId` and changes to the destination
+session only when that destination appends a supersession record.
+For a superseded record, `ownerSessionId` is audit-only: the terminal
+state grants no live ownership or completion authority.
+`runtimeId` identifies the runtime that wrote the latest record. `peerId` is
+the peer identity when known and is immutable across transitions. `reason` is
+null except on a `superseded` record, where it is required. `expiresAt` is
+nullable. The state vocabulary is exactly `accepted`, `completed`, `failed`,
+`expired`, and `superseded`; only `accepted` is recoverable/non-terminal.
+Each transition appends a new record, and folding by `requestId` makes the
+latest record authoritative. Metadata contains no request or response body.
+
 On `session_start(reason: "reload")`, fold the latest `p2p.task` record for
-each request ID and recover non-terminal tasks. The request body remains in
-Pi's custom-message entry, if needed for the conversation, and is not copied
-into the task record.
+each request ID and recover only records whose state is `accepted`, whose
+expiry has not passed, and whose `sessionId` and `ownerSessionId` both equal
+the selected session ID. Completed, failed, expired, superseded, and expired
+accepted records do not reopen. The request body remains in Pi's
+custom-message entry, if needed for the conversation, and is not copied into
+the task record.
 
-Task ownership is session-scoped:
+Task ownership and lifecycle boundaries are session-scoped:
 
-- **reload:** recover the same session's non-terminal records;
-- **new:** create an empty task scope; finish or mark outgoing tasks before
-  teardown, but do not migrate them;
-- **resume:** recover only records from the selected target session;
-- **fork/clone:** treat copied non-terminal records as inherited history and
-  mark them `superseded`/`needs-reissue` rather than allowing both sessions to
-  complete the same request.
+- **reload:** `session_shutdown` clears the outgoing runtime's active task
+  scope; the following `session_start` binds the same session and recovers its
+  live records.
+- **new:** the replacement starts with an empty task scope. Outgoing records
+  and queues remain associated with the outgoing session; no task state is
+  migrated or synthesized by the replacement.
+- **resume:** the replacement recovers only the selected target session's
+  records; the outgoing in-memory map is not carried over.
+- **fork/clone:** the replacement `session_start` automatically appends a
+  `superseded` record for each copied, unexpired, non-terminal task before
+  destination delivery. The record preserves `sessionId`, `peerId`, and
+  `expiresAt`, sets `ownerSessionId` and `runtimeId` to destination identities,
+  and requires a replacement reason. It is terminal and cannot be completed
+  by the destination. Terminal/expired records are not changed, and a fork
+  branch that predates a metadata entry contains no record to supersede.
+  Fork/clone replacement therefore produces only `superseded` history; a new
+  request must be accepted explicitly rather than reopening copied work.
 
-The task key should include the originating session identity (with the globally
-unique request ID), not just a process-global current request.
+The lifecycle binding runs task recovery and fork/clone supersession during
+`session_start` before any destination turn and resets the active scope at
+`session_shutdown`; `session_shutdown` runs before replacement
+`session_start`. It does not migrate queued delivery state.
+
+The task key is the globally unique `requestId` folded within the selected
+session branch; session identity and owner fields enforce scope rather than
+a process-global current request.
 
 ## Session-name synchronization
 
@@ -143,6 +178,18 @@ At every `session_start`, initialize the published display name from
 published identity when a rename occurs. The event-driven path handles later
 renames; the startup read handles reload, resume, fork, and clone paths where a
 name can already exist without a new rename event.
+
+## Fixture-only limitation
+
+The task-state lifecycle and metadata writer remain test-fixture utilities in
+this spike; no production adapter consumes or persists them. The in-process
+faux provider and temporary session files do not validate transport,
+cross-process failure, or production router behavior.
+
+The harness also cannot prove crash durability for a metadata append before
+Pi's first assistant entry. It records the observed session-file flush boundary
+but leaves production durability and recovery after abrupt process loss to a
+later implementation wave.
 
 ## Consequences
 

@@ -73,25 +73,46 @@ inbound request or the latest assistant message as correlation state.
 
 ### Persist metadata as append-only custom entries
 
-A future adapter will persist compact `p2p.task` custom entries containing the
-request ID, origin session/runtime identity, peer identity, state, timestamps,
-and expiry. The fixture will exercise the same session-manager entry shape and
-fold the latest record per request ID during `session_start(reason: "reload")`.
+A future adapter will persist compact `p2p.task` custom entries with the exact
+version-1, body-free fields `version`, `requestId`, `sessionId`,
+`ownerSessionId`, `runtimeId`, `peerId`, `state`, `updatedAt`, `expiresAt`,
+and `reason`. `sessionId` is the immutable origin session identity captured
+when the request is accepted. `ownerSessionId` is the current session identity
+that wrote the latest record. For `superseded`, destination `ownerSessionId` is
+audit-only and does not grant live ownership or completion authority. `runtimeId`
+identifies the runtime that wrote the latest record, and `peerId` is the known
+peer identity or `null`; peer identity and expiry remain immutable across
+transitions. `reason` is `null` except on a `superseded` record, where it is
+required.
 
-Request bodies remain in Pi custom-message entries when needed for context and
-are not duplicated in task records. The state vocabulary for this change is
-`accepted`, `completed`, `failed`, `expired`, and `superseded`; fork/clone
-records use `superseded` with a reason rather than an additional ambiguous
-`needs-reissue` state.
+The state vocabulary is exactly `accepted`, `completed`, `failed`, `expired`,
+and `superseded`. Only `accepted` is non-terminal and eligible for recovery
+when unexpired and owned by the selected session. Each transition appends a
+new record; folding by `requestId` selects the latest record. Request bodies
+remain in Pi custom-message entries when needed for context and are not
+duplicated in task records.
 
 ### Scope ownership to session identity
 
-Reload preserves the current session and may recover its non-terminal tasks.
-New sessions start with an empty task scope. Resume recovers only the selected
-target session's records. Fork and clone create a new session identity; copied
-non-terminal records are treated as inherited history and superseded before the
-new session can complete them. The fixture will assert that the replacement
-session does not inherit the outgoing agent's in-memory delivery queues.
+Reload preserves the current session and may recover its latest unexpired
+`accepted` records only when both `sessionId` and `ownerSessionId` match that
+session. New sessions start with an empty task scope. Resume recovers only the
+selected target session's records and never carries the outgoing in-memory map
+into it.
+
+Fork and clone create a new session identity. At the destination
+`session_start`, the lifecycle binding automatically appends a `superseded`
+record for each copied, unexpired, non-terminal record before destination
+delivery. The superseding record preserves immutable `sessionId`, `peerId`, and
+`expiresAt`, and records destination `ownerSessionId`, `runtimeId`, and a
+replacement reason. The destination recovers no superseded task and cannot
+complete it. Terminal or expired records are not changed; a fork branch that
+predates a metadata entry has no record to supersede. Fork/clone replacement
+therefore produces only `superseded` history rather than reopening copied work.
+
+The lifecycle binding clears the outgoing active task scope at
+`session_shutdown`, and Pi emits that boundary before the replacement
+`session_start`. It does not migrate outgoing delivery queues or task state.
 
 ### Synchronize names through bootstrap plus change events
 
@@ -114,8 +135,11 @@ and clone even when no rename event is emitted during the load.
   persisted details on the outgoing session, but never rely on those queues
   migrating to the destination.
 - **[Risk] Fork and clone copy extension entries along the selected branch.**
-  → **Mitigation:** Include origin session identity and assert inherited
+  → **Mitigation:** Include immutable `sessionId` and assert inherited
   non-terminal records become `superseded`.
+- **[Limitation] Task-state lifecycle is fixture-only in this spike.**
+  → The fixture validates the schema and in-process session boundaries;
+  production persistence, transport, and crash recovery remain later work.
 - **[Risk] The repository's current full format check includes pre-existing
   unformatted `.pi` skill files.** → **Mitigation:** Keep new artifacts and
   fixture files formatted and report baseline check failures separately.
