@@ -15,18 +15,18 @@ The package can be installed as a Pi package from this repository:
 pi install git:github.com/FetchUpstream/pi-to-pi
 ```
 
-The extension registers its namespaced flags and wires identity, configuration, and room resolution into
-Pi's native session lifecycle without allocating sockets, timers, watchers, or processes during module
-evaluation. Registry and lease primitives are implemented as modules, but registry publication, renewal,
-and end-to-end discovery integration are not yet wired into the Pi lifecycle.
+The extension registers its namespaced flags and wires identity, configuration, room resolution, registry
+publication, and lease renewal into Pi's native session lifecycle without allocating sockets, timers,
+watchers, or processes during module evaluation. End-to-end discovery wiring, peer messaging, transport,
+and orchestration are not implemented yet.
 
 ## Identity, names, and rooms
 
 The identity, configuration, room, naming, lookup, registry, and lease rules below describe the implemented
 foundation and its module contracts. `--p2p-name` and `--p2p-project` are registered and resolved
-through Pi's lifecycle, while registry publication and lease renewal remain available as modules but are not
-yet wired into that lifecycle. Peer transport, Agent Cards, request routing, and Pi-facing tools
-remain outside this release, as does end-to-end message delivery.
+through Pi's lifecycle, while registry publication and lease renewal are also wired into that lifecycle.
+Peer transport, Agent Cards, request routing, and Pi-facing tools remain outside this release, as does
+end-to-end message delivery.
 
 ### Session and runtime identity
 
