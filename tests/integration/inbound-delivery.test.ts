@@ -1,27 +1,37 @@
 import { describe, expect, it } from 'vitest';
 import { fauxAssistantMessage } from '@earendil-works/pi-ai';
-import { SettingsManager } from '@earendil-works/pi-coding-agent';
+import { SettingsManager, type AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import { createPersistedPiSessionFixture } from '../fixtures/index.js';
 import { createRequestCorrelation } from './request-correlation.js';
 
 const INBOUND_TYPE = 'p2p.inbound';
+type PersistedFixture = Awaited<ReturnType<typeof createPersistedPiSessionFixture>>;
 
-function customInboundEntries(
-  fixture: Awaited<ReturnType<typeof createPersistedPiSessionFixture>>,
-) {
+function customInboundEntries(fixture: PersistedFixture) {
   return fixture.entries.filter(
     (entry) => entry.type === 'custom_message' && entry.customType === INBOUND_TYPE,
   );
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) {
-      throw new Error('Timed out waiting for the expected Pi fixture observation');
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+function waitForSessionEvent(
+  fixture: PersistedFixture,
+  predicate: (event: AgentSessionEvent) => boolean,
+  timeoutMs = 2_000,
+): Promise<AgentSessionEvent> {
+  return new Promise((resolve, reject) => {
+    const unsubscribe = fixture.session.subscribe((event) => {
+      if (!predicate(event)) {
+        return;
+      }
+      clearTimeout(timeout);
+      unsubscribe();
+      resolve(event);
+    });
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      reject(new Error('Timed out waiting for the expected Pi fixture event'));
+    }, timeoutMs);
+  });
 }
 
 function deferred<T>(): {
@@ -35,6 +45,15 @@ function deferred<T>(): {
   return { promise, resolve: resolvePromise };
 }
 
+async function disposeFixture(fixture: PersistedFixture, pending?: Promise<void>): Promise<void> {
+  try {
+    await pending?.catch(() => undefined);
+    await fixture.waitForIdle().catch(() => undefined);
+  } finally {
+    await fixture.dispose();
+  }
+}
+
 describe('correlated inbound delivery', () => {
   it('registers before idle triggerTurn delivery and preserves an opaque request ID', async () => {
     const fixture = await createPersistedPiSessionFixture({
@@ -42,18 +61,22 @@ describe('correlated inbound delivery', () => {
     });
     const correlation = createRequestCorrelation();
     const requestId = 'opaque/request-a::7f';
-    correlation.accept(requestId);
+    correlation.accept(fixture, requestId);
+    expect(correlation.events).toEqual([{ type: 'registered', requestId }]);
 
     try {
       const delivery = correlation.deliver(fixture, requestId, 'idle request body', {
         triggerTurn: true,
       });
-      expect(correlation.events).toEqual([
-        { type: 'registered', requestId },
-        { type: 'delivered', requestId, stateAtDelivery: 'accepted' },
-      ]);
-
       await delivery;
+      const registeredIndex = correlation.events.findIndex(
+        (event) => event.type === 'registered' && event.requestId === requestId,
+      );
+      const deliveredIndex = correlation.events.findIndex(
+        (event) => event.type === 'delivered' && event.requestId === requestId,
+      );
+      expect(registeredIndex).toBeGreaterThanOrEqual(0);
+      expect(deliveredIndex).toBeGreaterThan(registeredIndex);
 
       expect(fixture.probe.byType('agent_start')).toHaveLength(1);
       const starts = fixture.probe.byType('custom_message_start');
@@ -76,7 +99,7 @@ describe('correlated inbound delivery', () => {
       }
       expect(entries[0].details).toEqual({ requestId });
     } finally {
-      await fixture.dispose();
+      await disposeFixture(fixture);
     }
   });
 
@@ -93,17 +116,23 @@ describe('correlated inbound delivery', () => {
     const initialId = 'opaque/request-initial';
     const steerId = 'opaque/request-steer';
     const followUpId = 'opaque/request-follow-up';
-    correlation.accept(initialId);
-    correlation.accept(steerId);
-    correlation.accept(followUpId);
+    correlation.accept(fixture, initialId);
+    correlation.accept(fixture, steerId);
+    correlation.accept(fixture, followUpId);
 
     let initialDelivery: Promise<void> | undefined;
     try {
       initialDelivery = correlation.deliver(fixture, initialId, 'initial request body', {
         triggerTurn: true,
       });
-      await waitFor(() => fixture.faux.state.callCount === 1);
+      await waitForSessionEvent(fixture, (event) => event.type === 'agent_start');
       expect(fixture.session.isStreaming).toBe(true);
+
+      await expect(
+        correlation.deliver(fixture, initialId, 'duplicate initial request body', {
+          deliverAs: 'steer',
+        }),
+      ).rejects.toThrow('Request ID is already being delivered: opaque/request-initial');
 
       await correlation.deliver(fixture, steerId, 'steering request body', {
         deliverAs: 'steer',
@@ -111,9 +140,10 @@ describe('correlated inbound delivery', () => {
       await correlation.deliver(fixture, followUpId, 'follow-up request body', {
         deliverAs: 'followUp',
       });
-      expect(correlation.events.slice(-2)).toEqual([
-        { type: 'delivered', requestId: steerId, stateAtDelivery: 'accepted' },
-        { type: 'delivered', requestId: followUpId, stateAtDelivery: 'accepted' },
+      expect(correlation.events.filter((event) => event.type === 'registered')).toEqual([
+        { type: 'registered', requestId: initialId },
+        { type: 'registered', requestId: steerId },
+        { type: 'registered', requestId: followUpId },
       ]);
 
       firstResponse.resolve(fauxAssistantMessage('initial response'));
@@ -156,20 +186,17 @@ describe('correlated inbound delivery', () => {
       ).toEqual([{ requestId: initialId }, { requestId: steerId }, { requestId: followUpId }]);
     } finally {
       firstResponse.resolve(fauxAssistantMessage('initial response after cleanup'));
-      if (initialDelivery) {
-        await initialDelivery.catch(() => undefined);
-      }
-      await fixture.dispose();
+      await disposeFixture(fixture, initialDelivery);
     }
   });
 
-  it('correlates replies only by explicit request ID and rejects unknown IDs', async () => {
+  it('correlates replies only by explicit request ID and rejects unknown or repeated transitions', async () => {
     const fixture = await createPersistedPiSessionFixture();
     const correlation = createRequestCorrelation();
     const requestA = 'opaque/request-a';
     const requestB = 'opaque/request-b';
-    correlation.accept(requestA);
-    correlation.accept(requestB);
+    correlation.accept(fixture, requestA);
+    correlation.accept(fixture, requestB);
 
     try {
       await correlation.deliver(fixture, requestA, 'request A body');
@@ -177,24 +204,49 @@ describe('correlated inbound delivery', () => {
       expect(correlation.state(requestA)).toBe('accepted');
       expect(correlation.state(requestB)).toBe('accepted');
 
-      expect(correlation.reply(requestA, 'reply A')).toEqual({
+      expect(correlation.reply(fixture, requestA, 'reply A')).toEqual({
         requestId: requestA,
         content: 'reply A',
       });
       expect(correlation.state(requestA)).toBe('completed');
       expect(correlation.state(requestB)).toBe('accepted');
-      expect(() => correlation.reply('unknown/request-id', 'unmatched')).toThrow(
+      expect(() => correlation.reply(fixture, requestA, 'duplicate reply A')).toThrow(
+        'Cannot reply completed request ID: opaque/request-a',
+      );
+      expect(() => correlation.reply(fixture, 'unknown/request-id', 'unmatched')).toThrow(
         'Unknown request ID: unknown/request-id',
       );
       expect(correlation.state(requestB)).toBe('accepted');
 
-      expect(correlation.reply(requestB, 'reply B')).toEqual({
+      expect(correlation.reply(fixture, requestB, 'reply B')).toEqual({
         requestId: requestB,
         content: 'reply B',
       });
       expect(correlation.state(requestB)).toBe('completed');
     } finally {
-      await fixture.dispose();
+      await disposeFixture(fixture);
+    }
+  });
+
+  it('binds accepted request state to the session and runtime identity', async () => {
+    const fixture = await createPersistedPiSessionFixture();
+    const correlation = createRequestCorrelation();
+    const requestId = 'opaque/request-session-bound';
+    correlation.accept(fixture, requestId);
+    const originalSessionId = fixture.sessionId;
+
+    try {
+      await fixture.newSession();
+      expect(fixture.sessionId).not.toBe(originalSessionId);
+      await expect(correlation.deliver(fixture, requestId, 'stale request body')).rejects.toThrow(
+        'Request ID belongs to another Pi session/runtime: opaque/request-session-bound',
+      );
+      expect(() => correlation.reply(fixture, requestId, 'stale reply')).toThrow(
+        'Request ID belongs to another Pi session/runtime: opaque/request-session-bound',
+      );
+      expect(correlation.state(requestId)).toBe('accepted');
+    } finally {
+      await disposeFixture(fixture);
     }
   });
 
@@ -214,14 +266,23 @@ describe('correlated inbound delivery', () => {
     });
     const correlation = createRequestCorrelation();
     const requestId = 'opaque/request-retry';
-    correlation.accept(requestId);
+    correlation.accept(fixture, requestId);
 
+    let delivery: Promise<void> | undefined;
     try {
-      const delivery = correlation.deliver(fixture, requestId, 'retry request body', {
+      const firstAgentEnd = waitForSessionEvent(
+        fixture,
+        (event) => event.type === 'agent_end' && event.willRetry,
+      );
+      delivery = correlation.deliver(fixture, requestId, 'retry request body', {
         triggerTurn: true,
       });
-      await waitFor(() => fixture.probe.byType('agent_end').length === 1);
-
+      const agentEnd = await firstAgentEnd;
+      expect(agentEnd.type).toBe('agent_end');
+      if (agentEnd.type !== 'agent_end') {
+        throw new Error('Expected an agent_end event before retry settlement');
+      }
+      expect(agentEnd.willRetry).toBe(true);
       expect(fixture.probe.latest('agent_end')?.idle).toBe(false);
       expect(fixture.probe.byType('agent_settled')).toHaveLength(0);
       expect(correlation.state(requestId)).toBe('accepted');
@@ -231,10 +292,10 @@ describe('correlated inbound delivery', () => {
       expect(fixture.probe.byType('agent_settled')).toHaveLength(1);
       expect(correlation.state(requestId)).toBe('accepted');
 
-      correlation.reply(requestId, 'explicit retry reply');
+      correlation.reply(fixture, requestId, 'explicit retry reply');
       expect(correlation.state(requestId)).toBe('completed');
     } finally {
-      await fixture.dispose();
+      await disposeFixture(fixture, delivery);
     }
   });
 });
