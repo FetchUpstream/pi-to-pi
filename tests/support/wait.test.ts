@@ -57,4 +57,35 @@ describe('bounded predicate waits', () => {
       vi.useRealTimers();
     }
   });
+  it('rejects at the deadline when a predicate ignores cancellation without retaining timers', async () => {
+    vi.useFakeTimers();
+    try {
+      let predicateSignal: AbortSignal | undefined;
+      let releasePredicate!: (value?: undefined) => void;
+      const wait = waitForPredicate(
+        (signal) => {
+          predicateSignal = signal;
+          return new Promise<undefined>((resolve) => {
+            releasePredicate = resolve;
+          });
+        },
+        {
+          timeoutMs: 10,
+          description: 'ignored predicate',
+        },
+      );
+      const assertion = expect(wait).rejects.toMatchObject({ code: 'ERR_WAIT_TIMEOUT' });
+
+      await vi.advanceTimersByTimeAsync(10);
+      await assertion;
+      expect(predicateSignal?.aborted).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+
+      releasePredicate();
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

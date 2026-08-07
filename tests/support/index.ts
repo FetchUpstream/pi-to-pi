@@ -11,6 +11,7 @@ export type {
   TestWorkspace,
   TestWorkspaceOptions,
   TestWorkspacePaths,
+  WorkspaceCleanupHook,
 } from './workspace.js';
 
 export {
@@ -26,6 +27,7 @@ export type { AsyncWaitPredicate, WaitForPredicateOptions, WaitPredicateResult }
 export {
   BoundedOutput,
   createBoundedOutput,
+  DEFAULT_MAX_JSON_CHUNK_BYTES,
   DEFAULT_MAX_JSON_LINE_BYTES,
   DEFAULT_MAX_OUTPUT_BYTES,
   formatProcessDiagnostics,

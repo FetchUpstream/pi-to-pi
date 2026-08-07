@@ -24,6 +24,9 @@ export interface TestWorkspaceOptions {
   readonly cleanupRetryDelayMs?: number;
 }
 
+/** Owner-provided cleanup work, such as terminating managed child processes. */
+export type WorkspaceCleanupHook = () => void | Promise<void>;
+
 export interface TestWorkspacePaths {
   readonly root: string;
   readonly runtime: string;
@@ -43,6 +46,8 @@ export interface TestWorkspace {
   readonly env: Readonly<Record<string, string>>;
   /** Alias for callers that prefer the longer name. */
   readonly environment: Readonly<Record<string, string>>;
+  /** Registers a hook that MUST release child resources before workspace removal. */
+  readonly registerBeforeCleanup: (hook: WorkspaceCleanupHook) => () => void;
   /** Idempotently removes the complete workspace with bounded retries. */
   readonly cleanup: () => Promise<void>;
 }
@@ -73,10 +78,17 @@ export async function createTestWorkspace(
     await mkdir(runtimePath);
     await mkdir(roomPath);
   } catch (error) {
-    await removeTestWorkspace(rootPath, {
-      retries: options.cleanupRetries,
-      retryDelayMs: options.cleanupRetryDelayMs,
-    }).catch(() => undefined);
+    try {
+      await removeTestWorkspace(rootPath, {
+        retries: options.cleanupRetries,
+        retryDelayMs: options.cleanupRetryDelayMs,
+      });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `Unable to create test workspace "${rootPath}" and clean up after the creation failure`,
+      );
+    }
     throw error;
   }
 
@@ -101,11 +113,52 @@ export async function createTestWorkspace(
   };
 
   let cleanupPromise: Promise<void> | undefined;
+  let cleanupStarted = false;
+  const cleanupHooks = new Set<WorkspaceCleanupHook>();
+  const registerBeforeCleanup = (hook: WorkspaceCleanupHook): (() => void) => {
+    if (typeof hook !== 'function') {
+      throw new TypeError('workspace cleanup hook must be a function');
+    }
+    if (cleanupStarted) {
+      throw new Error('Cannot register a workspace cleanup hook after cleanup has started');
+    }
+    cleanupHooks.add(hook);
+    return () => {
+      cleanupHooks.delete(hook);
+    };
+  };
+  const runCleanup = async (): Promise<void> => {
+    cleanupStarted = true;
+    const errors: unknown[] = [];
+    for (const hook of cleanupHooks) {
+      try {
+        await hook();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    cleanupHooks.clear();
+    try {
+      await removeTestWorkspace(rootPath, cleanupOptions);
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        `Unable to clean up test workspace "${rootPath}"; ${errors
+          .map((error) => (error instanceof Error ? error.message : String(error)))
+          .join('; ')}`,
+      );
+    }
+  };
   const cleanup = (): Promise<void> => {
-    cleanupPromise ??= removeTestWorkspace(rootPath, cleanupOptions);
+    cleanupPromise ??= runCleanup();
     return cleanupPromise;
   };
-
   return Object.freeze({
     id,
     rootPath,
@@ -116,6 +169,7 @@ export async function createTestWorkspace(
     paths,
     env,
     environment: env,
+    registerBeforeCleanup,
     cleanup,
   });
 }
@@ -162,7 +216,7 @@ export async function removeTestWorkspace(
 
 /**
  * Runs a callback with an isolated workspace and always attempts cleanup.
- * If both the callback and cleanup fail, the callback failure is preserved.
+ * If both the callback and cleanup fail, the returned AggregateError contains both failures.
  */
 export async function withTestWorkspace<T>(
   callback: (workspace: TestWorkspace) => T | Promise<T>,
@@ -188,6 +242,12 @@ export async function withTestWorkspace<T>(
     cleanupError = error;
   }
 
+  if (callbackFailed && cleanupFailed) {
+    throw new AggregateError(
+      [callbackError, cleanupError],
+      `Test workspace callback and cleanup failed for "${workspace.rootPath}"`,
+    );
+  }
   if (callbackFailed) {
     throw callbackError;
   }

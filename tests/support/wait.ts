@@ -8,11 +8,16 @@ export interface WaitForPredicateOptions {
   readonly pollIntervalMs?: number;
   /** Text included in timeout and abort messages. */
   readonly description?: string;
-  /** Cancels the wait before its deadline. */
+  /** Cancels the wait before its deadline; the predicate receives a separate signal. */
   readonly signal?: AbortSignal;
 }
 
 export type WaitPredicateResult<T> = T | false | null | undefined;
+/**
+ * A wait predicate MUST observe the supplied signal and stop its own asynchronous work
+ * promptly after cancellation. The wait rejects at its deadline or when its caller aborts,
+ * but JavaScript cannot forcibly cancel a predicate that ignores the signal.
+ */
 export type AsyncWaitPredicate<T> = (
   signal: AbortSignal,
 ) => WaitPredicateResult<T> | Promise<WaitPredicateResult<T>>;
@@ -61,7 +66,8 @@ export class WaitAbortedError extends Error {
  * The predicate is called immediately and then after each polling interval
  * until it returns a non-sentinel value. The signal is aborted when the
  * caller aborts or the deadline expires, and every timer/listener owned by
- * this helper is removed before it settles.
+ * this helper is removed before it settles. Predicate cancellation is cooperative: an
+ * ignored predicate may finish later, but this helper does not retain its polling or timers.
  */
 export async function waitForPredicate<T>(
   predicate: AsyncWaitPredicate<T>,

@@ -34,4 +34,35 @@ describe('test workspace support', () => {
       }),
     ).rejects.toBe(failure);
   });
+  it('awaits owner cleanup hooks before removing the workspace', async () => {
+    let workspaceExistedDuringCleanup = false;
+
+    await withTestWorkspace(async (workspace) => {
+      workspace.registerBeforeCleanup(async () => {
+        workspaceExistedDuringCleanup = await testWorkspaceExists(workspace.rootPath);
+      });
+    });
+
+    expect(workspaceExistedDuringCleanup).toBe(true);
+  });
+
+  it('preserves callback and cleanup failures together', async () => {
+    const callbackFailure = new Error('callback failed');
+    const cleanupFailure = new Error('child termination failed');
+
+    const result = withTestWorkspace(async (workspace) => {
+      workspace.registerBeforeCleanup(() => {
+        throw cleanupFailure;
+      });
+      throw callbackFailure;
+    });
+
+    await expect(result).rejects.toSatisfy((error: unknown) => {
+      return (
+        error instanceof AggregateError &&
+        error.errors[0] === callbackFailure &&
+        error.errors[1] === cleanupFailure
+      );
+    });
+  });
 });

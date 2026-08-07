@@ -1,4 +1,4 @@
-/* global process, clearInterval, setInterval */
+/* global Buffer, process, clearInterval, setInterval */
 /**
  * Standalone child-process lifecycle fixture.
  *
@@ -29,7 +29,10 @@ const lineEnding =
     ? '\r\n'
     : '\n';
 
+const MAX_COMMAND_LINE_BYTES = 64 * 1024;
 let input = '';
+let inputBytes = 0;
+let discardingOversizedLine = false;
 let state = 'running';
 let hangTimer;
 let currentLineEnding = lineEnding;
@@ -88,6 +91,9 @@ function shutdown(command = {}) {
   }
 
   state = 'shutting-down';
+  input = '';
+  inputBytes = 0;
+  discardingOversizedLine = false;
   stopHanging();
   process.stdin.pause();
   process.stdin.destroy();
@@ -142,6 +148,9 @@ function commandName(command) {
 }
 
 function handleCommand(command) {
+  if (state === 'shutting-down') {
+    return;
+  }
   if (command === null || typeof command !== 'object' || Array.isArray(command)) {
     emit('error', { error: 'command_must_be_an_object' });
     return;
@@ -175,19 +184,59 @@ function handleCommand(command) {
   }
 }
 
+function emitOversizedCommandLine() {
+  emit('error', {
+    error: 'command_line_too_large',
+    maxBytes: MAX_COMMAND_LINE_BYTES,
+  });
+}
+
 function onData(chunk) {
-  input += chunk.toString();
-
-  let newlineIndex = input.indexOf('\n');
-  while (newlineIndex !== -1) {
-    const line = input.slice(0, newlineIndex).replace(/\r$/, '');
-    input = input.slice(newlineIndex + 1);
-    newlineIndex = input.indexOf('\n');
-
+  if (state === 'shutting-down') {
+    return;
+  }
+  let offset = 0;
+  while (offset < chunk.length) {
+    if (state === 'shutting-down') {
+      return;
+    }
+    const newlineIndex = chunk.indexOf('\n', offset);
+    const hasNewline = newlineIndex !== -1;
+    const segmentEnd = hasNewline ? newlineIndex : chunk.length;
+    const segment = chunk.slice(offset, segmentEnd);
+    const lineSegment = segment.endsWith('\r') ? segment.slice(0, -1) : segment;
+    const segmentBytes = Buffer.byteLength(lineSegment, 'utf8');
+    if (discardingOversizedLine) {
+      if (!hasNewline) {
+        return;
+      }
+      discardingOversizedLine = false;
+      offset = newlineIndex + 1;
+      continue;
+    }
+    if (inputBytes + segmentBytes > MAX_COMMAND_LINE_BYTES) {
+      input = '';
+      inputBytes = 0;
+      emitOversizedCommandLine();
+      if (!hasNewline) {
+        discardingOversizedLine = true;
+        return;
+      }
+      offset = newlineIndex + 1;
+      continue;
+    }
+    if (!hasNewline) {
+      input += segment;
+      inputBytes = Buffer.byteLength(input, 'utf8') - (input.endsWith('\r') ? 1 : 0);
+      return;
+    }
+    const line = (input + lineSegment).replace(/\r$/, '');
+    input = '';
+    inputBytes = 0;
+    offset = newlineIndex + 1;
     if (line.trim() === '') {
       continue;
     }
-
     try {
       handleCommand(JSON.parse(line));
     } catch (error) {

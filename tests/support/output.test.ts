@@ -59,4 +59,33 @@ describe('bounded process output support', () => {
       expect(String(error)).toContain('ready');
     }
   });
+  it('checks line bounds before ignoring oversized whitespace lines', () => {
+    expect(() =>
+      parseJsonLines(`${' '.repeat(9)}\n`, {
+        maxLineBytes: 8,
+        identity: 'whitespace-fixture',
+      }),
+    ).toThrowError(/line exceeds 8 bytes/);
+  });
+
+  it('processes large input chunks in bounded parser slices', () => {
+    const parser = new JsonLinesParser<{ value: number }>({ maxChunkBytes: 4 });
+
+    expect(parser.push('{"value":1}\n{"value":2}\n')).toEqual([{ value: 1 }, { value: 2 }]);
+    const unicodeParser = new JsonLinesParser<{ value: string }>({ maxChunkBytes: 1 });
+    expect(unicodeParser.push('{"value":"😀"}\n')).toEqual([{ value: '😀' }]);
+  });
+
+  it('retains only a bounded prefix of an oversized multibyte output chunk', () => {
+    const output = new BoundedOutput({ maxStdoutBytes: 4 });
+
+    output.appendStdout('😀😀');
+
+    expect(output.snapshot()).toMatchObject({
+      stdout: '😀',
+      stdoutTotalBytes: 8,
+      stdoutRetainedBytes: 4,
+      stdoutTruncated: true,
+    });
+  });
 });

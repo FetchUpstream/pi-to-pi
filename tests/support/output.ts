@@ -2,6 +2,7 @@ import { StringDecoder } from 'node:string_decoder';
 
 export const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 export const DEFAULT_MAX_JSON_LINE_BYTES = 64 * 1024;
+export const DEFAULT_MAX_JSON_CHUNK_BYTES = 64 * 1024;
 
 export type OutputStream = 'stdout' | 'stderr';
 export type ProcessIdentity =
@@ -183,6 +184,8 @@ export function formatProcessDiagnostics(diagnostics: ProcessDiagnostics = {}): 
 
 export interface JsonLinesParserOptions<T> {
   readonly maxLineBytes?: number;
+  /** Maximum bytes processed from one input chunk at a time. */
+  readonly maxChunkBytes?: number;
   readonly identity?: ProcessIdentity;
   /** A snapshot captured at parser construction time. */
   readonly output?: CapturedOutput;
@@ -231,6 +234,7 @@ export class JsonLinesParseError extends Error {
 /** Incrementally parses JSON values from newline-delimited input. */
 export class JsonLinesParser<T = unknown> {
   readonly maxLineBytes: number;
+  readonly maxChunkBytes: number;
 
   private readonly decoder = new StringDecoder('utf8');
   private readonly identity?: ProcessIdentity;
@@ -246,6 +250,10 @@ export class JsonLinesParser<T = unknown> {
       options.maxLineBytes ?? DEFAULT_MAX_JSON_LINE_BYTES,
       'max JSON line bytes',
     );
+    this.maxChunkBytes = validatePositiveMaxBytes(
+      options.maxChunkBytes ?? DEFAULT_MAX_JSON_CHUNK_BYTES,
+      'max JSON chunk bytes',
+    );
     this.identity = options.identity;
     this.output = options.output;
     this.getOutput = options.getOutput;
@@ -255,7 +263,24 @@ export class JsonLinesParser<T = unknown> {
   /** Feeds a chunk and returns every complete event found in that chunk. */
   push(chunk: Uint8Array | string): T[] {
     this.assertOpen();
-    return this.consume(this.decoder.write(toBuffer(chunk)));
+    const events: T[] = [];
+    if (typeof chunk === 'string') {
+      let offset = 0;
+      while (offset < chunk.length) {
+        const end = nextStringChunkEnd(chunk, offset, this.maxChunkBytes);
+        events.push(
+          ...this.consume(this.decoder.write(Buffer.from(chunk.slice(offset, end), 'utf8'))),
+        );
+        offset = end;
+      }
+      return events;
+    }
+
+    for (let offset = 0; offset < chunk.byteLength; offset += this.maxChunkBytes) {
+      const end = Math.min(offset + this.maxChunkBytes, chunk.byteLength);
+      events.push(...this.consume(this.decoder.write(chunk.subarray(offset, end))));
+    }
+    return events;
   }
 
   /**
@@ -268,7 +293,7 @@ export class JsonLinesParser<T = unknown> {
     }
     this.ended = true;
     const events = this.consume(this.decoder.end());
-    if (this.pending.trim() !== '') {
+    if (this.pending !== '') {
       const parsed = this.parseLine(this.pending);
       if (parsed !== EMPTY_LINE) {
         events.push(parsed);
@@ -299,9 +324,6 @@ export class JsonLinesParser<T = unknown> {
 
   private parseLine(line: string): T | typeof EMPTY_LINE {
     this.lineNumber += 1;
-    if (line.trim() === '') {
-      return EMPTY_LINE;
-    }
     if (Buffer.byteLength(line, 'utf8') > this.maxLineBytes) {
       throw new JsonLinesParseError({
         cause: new Error(`line exceeds ${this.maxLineBytes} bytes`),
@@ -310,6 +332,9 @@ export class JsonLinesParser<T = unknown> {
         lineNumber: this.lineNumber,
         output: this.getOutput?.() ?? this.output,
       });
+    }
+    if (line.trim() === '') {
+      return EMPTY_LINE;
     }
 
     try {
@@ -373,20 +398,25 @@ class BoundedStream {
   }
 
   append(chunk: Uint8Array | string): void {
-    const bytes = toBuffer(chunk, this.encoding);
-    this.observedByteCount += bytes.byteLength;
+    const chunkBytes = getChunkByteLength(chunk, this.encoding);
+    this.observedByteCount += chunkBytes;
     const remaining = this.maxBytes - this.retainedByteCount;
     if (remaining <= 0) {
-      if (bytes.byteLength > 0) {
+      if (chunkBytes > 0) {
         this.didTruncate = true;
       }
       return;
     }
 
-    const retainedBytes = Math.min(remaining, bytes.byteLength);
-    bytes.copy(this.buffer, this.retainedByteCount, 0, retainedBytes);
+    const retainedBytes = copyChunkPrefix(
+      this.buffer,
+      this.retainedByteCount,
+      chunk,
+      remaining,
+      this.encoding,
+    );
     this.retainedByteCount += retainedBytes;
-    if (retainedBytes < bytes.byteLength) {
+    if (retainedBytes < chunkBytes) {
       this.didTruncate = true;
     }
   }
@@ -421,8 +451,85 @@ function validateMaxBytes(value: number, label: string): number {
   return value;
 }
 
-function toBuffer(chunk: Uint8Array | string, encoding: BufferEncoding = 'utf8'): Buffer {
-  return typeof chunk === 'string' ? Buffer.from(chunk, encoding) : Buffer.from(chunk);
+function validatePositiveMaxBytes(value: number, label: string): number {
+  const validated = validateMaxBytes(value, label);
+  if (validated === 0) {
+    throw new RangeError(`${label} must be greater than zero; received ${value}`);
+  }
+  return validated;
+}
+
+function nextStringChunkEnd(value: string, offset: number, maxBytes: number): number {
+  let low = 0;
+  let high = value.length - offset;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(offset, offset + middle), 'utf8') <= maxBytes) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  let end = offset + low;
+  if (end < value.length && end > offset) {
+    const previous = value.charCodeAt(end - 1);
+    const next = value.charCodeAt(end);
+    if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+      end -= 1;
+    }
+  }
+  if (end !== offset) {
+    return end;
+  }
+  const first = value.charCodeAt(offset);
+  const second = value.charCodeAt(offset + 1);
+  if (first >= 0xd800 && first <= 0xdbff && second >= 0xdc00 && second <= 0xdfff) {
+    return Math.min(offset + 2, value.length);
+  }
+  return Math.min(offset + 1, value.length);
+}
+
+function getChunkByteLength(chunk: Uint8Array | string, encoding: BufferEncoding): number {
+  return typeof chunk === 'string' ? Buffer.byteLength(chunk, encoding) : chunk.byteLength;
+}
+
+function copyChunkPrefix(
+  target: Buffer,
+  offset: number,
+  chunk: Uint8Array | string,
+  maxBytes: number,
+  encoding: BufferEncoding,
+): number {
+  if (typeof chunk !== 'string') {
+    const retainedBytes = Math.min(maxBytes, chunk.byteLength);
+    target.set(chunk.subarray(0, retainedBytes), offset);
+    return retainedBytes;
+  }
+
+  const prefix = encodeStringPrefix(chunk, maxBytes, encoding);
+  prefix.copy(target, offset);
+  return prefix.byteLength;
+}
+
+function encodeStringPrefix(value: string, maxBytes: number, encoding: BufferEncoding): Buffer {
+  if (maxBytes === 0 || value.length === 0) {
+    return Buffer.alloc(0);
+  }
+  if (Buffer.byteLength(value, encoding) <= maxBytes) {
+    return Buffer.from(value, encoding);
+  }
+
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(0, middle), encoding) <= maxBytes) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return low === 0 ? Buffer.alloc(0) : Buffer.from(value.slice(0, low), encoding);
 }
 
 function formatCapturedOutput(output: CapturedOutput): string[] {
