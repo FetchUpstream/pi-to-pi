@@ -1,7 +1,9 @@
 import { promises as fs } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import type { Socket } from 'node:net';
 
 import { describe, expect, it } from 'vitest';
 
@@ -19,6 +21,22 @@ import { RawNetTransport, removeStalePosixEndpoint } from './raw-net.js';
 const CHILD_SCRIPT = fileURLToPath(new URL('./raw-net-child.mjs', import.meta.url));
 const PROCESS_TIMEOUT_MS = 3_000;
 
+class BareCloseSocket extends EventEmitter {
+  destroyed = false;
+
+  constructor() {
+    super();
+    queueMicrotask(() => this.emit('close', false));
+  }
+
+  destroy(): this {
+    if (!this.destroyed) {
+      this.destroyed = true;
+      this.emit('close', false);
+    }
+    return this;
+  }
+}
 async function endpointExists(endpoint: string): Promise<boolean> {
   try {
     await fs.lstat(endpoint);
@@ -151,6 +169,67 @@ describe('raw node:net process lifecycle evidence', () => {
               // Cleanup must not hide the test failure or remove a replacement.
             }
           }
+        }
+      }
+    },
+    PROCESS_TIMEOUT_MS * 2,
+  );
+  it(
+    'does not unlink an endpoint after an inconclusive bare-close probe',
+    async () => {
+      if (process.platform === 'win32') {
+        expect({
+          platform: process.platform,
+          limitation: 'POSIX probe-state behavior requires a Linux or macOS runner',
+        }).toEqual({
+          platform: process.platform,
+          limitation: 'POSIX probe-state behavior requires a Linux or macOS runner',
+        });
+        return;
+      }
+      const endpoint = createIpcEndpoint();
+      let child: ChildProcess | undefined;
+      let diagnostics: ReturnType<typeof captureChildDiagnostics> | undefined;
+
+      try {
+        child = spawn(process.execPath, [CHILD_SCRIPT, endpoint], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        diagnostics = captureChildDiagnostics(child);
+        const runningChild = child;
+        const runningDiagnostics = diagnostics;
+
+        try {
+          await waitForReady(runningChild);
+        } catch (error: unknown) {
+          throw diagnosticError(error, runningDiagnostics.snapshot());
+        }
+        expect(await endpointExists(endpoint)).toBe(true);
+
+        runningChild.kill('SIGKILL');
+        const exit = await waitForChildExit(
+          runningChild,
+          createPhaseDeadline('inconclusive-probe-child-exit', PROCESS_TIMEOUT_MS),
+        );
+        expect(exit.signal).toBe('SIGKILL');
+        expect(await endpointExists(endpoint)).toBe(true);
+
+        await expect(
+          removeStalePosixEndpoint(endpoint, 500, () => new BareCloseSocket() as unknown as Socket),
+        ).resolves.toBe(false);
+        expect(await endpointExists(endpoint)).toBe(true);
+
+        await expect(removeStalePosixEndpoint(endpoint, 500)).resolves.toBe(true);
+        expect(await endpointExists(endpoint)).toBe(false);
+      } finally {
+        diagnostics?.dispose();
+        if (child !== undefined) {
+          await stopChild(child);
+        }
+        try {
+          await removeStalePosixEndpoint(endpoint, 500);
+        } catch {
+          // Cleanup must not hide the test failure or remove a replacement.
         }
       }
     },

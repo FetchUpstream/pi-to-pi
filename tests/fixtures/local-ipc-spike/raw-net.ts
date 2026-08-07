@@ -815,36 +815,48 @@ function readResponse(
   });
 }
 
-async function probePosixEndpoint(endpoint: string, timeoutMs: number): Promise<'live' | 'stale'> {
-  const socket = createConnection(endpoint);
+type PosixEndpointProbeState = 'live' | 'stale' | 'inconclusive';
+
+/**
+ * Probe one POSIX endpoint without authorizing cleanup on an ambiguous result.
+ * A refused or missing endpoint is definitive stale evidence; a successful
+ * connection is an active listener. Other errors and close-before-connect are
+ * inconclusive because neither state proves that the endpoint has no listener.
+ */
+async function probePosixEndpoint(
+  endpoint: string,
+  timeoutMs: number,
+  socketFactory: RawNetSocketFactory = (candidateEndpoint) => createConnection(candidateEndpoint),
+): Promise<PosixEndpointProbeState> {
+  const socket = socketFactory(endpoint);
   try {
     const deadline = createPhaseDeadline('stale-probe', timeoutMs);
-    const connected = await withDeadline(
+    return await withDeadline(
       () =>
-        new Promise<boolean>((resolve, reject) => {
+        new Promise<PosixEndpointProbeState>((resolve) => {
           let settled = false;
           const cleanup = (): void => {
             socket.off('connect', onConnect);
             socket.off('error', onError);
             socket.off('close', onClose);
           };
-          const settle = (callback: () => void): void => {
+          const settle = (state: PosixEndpointProbeState): void => {
             if (settled) {
               return;
             }
             settled = true;
             cleanup();
-            callback();
+            resolve(state);
           };
-          const onConnect = (): void => settle(() => resolve(true));
+          const onConnect = (): void => settle('live');
           const onError = (error: Error): void => {
             if (isRefusedOrMissing(error)) {
-              settle(() => resolve(false));
+              settle('stale');
             } else {
-              settle(() => reject(error));
+              settle('inconclusive');
             }
           };
-          const onClose = (): void => settle(() => resolve(false));
+          const onClose = (): void => settle('inconclusive');
 
           socket.once('connect', onConnect);
           socket.once('error', onError);
@@ -853,7 +865,6 @@ async function probePosixEndpoint(endpoint: string, timeoutMs: number): Promise<
       deadline,
       { onTimeout: () => destroySocket(socket) },
     );
-    return connected ? 'live' : 'stale';
   } finally {
     destroySocket(socket);
   }
@@ -892,6 +903,8 @@ function isGeneratedPosixEndpoint(endpoint: string): boolean {
 export async function removeStalePosixEndpoint(
   endpoint: string,
   timeoutMs = DEFAULT_RAW_NET_STALE_PROBE_TIMEOUT_MS,
+  /** Test-only seam for deterministic probe-state coverage. */
+  socketFactory: RawNetSocketFactory = (candidateEndpoint) => createConnection(candidateEndpoint),
 ): Promise<boolean> {
   if (!isPosixRuntime()) {
     return false;
@@ -908,11 +921,16 @@ export async function removeStalePosixEndpoint(
     return false;
   }
 
-  const state = await withDeadline(probePosixEndpoint(endpoint, remainingMs(deadline)), deadline);
+  const state = await withDeadline(
+    probePosixEndpoint(endpoint, remainingMs(deadline), socketFactory),
+    deadline,
+  );
   if (state === 'live') {
     throw new RawNetError('endpoint-in-use', `A live listener owns endpoint ${endpoint}`);
   }
-
+  if (state !== 'stale') {
+    return false;
+  }
   return await unlinkOwnedSocket(endpoint, observed, deadline);
 }
 
