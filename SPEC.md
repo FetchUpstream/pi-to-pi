@@ -1,14 +1,16 @@
-# Exploration result
+# Exploration and v1 boundary
 
-The new Pi-to-Pi should be designed as a **small, reliable peer-messaging substrate for independent Pi sessions**.
+This document records the architectural exploration that motivated Pi-to-Pi v1. The normative, implemented wire contract is [`openspec/changes/define-pi-to-pi-v1-protocol/specs/pi-to-pi-v1-protocol/spec.md`](openspec/changes/define-pi-to-pi-v1-protocol/specs/pi-to-pi-v1-protocol/spec.md).
+
+The v1 implementation is a **small, reliable peer-messaging substrate for independent Pi sessions**. It defines explicit operation/request correlation, typed content, peer discovery, task lifecycle, cancellation, expiry, bounded admission, authentication and runtime-scoped deduplication. Transport framing remains outside the protocol; adapters carry envelopes and operation responses without changing their semantics.
 
 It should not become an orchestrator, task scheduler, subagent framework, worktree manager, or local Slack replacement. Those systems may use Pi-to-Pi, but they should sit above it.
 
 The central abstraction is:
 
-> One running Pi session can discover another running Pi session, send it a correlated request, and receive a correlated reply without either session being the parent of the other.
+ > One running Pi session can discover another running Pi session, send it a correlated request, and receive a correlated reply without either session being the parent of the other.
 
-No application code or OpenSpec artifacts were created during this exploration.
+The historical exploration below is retained as design context; it is not a statement that the current protocol modules are unimplemented.
 
 ---
 

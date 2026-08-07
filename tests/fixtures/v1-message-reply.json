@@ -1,0 +1,23 @@
+{
+  "protocolVersion": "1.0",
+  "operation": "message.reply",
+  "operationId": "2e7a11d9-aaf9-4b42-b46b-39d16f6a5f06",
+  "requestId": "8b6f4f7e-1fc4-4c4e-8e4c-5a3c7427c4d1",
+  "sender": {
+    "sessionId": "session-b",
+    "runtimeId": "runtime-b"
+  },
+  "recipientRuntimeId": "runtime-a",
+  "roomId": "r1-11111111111111111111111111111111",
+  "createdAt": "2026-08-07T10:02:00.000Z",
+  "expiresAt": "2026-08-07T10:10:00.000Z",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "parentOperationId": "8b6f4f7e-1fc4-4c4e-8e4c-5a3c7427c4d1",
+  "payload": {
+    "outcome": "completed",
+    "content": {
+      "type": "text",
+      "text": "Reviewed successfully."
+    }
+  }
+}

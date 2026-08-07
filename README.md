@@ -3,9 +3,15 @@
 Pi-to-Pi is an independent community extension for direct communication between
 independent [Pi](https://github.com/earendil-works/pi) sessions.
 
-This repository contains the package and test foundation for the project. Peer
-messaging, discovery, transport, and orchestration are intentionally not
-implemented yet.
+This repository implements the transport-independent Pi-to-Pi v1 protocol: explicit request/reply correlation, notifications, peer discovery, bounded admission, task status/cancellation, expiry, authentication and runtime-scoped deduplication.
+
+The protocol core is implemented under `src/protocol/`, routing under `src/router/`, and Pi lifecycle/tool integration under `src/pi/`. Transport adapters carry typed envelopes and operation responses but do not choose a framing protocol.
+
+## Protocol reference
+
+The normative contract is [`openspec/changes/define-pi-to-pi-v1-protocol/specs/pi-to-pi-v1-protocol/spec.md`](openspec/changes/define-pi-to-pi-v1-protocol/specs/pi-to-pi-v1-protocol/spec.md). It defines `peer.describe`, `message.request`, `message.reply`, `message.notify`, `task.status`, and `task.cancel`. Wire examples are in [`tests/fixtures/`](tests/fixtures/).
+
+The v1 boundary does not provide offline delivery, runtime task handoff, streaming, attachments, or a broker. A transport binding is responsible for endpoint delivery and authentication metadata; application credentials are not protocol content.
 
 ## Install
 
@@ -14,9 +20,6 @@ The package can be installed as a Pi package from this repository:
 ```bash
 pi install git:github.com/FetchUpstream/pi-to-pi
 ```
-
-The current scaffold only verifies that the extension can load and participate
-in Pi's session lifecycle without starting background resources.
 
 ## Attribution and independence
 

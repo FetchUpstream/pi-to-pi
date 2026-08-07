@@ -16,3 +16,18 @@ export default function registerPiToPi(pi: ExtensionAPI): void {
     // Future session-scoped resources will be closed here.
   });
 }
+
+export {
+  MessageRouter,
+  Router,
+  createRouter,
+  type RouterOptions,
+  type RouterRequestInput,
+} from './router/router.js';
+export { RuntimePersistence, createRuntimePersistence } from './pi/persistence.js';
+export { PiLifecycleBridge, createPiLifecycle, createPiRuntime } from './pi/lifecycle.js';
+export { PiTools, createPiTools, registerPiTools } from './pi/tools.js';
+export * from './protocol/messages.js';
+export * from './protocol/errors.js';
+export * from './protocol/task-state.js';
+export * from './protocol/validation.js';
