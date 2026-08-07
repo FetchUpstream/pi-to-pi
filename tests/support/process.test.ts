@@ -5,10 +5,11 @@ import {
   createManagedProcessGroup,
   LIFECYCLE_FIXTURE_PATH,
   ManagedProcessClosedError,
+  ManagedProcessCommandError,
   ManagedProcessCommandTimeoutError,
   ManagedProcessTimeoutError,
 } from './process.js';
-import { testWorkspaceExists, withTestWorkspace } from './workspace.js';
+import { createTestWorkspace, testWorkspaceExists, withTestWorkspace } from './workspace.js';
 
 describe('managed process support', () => {
   it('starts a fixture, exchanges JSON-lines commands, and observes close diagnostics', async () => {
@@ -172,6 +173,58 @@ describe('managed process support', () => {
         await managed.cleanup();
       }
     });
+  });
+
+  it('reports stdin write callback errors with identity and diagnostics', async () => {
+    await withTestWorkspace(async (workspace) => {
+      const managed = createManagedProcess({ label: 'callback failure fixture', workspace });
+      const callbackFailure = new Error('write callback failed');
+      try {
+        await managed.waitForReady();
+        const initialErrorListeners = managed.stdin.listenerCount('error');
+        const write = vi.spyOn(managed.stdin, 'write').mockImplementation((...args: unknown[]) => {
+          const callback = args.at(-1) as (error?: Error | null) => void;
+          queueMicrotask(() => callback(callbackFailure));
+          return true;
+        });
+
+        await expect(managed.sendCommand({ command: 'hang' })).rejects.toSatisfy(
+          (error: unknown) =>
+            error instanceof ManagedProcessCommandError &&
+            error.cause === callbackFailure &&
+            error.identity !== undefined &&
+            error.diagnostics.output !== undefined,
+        );
+        expect(managed.stdin.listenerCount('error')).toBe(initialErrorListeners);
+        expect(managed.stdin.listenerCount('close')).toBe(0);
+        write.mockRestore();
+      } finally {
+        await managed.cleanup();
+      }
+    });
+  });
+
+  it('keeps a directly managed child owned when workspace cleanup starts immediately', async () => {
+    const workspace = await createTestWorkspace();
+    const managed = createManagedProcess({ workspace });
+
+    const cleanup = workspace.cleanup();
+    await cleanup;
+
+    expect(managed.state).toBe('closed');
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(false);
+  });
+
+  it('does not spawn when workspace ownership registration fails', () => {
+    const registrationFailure = new Error('registration rejected');
+    const workspace = {
+      env: {},
+      registerBeforeCleanup: () => {
+        throw registrationFailure;
+      },
+    };
+
+    expect(() => createManagedProcess({ workspace })).toThrow(registrationFailure);
   });
 
   it('rejects process additions after group teardown and cleans the late child', async () => {

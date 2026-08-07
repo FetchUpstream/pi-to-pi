@@ -60,6 +60,7 @@ export {
   ManagedChildProcess,
   ManagedProcess,
   ManagedProcessClosedError,
+  ManagedProcessCommandError,
   ManagedProcessCommandTimeoutError,
   ManagedProcessGroup,
   ManagedProcessSpawnError,

@@ -189,6 +189,28 @@ export class ManagedProcessCommandTimeoutError extends Error {
   }
 }
 
+export class ManagedProcessCommandError extends Error {
+  readonly code = 'ERR_MANAGED_PROCESS_COMMAND';
+  readonly identity: ProcessIdentity;
+  readonly diagnostics: ProcessDiagnostics;
+
+  constructor(options: {
+    readonly identity: ProcessIdentity;
+    readonly diagnostics: ProcessDiagnostics;
+    readonly cause: unknown;
+  }) {
+    super(
+      `Unable to send a command to ${formatIdentity(options.identity)}.\n${formatProcessDiagnostics(
+        options.diagnostics,
+      )}`,
+      { cause: options.cause },
+    );
+    this.name = 'ManagedProcessCommandError';
+    this.identity = options.identity;
+    this.diagnostics = options.diagnostics;
+  }
+}
+
 interface EventWaiter<TEvent> {
   readonly predicate: (event: TEvent) => boolean;
   readonly resolve: (event: TEvent) => void;
@@ -298,40 +320,41 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       'maximum managed process events',
     );
     this.outputBuffer = new BoundedOutput(options.output);
-
-    const env = { ...process.env, ...options.workspace?.env, ...options.env };
-    this.child = spawn(process.execPath, [this.fixturePath, ...this.args], {
-      cwd: options.cwd,
-      env,
-      shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
+    const parserIdentity: { label: string; pid?: number } = { label: this.label };
     this.eventParser = new JsonLinesParser<TEvent>({
       getOutput: () => this.output,
-      identity: this.identity,
+      identity: parserIdentity,
     });
-
     this.exitPromise = new Promise<ManagedProcessExit>((resolve) => {
       this.resolveExit = resolve;
     });
     this.closePromise = new Promise<ManagedProcessExit>((resolve) => {
       this.resolveClose = resolve;
     });
+    const env = { ...process.env, ...options.workspace?.env, ...options.env };
 
-    this.attachListeners();
+    // Reserve workspace ownership before spawning. Because construction is synchronous,
+    // cleanup can now observe either this hook or no child at all, never a live unowned child.
     if (options.workspace) {
-      try {
-        this.workspaceUnregister = options.workspace.registerBeforeCleanup(() =>
-          this.cleanup().then(() => undefined),
-        );
-      } catch (error) {
-        // Registration is the ownership hand-off. If it fails, terminate the child
-        // immediately rather than returning an unowned process to the caller.
-        void this.cleanup().catch(() => undefined);
-        throw error;
-      }
+      this.workspaceUnregister = options.workspace.registerBeforeCleanup(() =>
+        this.cleanup().then(() => undefined),
+      );
     }
+
+    try {
+      this.child = spawn(process.execPath, [this.fixturePath, ...this.args], {
+        cwd: options.cwd,
+        env,
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      this.workspaceUnregister?.();
+      this.workspaceUnregister = undefined;
+      throw error;
+    }
+    parserIdentity.pid = this.child.pid;
+    this.attachListeners();
   }
 
   /** The child process id, when Node assigned one. */
@@ -574,12 +597,7 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       };
       const pending: PendingCommandWrite = { cancel: (error) => finish(error) };
       const onError = (error: unknown): void => {
-        finish(
-          new Error(
-            `Unable to send a command to ${formatIdentity(this.identity)}.\n${this.formatDiagnostics()}`,
-            { cause: error },
-          ),
-        );
+        finish(this.createCommandError(error));
       };
       const onClose = (): void => {
         finish(
@@ -613,9 +631,11 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
         return;
       }
       try {
-        this.child.stdin.write(line, 'utf8', () => finish());
+        this.child.stdin.write(line, 'utf8', (error) =>
+          finish(error == null ? undefined : this.createCommandError(error)),
+        );
       } catch (error) {
-        finish(error);
+        finish(this.createCommandError(error));
       }
     });
   }
@@ -876,15 +896,16 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       return this.closeResult;
     }
 
+    const deadline = Date.now() + timeoutMs;
     const pid = this.child.pid;
     if (pid !== undefined && this.child.exitCode === null && this.child.signalCode === null) {
       if (process.platform === 'win32') {
         try {
-          await terminateWindowsProcessTree(pid, timeoutMs);
+          await terminateWindowsProcessTree(pid, remainingTime(deadline));
         } catch (error) {
           if (isAlreadyClosedTerminationError(error)) {
             try {
-              return await this.waitForCloseWithin(timeoutMs);
+              return await this.waitForCloseWithin(remainingTime(deadline));
             } catch (closeError) {
               throw new AggregateError(
                 [error, closeError],
@@ -896,7 +917,7 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
           // best-effort fallback to prevent a live child leak and never replaces the error.
           const fallbackError = this.tryDirectKill();
           try {
-            await this.waitForCloseWithin(timeoutMs);
+            await this.waitForCloseWithin(remainingTime(deadline));
           } catch (closeError) {
             const errors = [error];
             if (fallbackError !== undefined) {
@@ -927,7 +948,7 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       }
     }
 
-    return this.waitForCloseWithin(timeoutMs);
+    return this.waitForCloseWithin(remainingTime(deadline));
   }
 
   private tryDirectKill(): unknown {
@@ -1017,6 +1038,14 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
       diagnostics: this.getDiagnostics(),
       identity: this.identity,
       spawnError: this.processError,
+    });
+  }
+
+  private createCommandError(cause: unknown): ManagedProcessCommandError {
+    return new ManagedProcessCommandError({
+      cause,
+      diagnostics: this.getDiagnostics(),
+      identity: this.identity,
     });
   }
 }
@@ -1141,6 +1170,10 @@ function validateDuration(value: number, label: string): number {
   return value;
 }
 
+function remainingTime(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
 function validateNonNegativeInteger(value: number, label: string): number {
   if (!Number.isInteger(value) || value < 0) {
     throw new RangeError(`${label} must be a non-negative integer; received ${value}`);
@@ -1195,9 +1228,13 @@ function isAlreadyClosedTerminationError(error: unknown): boolean {
   return error instanceof WindowsProcessTreeTerminationError && error.alreadyClosed;
 }
 
-function terminateWindowsProcessTree(pid: number, timeoutMs: number): Promise<void> {
+export function terminateWindowsProcessTree(
+  pid: number,
+  timeoutMs: number,
+  spawnCommand: typeof spawn = spawn,
+): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const taskkill = spawn('taskkill', ['/F', '/T', '/PID', String(pid)], {
+    const taskkill = spawnCommand('taskkill', ['/F', '/T', '/PID', String(pid)], {
       shell: false,
       stdio: ['ignore', 'ignore', 'ignore'],
       windowsHide: true,
@@ -1212,23 +1249,10 @@ function terminateWindowsProcessTree(pid: number, timeoutMs: number): Promise<vo
       taskkill.removeListener('close', onClose);
     };
     const stopCommand = (): void => {
-      const onLateError = (): void => {
-        taskkill.removeListener('error', onLateError);
-        taskkill.removeListener('close', onLateClose);
-      };
-      const onLateClose = (): void => {
-        taskkill.removeListener('error', onLateError);
-        taskkill.removeListener('close', onLateClose);
-      };
-      taskkill.once('error', onLateError);
-      taskkill.once('close', onLateClose);
       try {
-        const killed = taskkill.kill();
-        if (!killed || taskkill.exitCode !== null || taskkill.signalCode !== null) {
-          onLateClose();
-        }
+        taskkill.kill();
       } catch {
-        onLateClose();
+        // The timeout error remains authoritative when the command already exited.
       }
       taskkill.unref();
     };
