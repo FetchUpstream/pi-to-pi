@@ -55,7 +55,7 @@ function hasControlCharacter(value: string): boolean {
   return false;
 }
 const RUNTIME_RECORD_FILE_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/iu;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/u;
 const MAX_ENDPOINT_LENGTH = 4096;
 
 export type RegistryClock = LeaseClock;
@@ -308,40 +308,62 @@ function validateRecordFields(
   let sessionId: SessionId;
   let roomId: RoomId;
   let networkName: NormalizedName;
+  let endpoint = '';
   let leaseExpiresAt: number;
-  try {
-    runtimeId = asRuntimeId(String(value.runtimeId));
-  } catch {
-    errors.push({ field: 'runtimeId', message: 'must be a full UUID' });
+
+  if (typeof value.runtimeId !== 'string') {
+    errors.push({ field: 'runtimeId', message: 'must be a canonical lowercase full UUID' });
     runtimeId = '' as RuntimeId;
+  } else {
+    try {
+      runtimeId = asRuntimeId(value.runtimeId);
+    } catch {
+      errors.push({ field: 'runtimeId', message: 'must be a canonical lowercase full UUID' });
+      runtimeId = '' as RuntimeId;
+    }
   }
-  try {
-    sessionId = asSessionId(String(value.sessionId));
-  } catch {
+
+  if (typeof value.sessionId !== 'string') {
     errors.push({ field: 'sessionId', message: 'must be non-empty text without controls' });
     sessionId = '' as SessionId;
+  } else {
+    try {
+      sessionId = asSessionId(value.sessionId);
+    } catch {
+      errors.push({ field: 'sessionId', message: 'must be non-empty text without controls' });
+      sessionId = '' as SessionId;
+    }
   }
-  try {
-    roomId = asRoomId(String(value.roomId));
-  } catch {
+
+  if (typeof value.roomId !== 'string') {
     errors.push({ field: 'roomId', message: 'must be an opaque versioned room ID' });
     roomId = '' as RoomId;
-  }
-  try {
-    const rawName = String(value.networkName);
-    networkName = asNormalizedName(rawName);
-    if (networkName !== rawName) {
-      errors.push({ field: 'networkName', message: 'must already be normalized' });
+  } else {
+    try {
+      roomId = asRoomId(value.roomId);
+    } catch {
+      errors.push({ field: 'roomId', message: 'must be an opaque versioned room ID' });
+      roomId = '' as RoomId;
     }
-  } catch {
+  }
+
+  if (typeof value.networkName !== 'string') {
     errors.push({ field: 'networkName', message: 'must be a non-empty normalized name' });
     networkName = '' as NormalizedName;
-  }
-  try {
-    const endpoint = assertText(value.endpoint, 'endpoint', MAX_ENDPOINT_LENGTH);
-    if (endpoint.length === 0) {
-      errors.push({ field: 'endpoint', message: 'must not be empty' });
+  } else {
+    try {
+      networkName = asNormalizedName(value.networkName);
+      if (networkName !== value.networkName) {
+        errors.push({ field: 'networkName', message: 'must already be normalized' });
+      }
+    } catch {
+      errors.push({ field: 'networkName', message: 'must be a non-empty normalized name' });
+      networkName = '' as NormalizedName;
     }
+  }
+
+  try {
+    endpoint = assertText(value.endpoint, 'endpoint', MAX_ENDPOINT_LENGTH);
   } catch (error) {
     if (error instanceof RuntimeRecordValidationError) {
       errors.push(...error.errors);
@@ -349,27 +371,29 @@ function validateRecordFields(
       errors.push({ field: 'endpoint', message: 'must be valid endpoint text' });
     }
   }
-  try {
-    leaseExpiresAt = timestamp(value.leaseExpiresAt as LeaseExpiryInput, 'leaseExpiresAt');
-  } catch (error) {
-    errors.push(
-      ...(error instanceof RuntimeRecordValidationError
-        ? error.errors
-        : [{ field: 'leaseExpiresAt', message: 'must be a finite timestamp' }]),
-    );
+
+  if (typeof value.leaseExpiresAt !== 'number') {
+    errors.push({ field: 'leaseExpiresAt', message: 'must be a finite timestamp number' });
     leaseExpiresAt = 0;
+  } else {
+    try {
+      leaseExpiresAt = timestamp(value.leaseExpiresAt, 'leaseExpiresAt');
+    } catch (error) {
+      errors.push(
+        ...(error instanceof RuntimeRecordValidationError
+          ? error.errors
+          : [{ field: 'leaseExpiresAt', message: 'must be a finite timestamp' }]),
+      );
+      leaseExpiresAt = 0;
+    }
   }
 
   const expectedRuntimeId =
-    options.expectedRuntimeId === undefined
-      ? undefined
-      : asRuntimeId(String(options.expectedRuntimeId));
+    options.expectedRuntimeId === undefined ? undefined : asRuntimeId(options.expectedRuntimeId);
   const expectedSessionId =
-    options.expectedSessionId === undefined
-      ? undefined
-      : asSessionId(String(options.expectedSessionId));
+    options.expectedSessionId === undefined ? undefined : asSessionId(options.expectedSessionId);
   const expectedRoomId =
-    options.expectedRoomId === undefined ? undefined : asRoomId(String(options.expectedRoomId));
+    options.expectedRoomId === undefined ? undefined : asRoomId(options.expectedRoomId);
   if (expectedRuntimeId !== undefined && runtimeId !== expectedRuntimeId) {
     errors.push({ field: 'runtimeId', message: 'does not match the expected runtime ID' });
   }
@@ -392,7 +416,7 @@ function validateRecordFields(
     sessionId,
     roomId,
     networkName,
-    endpoint: value.endpoint as string,
+    endpoint,
     leaseExpiresAt,
   });
 }
@@ -472,8 +496,8 @@ function identityFromDraft(draft: RuntimeRecordDraft): {
       { field: 'identity', message: 'runtimeId and sessionId are required' },
     ]);
   }
-  const brandedRuntimeId = asRuntimeId(String(runtimeId));
-  const brandedSessionId = asSessionId(String(sessionId));
+  const brandedRuntimeId = asRuntimeId(runtimeId);
+  const brandedSessionId = asSessionId(sessionId);
   if (
     identity &&
     (identity.runtimeId !== brandedRuntimeId || identity.sessionId !== brandedSessionId)
@@ -490,16 +514,16 @@ function roomIdFromLike(value: RoomLike): RoomId {
     return asRoomId(value);
   }
   if ('roomId' in value) {
-    return asRoomId(String(value.roomId));
+    return asRoomId(value.roomId);
   }
-  return asRoomId(String(value.id));
+  return asRoomId(value.id);
 }
 
 function resolveRoomId(
   direct: RoomId | string | undefined,
   room: RoomLike | undefined,
 ): RoomId | undefined {
-  const directRoom = direct === undefined ? undefined : asRoomId(String(direct));
+  const directRoom = direct === undefined ? undefined : asRoomId(direct);
   const objectRoom = room === undefined ? undefined : roomIdFromLike(room);
   if (directRoom !== undefined && objectRoom !== undefined && directRoom !== objectRoom) {
     throw new Error('roomId and room disagree');
@@ -671,7 +695,7 @@ export function getRuntimeRecordPath(
   options: RegistryPathOptions = {},
 ): string {
   const paths = getRegistryPaths(roomId, options);
-  return safeRuntimePath(paths.recordsDirectory, asRuntimeId(String(runtimeId)));
+  return safeRuntimePath(paths.recordsDirectory, asRuntimeId(runtimeId));
 }
 
 export const buildRuntimeRecordPath = getRuntimeRecordPath;
@@ -990,7 +1014,7 @@ export async function readRuntimeRecord(
   runtimeId: RuntimeId | string,
   options: RuntimeRecordReadOptions = {},
 ): Promise<RuntimeRecord | undefined> {
-  const validatedRuntimeId = asRuntimeId(String(runtimeId));
+  const validatedRuntimeId = asRuntimeId(runtimeId);
   const paths = getRegistryPaths(roomId, options);
   if (!(await registryTreeIsPrivate(paths, options))) {
     return undefined;
@@ -1077,7 +1101,7 @@ function matchesCleanupExpectation(
 ): boolean {
   if (
     options.expectedSessionId !== undefined &&
-    record.sessionId !== asSessionId(String(options.expectedSessionId))
+    record.sessionId !== asSessionId(options.expectedSessionId)
   ) {
     return false;
   }
@@ -1086,7 +1110,7 @@ function matchesCleanupExpectation(
   }
   if (options.expectedNetworkName !== undefined) {
     try {
-      if (record.networkName !== asNormalizedName(String(options.expectedNetworkName))) {
+      if (record.networkName !== asNormalizedName(options.expectedNetworkName)) {
         return false;
       }
     } catch {
@@ -1105,7 +1129,7 @@ export async function removeRuntimeRecord(
   runtimeId: RuntimeId | string,
   options: RuntimeRecordCleanupOptions = {},
 ): Promise<boolean> {
-  const validatedRuntimeId = asRuntimeId(String(runtimeId));
+  const validatedRuntimeId = asRuntimeId(runtimeId);
   const paths = getRegistryPaths(roomId, options);
   if (!(await registryTreeIsPrivate(paths, options))) {
     return false;
@@ -1230,8 +1254,8 @@ function runtimeIdentityFromOptions(options: RuntimeRegistryOptions): {
     throw new RuntimeRegistryError('runtimeId and sessionId are required');
   }
   try {
-    const parsedRuntimeId = asRuntimeId(String(runtimeId));
-    const parsedSessionId = asSessionId(String(sessionId));
+    const parsedRuntimeId = asRuntimeId(runtimeId);
+    const parsedSessionId = asSessionId(sessionId);
     if (
       identity &&
       (identity.runtimeId !== parsedRuntimeId || identity.sessionId !== parsedSessionId)
@@ -1266,6 +1290,8 @@ export class RuntimeRegistry {
   private readonly clock: RegistryClock;
   private readonly cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
+  private pendingRenewal: Promise<void> = Promise.resolve();
+  private shutdownRequested = false;
   private shutdownPromise: Promise<boolean> | undefined;
 
   public constructor(options: RuntimeRegistryOptions) {
@@ -1278,7 +1304,7 @@ export class RuntimeRegistry {
       throw new RuntimeRegistryError('networkName is required');
     }
     try {
-      const normalized = asNormalizedName(String(networkName));
+      const normalized = asNormalizedName(networkName);
       if (normalized !== networkName) {
         throw new RuntimeRegistryError('networkName must already be normalized');
       }
@@ -1336,21 +1362,33 @@ export class RuntimeRegistry {
   }
 
   /** Publish one owner record with a fresh lease. */
-  public async renew(): Promise<void> {
-    if (this.lease.stopped) {
-      throw new LeaseConfigurationError('cannot renew a stopped runtime registry');
+  public renew(): Promise<void> {
+    if (this.shutdownRequested || this.lease.stopped) {
+      return Promise.reject(new LeaseConfigurationError('cannot renew a stopped runtime registry'));
     }
-    const record = createRuntimeRecord({
-      runtimeId: this.runtimeId,
-      sessionId: this.sessionId,
-      roomId: this.roomId,
-      networkName: this.networkName,
-      endpoint: this.endpoint,
-      now: this.clock(),
-      ttlMs: this.ttlMs,
+
+    const operation = this.pendingRenewal.then(async () => {
+      if (this.shutdownRequested || this.lease.stopped) {
+        throw new LeaseConfigurationError('cannot renew a stopped runtime registry');
+      }
+      const record = createRuntimeRecord({
+        runtimeId: this.runtimeId,
+        sessionId: this.sessionId,
+        roomId: this.roomId,
+        networkName: this.networkName,
+        endpoint: this.endpoint,
+        now: this.clock(),
+        ttlMs: this.ttlMs,
+      });
+      await publishRuntimeRecordAtomically(record, this.pathOptions);
+      this.currentRecord = record;
     });
-    await publishRuntimeRecordAtomically(record, this.pathOptions);
-    this.currentRecord = record;
+
+    this.pendingRenewal = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   public publish(): Promise<void> {
@@ -1377,8 +1415,10 @@ export class RuntimeRegistry {
    */
   public shutdown(): Promise<boolean> {
     if (!this.shutdownPromise) {
+      this.shutdownRequested = true;
       this.shutdownPromise = (async () => {
         await this.lease.stop();
+        await this.pendingRenewal;
         const removed = await removeRuntimeRecord(this.roomId, this.runtimeId, this.cleanupOptions);
         this.currentRecord = undefined;
         return removed;

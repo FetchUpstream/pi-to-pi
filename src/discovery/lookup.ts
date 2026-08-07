@@ -7,6 +7,11 @@ import {
 import { asRoomId, type RoomId, type RoomLike } from '../room.js';
 import { isPublishedNetworkName, normalizePeerLookupName, publishedNetworkBase } from './naming.js';
 
+const RUNTIME_ID_SHAPE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+function isRuntimeIdShaped(value: unknown): value is string {
+  return typeof value === 'string' && RUNTIME_ID_SHAPE_PATTERN.test(value);
+}
 /** The registry fields required by pure same-room lookup. */
 export interface PeerRecordLike {
   readonly runtimeId: RuntimeId | string;
@@ -137,26 +142,31 @@ function roomIdFromLike(room: RoomLike): RoomId {
   }
 
   if ('roomId' in room) {
-    return asRoomId(String(room.roomId));
+    return asRoomId(room.roomId);
   }
 
-  return asRoomId(String(room.id));
+  return asRoomId(room.id);
 }
 
 function runtimeIdsEqual(left: RuntimeId, right: RuntimeId): boolean {
-  return left.toLowerCase() === right.toLowerCase();
+  return left === right;
 }
 
 function parseCandidate<TRecord extends PeerRecordLike>(
   record: TRecord,
 ): ParsedCandidate<TRecord> | undefined {
-  if (typeof record.networkName !== 'string' || record.networkName.length === 0) {
+  if (
+    typeof record.runtimeId !== 'string' ||
+    typeof record.roomId !== 'string' ||
+    typeof record.networkName !== 'string' ||
+    record.networkName.length === 0
+  ) {
     return undefined;
   }
 
   try {
-    const runtimeId = asRuntimeId(String(record.runtimeId));
-    const roomId = asRoomId(String(record.roomId));
+    const runtimeId = asRuntimeId(record.runtimeId);
+    const roomId = asRoomId(record.roomId);
     const normalizedName = normalizePeerLookupName(record.networkName);
     return {
       candidate: {
@@ -211,6 +221,9 @@ export function lookupPeerByName<TRecord extends PeerRecordLike>(
   const roomId = roomIdFromLike(currentRoom);
   const normalizedQuery = normalizePeerLookupName(name);
   const queryIsFullName = isPublishedNetworkName(normalizedQuery);
+  const queryBase = queryIsFullName
+    ? String(publishedNetworkBase(normalizedQuery))
+    : normalizedQuery;
   const matching: PeerCandidate<TRecord>[] = [];
 
   for (const record of records) {
@@ -220,7 +233,9 @@ export function lookupPeerByName<TRecord extends PeerRecordLike>(
     }
 
     const exactMatch = parsed.normalizedName === normalizedQuery;
-    const baseMatch = !queryIsFullName && candidateBase(parsed.normalizedName) === normalizedQuery;
+    const baseMatch = queryIsFullName
+      ? parsed.normalizedName === queryBase
+      : candidateBase(parsed.normalizedName) === queryBase;
     if (exactMatch || baseMatch) {
       matching.push(parsed.candidate);
     }
@@ -259,7 +274,7 @@ export function lookupPeerByRuntimeId<TRecord extends PeerRecordLike>(
   currentRoom: RoomLike,
   records: readonly TRecord[],
 ): PeerLookupResult<TRecord> {
-  const targetRuntimeId = asRuntimeId(String(runtimeId));
+  const targetRuntimeId = asRuntimeId(runtimeId);
   const roomId = roomIdFromLike(currentRoom);
   const sameRoom: PeerCandidate<TRecord>[] = [];
   const otherRoom: PeerCandidate<TRecord>[] = [];
@@ -341,6 +356,10 @@ export function resolvePeerTarget<TRecord extends PeerRecordLike>(
   currentRoom: RoomLike,
   records: readonly TRecord[],
 ): PeerLookupResult<TRecord> {
+  if (isRuntimeIdShaped(target)) {
+    return lookupPeerByRuntimeId(target, currentRoom, records);
+  }
+
   try {
     return lookupPeerByRuntimeId(target, currentRoom, records);
   } catch {

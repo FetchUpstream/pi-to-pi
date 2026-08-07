@@ -33,8 +33,13 @@ describe('P2P identity and configuration foundations', () => {
   it('requires full UUID runtime syntax and keeps deterministic injection test-only', () => {
     expect(isUuid('11111111-1111-4111-8111-111111111111')).toBe(true);
     expect(isUuid('runtime-1')).toBe(false);
+    expect(isUuid('abcdefab-cdef-4abc-8def-abcdefabcdef'.toUpperCase())).toBe(false);
     expect(() => asRuntimeId('runtime-1')).toThrow('full UUID');
     expect(() => asRuntimeId('11111111-1111-4111-7111-111111111111')).toThrow('full UUID');
+    expect(() => asRuntimeId('abcdefab-cdef-4abc-8def-abcdefabcdef'.toUpperCase())).toThrow(
+      'canonical lowercase',
+    );
+    expect(() => asRuntimeId(123)).toThrow('canonical lowercase');
     expect(asNormalizedName('  Ｐlanner / One  ')).toBe('planner-one');
     expect(() => asNormalizedName('planner\uFEFF')).toThrow();
   });

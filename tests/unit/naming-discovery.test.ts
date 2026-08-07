@@ -102,6 +102,18 @@ describe('same-room collision-safe peer lookup', () => {
     expect(result.address).toEqual({ runtimeId: RUNTIME_A, roomId: ROOM_A });
     expect(result.record).toBe(plannerA);
   });
+  it('checks exact full names and base names for suffix-shaped queries', () => {
+    const baseOnly = record(RUNTIME_C, ROOM_A, 'planner');
+    const result = lookupPeerByName(plannerA.networkName, ROOM_A, [plannerA, plannerB, baseOnly]);
+
+    expect(result.kind).toBe('ambiguous');
+    if (result.kind !== 'ambiguous') return;
+    expect(result.candidates).toEqual([
+      { runtimeId: RUNTIME_A, roomId: ROOM_A },
+      { runtimeId: RUNTIME_C, roomId: ROOM_A },
+    ]);
+    expect(result.records).toEqual([plannerA, baseOnly]);
+  });
 
   it('returns every full address for a normalized-name collision', () => {
     const result = lookupPeerByName('PLANNER', ROOM_A, [plannerA, plannerB, otherRoom]);

@@ -77,6 +77,19 @@ describe('runtime record validation and atomic publication', () => {
     expect(validateRuntimeRecord({ ...valid, roomId: '../room' }).valid).toBe(false);
     expect(validateRuntimeRecord({ ...valid, endpoint: 'bad\nendpoint' }).valid).toBe(false);
     expect(validateRuntimeRecord({ ...valid, extra: true }).valid).toBe(false);
+    for (const [field, value] of [
+      ['runtimeId', 123],
+      ['runtimeId', 'abcdefab-cdef-4abc-8def-abcdefabcdef'.toUpperCase()],
+      ['sessionId', 123],
+      ['roomId', 123],
+      ['networkName', 123],
+      ['endpoint', 123],
+      ['leaseExpiresAt', '2030-01-01T00:00:00.000Z'],
+    ] as const) {
+      const malformed = { ...valid, [field]: value };
+      expect(validateRuntimeRecord(malformed).valid).toBe(false);
+      expect(parseRuntimeRecordJson(JSON.stringify(malformed)).valid).toBe(false);
+    }
     expect(parseRuntimeRecordJson('{not-json').valid).toBe(false);
   });
 
@@ -301,5 +314,26 @@ describe('serialized lease and lifecycle cleanup', () => {
     ).toBeUndefined();
     expect(await readRuntimeRecord(ROOM_ID, RUNTIME_B, { rootDirectory: root, now })).toBeDefined();
     await replacement.shutdown();
+  });
+  it('rejects a late direct renewal and leaves exact shutdown cleanup final', async () => {
+    const root = await temporaryRoot();
+    const registry = new RuntimeRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+
+    const renewal = registry.renew();
+    const shutdown = registry.shutdown();
+
+    await expect(renewal).rejects.toThrow('stopped');
+    expect(await shutdown).toBe(false);
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toBeUndefined();
   });
 });

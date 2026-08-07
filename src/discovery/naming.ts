@@ -94,7 +94,7 @@ export function isRuntimeNameSuffix(value: unknown): value is RuntimeNameSuffix 
  * SHA-256 digest of the full runtime UUID.
  */
 export function runtimeNameSuffix(runtimeId: RuntimeId | string): RuntimeNameSuffix {
-  const canonicalRuntimeId = asRuntimeId(String(runtimeId));
+  const canonicalRuntimeId = asRuntimeId(runtimeId);
   const digest = createHash('sha256').update(canonicalRuntimeId, 'utf8').digest();
   const firstTwentyBits = digest.readUIntBE(0, 3) >>> 4;
   let suffix = '';
@@ -164,7 +164,7 @@ export function createPublishedPeerName(
   runtimeId: RuntimeId | string,
 ): PublishedPeerName {
   const normalizedBase = normalizePeerName(base);
-  const canonicalRuntimeId = asRuntimeId(String(runtimeId));
+  const canonicalRuntimeId = asRuntimeId(runtimeId);
   const suffix = runtimeNameSuffix(canonicalRuntimeId);
 
   return Object.freeze({

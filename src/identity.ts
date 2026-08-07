@@ -52,19 +52,19 @@ export function asSessionId(value: string): SessionId {
   return value as SessionId;
 }
 
-/** Brand a full UUID runtime identifier. */
-export function asRuntimeId(value: string): RuntimeId {
+/** Brand a canonical lowercase full UUID runtime identifier. */
+export function asRuntimeId(value: unknown): RuntimeId {
   if (!isUuid(value)) {
-    throw new Error(`Invalid runtime ID: expected a full UUID, received ${JSON.stringify(value)}`);
+    throw new Error('Invalid runtime ID: expected a canonical lowercase full UUID');
   }
   return value as RuntimeId;
 }
 
-/** Return whether a value has full UUID text syntax. */
+/** Return whether a value has canonical lowercase full UUID text syntax. */
 export function isUuid(value: unknown): value is string {
   return (
     typeof value === 'string' &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value)
   );
 }
 
@@ -117,7 +117,7 @@ export function createCanonicalPeerAddress(
 /** Stateful seam used by the Pi lifecycle wiring and lifecycle tests. */
 export interface RuntimeLifecycle {
   start(sessionId: string): RuntimeIdentity;
-  shutdown(runtimeId: RuntimeId): void;
+  shutdown(runtimeId: RuntimeId | string): void;
   current(): RuntimeIdentity | undefined;
 }
 
@@ -145,8 +145,9 @@ function createRuntimeLifecycleWithFactory(runtimeIdFactory: () => RuntimeId): R
       active = createRuntimeIdentityWithFactory(sessionId, runtimeIdFactory);
       return active;
     },
-    shutdown(runtimeId: RuntimeId): void {
-      if (active?.runtimeId === runtimeId) {
+    shutdown(runtimeId: RuntimeId | string): void {
+      const canonicalRuntimeId = asRuntimeId(runtimeId);
+      if (active?.runtimeId === canonicalRuntimeId) {
         active = undefined;
       }
     },
