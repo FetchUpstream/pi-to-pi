@@ -58,6 +58,25 @@ export interface AgentCardValidationOptions {
   readonly maxCardSizeBytes?: number;
 }
 
+const CARD_FIELDS = new Set([
+  'protocolVersion',
+  'sessionId',
+  'runtimeInstanceId',
+  'displayName',
+  'roomId',
+  'purpose',
+  'workingDirectoryLabel',
+  'roleTags',
+  'model',
+  'capabilities',
+  'state',
+  'contextUsage',
+  'inboundQueueDepth',
+  'endpoint',
+  'runtimeStartedAt',
+  'leaseExpiresAt',
+]);
+
 const CARD_FORBIDDEN_FIELDS = new Set([
   'apiKey',
   'apiToken',
@@ -88,6 +107,9 @@ const ENDPOINT_FIELDS = new Set(['kind', 'address', 'runtimeInstanceId']);
 const ISO_TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/u;
+const SAFE_RUNTIME_INSTANCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const WINDOWS_RESERVED_RUNTIME_INSTANCE_ID_PATTERN =
+  /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)/iu;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -128,6 +150,21 @@ function isBoundedText(value: unknown, maxLength: number): value is string {
 
 function isIdentifier(value: unknown): value is string {
   return typeof value === 'string' && IDENTIFIER_PATTERN.test(value);
+}
+
+/**
+ * Runtime identities are shared by registry construction, path construction, and
+ * card schema validation. Keep this check cross-platform and stricter than the
+ * generic logical session identity grammar.
+ */
+export function isSafeRuntimeInstanceId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    SAFE_RUNTIME_INSTANCE_ID_PATTERN.test(value) &&
+    !value.endsWith('.') &&
+    !value.endsWith(' ') &&
+    !WINDOWS_RESERVED_RUNTIME_INSTANCE_ID_PATTERN.test(value)
+  );
 }
 
 function isFiniteInteger(value: unknown): value is number {
@@ -362,7 +399,7 @@ function validateEndpoint(
   if (!checkRequiredField(value, 'runtimeInstanceId', errors)) {
     return;
   }
-  if (!isIdentifier(value.runtimeInstanceId)) {
+  if (!isSafeRuntimeInstanceId(value.runtimeInstanceId)) {
     issue(
       errors,
       'endpoint.runtimeInstanceId',
@@ -484,6 +521,7 @@ export function validateAgentCard(
     return resultFor(input, errors);
   }
 
+  checkKnownFields(input, CARD_FIELDS, '$', errors);
   forbiddenTopLevelFields(input, errors);
 
   const requiredFields = [
@@ -529,7 +567,7 @@ export function validateAgentCard(
       `must be a bounded identity of at most ${MAX_AGENT_ID_LENGTH} characters`,
     );
   }
-  if (!isIdentifier(input.runtimeInstanceId)) {
+  if (!isSafeRuntimeInstanceId(input.runtimeInstanceId)) {
     issue(
       errors,
       'runtimeInstanceId',
