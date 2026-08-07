@@ -134,6 +134,96 @@ const legalTransitions: readonly (readonly [TaskState, TaskState])[] = [
   ['cancelling', 'expired'],
 ];
 
+// Deliberately enumerate the complement of the v1 state machine instead of deriving it
+// from TASK_STATE_TRANSITIONS, so every illegal edge remains independently reviewed.
+const illegalTransitions: readonly (readonly [TaskState, TaskState])[] = [
+  ['created', 'created'],
+  ['created', 'queued'],
+  ['created', 'working'],
+  ['created', 'cancelling'],
+  ['created', 'completed'],
+  ['created', 'failed'],
+  ['created', 'cancelled'],
+  ['accepted', 'created'],
+  ['accepted', 'accepted'],
+  ['accepted', 'completed'],
+  ['accepted', 'failed'],
+  ['queued', 'created'],
+  ['queued', 'accepted'],
+  ['queued', 'queued'],
+  ['queued', 'completed'],
+  ['queued', 'failed'],
+  ['working', 'created'],
+  ['working', 'accepted'],
+  ['working', 'queued'],
+  ['working', 'working'],
+  ['working', 'cancelled'],
+  ['cancelling', 'created'],
+  ['cancelling', 'accepted'],
+  ['cancelling', 'queued'],
+  ['cancelling', 'working'],
+  ['cancelling', 'cancelling'],
+  ['cancelling', 'rejected'],
+  ['completed', 'created'],
+  ['completed', 'accepted'],
+  ['completed', 'queued'],
+  ['completed', 'working'],
+  ['completed', 'cancelling'],
+  ['completed', 'completed'],
+  ['completed', 'failed'],
+  ['completed', 'rejected'],
+  ['completed', 'cancelled'],
+  ['completed', 'expired'],
+  ['failed', 'created'],
+  ['failed', 'accepted'],
+  ['failed', 'queued'],
+  ['failed', 'working'],
+  ['failed', 'cancelling'],
+  ['failed', 'completed'],
+  ['failed', 'failed'],
+  ['failed', 'rejected'],
+  ['failed', 'cancelled'],
+  ['failed', 'expired'],
+  ['rejected', 'created'],
+  ['rejected', 'accepted'],
+  ['rejected', 'queued'],
+  ['rejected', 'working'],
+  ['rejected', 'cancelling'],
+  ['rejected', 'completed'],
+  ['rejected', 'failed'],
+  ['rejected', 'rejected'],
+  ['rejected', 'cancelled'],
+  ['rejected', 'expired'],
+  ['cancelled', 'created'],
+  ['cancelled', 'accepted'],
+  ['cancelled', 'queued'],
+  ['cancelled', 'working'],
+  ['cancelled', 'cancelling'],
+  ['cancelled', 'completed'],
+  ['cancelled', 'failed'],
+  ['cancelled', 'rejected'],
+  ['cancelled', 'cancelled'],
+  ['cancelled', 'expired'],
+  ['expired', 'created'],
+  ['expired', 'accepted'],
+  ['expired', 'queued'],
+  ['expired', 'working'],
+  ['expired', 'cancelling'],
+  ['expired', 'completed'],
+  ['expired', 'failed'],
+  ['expired', 'rejected'],
+  ['expired', 'cancelled'],
+  ['expired', 'expired'],
+];
+
+const terminalTaskStates: readonly TaskState[] = [
+  'completed',
+  'failed',
+  'rejected',
+  'cancelled',
+  'expired',
+];
+
 describe('TaskStore lifecycle', () => {
   for (const [from, to] of legalTransitions) {
     it(`allows the legal ${from} -> ${to} transition`, () => {
@@ -167,62 +257,144 @@ describe('TaskStore lifecycle', () => {
     });
   }
 
-  it('rejects an illegal transition without changing the active snapshot', () => {
-    const clock = new ManualClock();
-    const store = createStore(clock);
-    const before = createTask(store, 'illegal-transition', { initialState: 'accepted' });
+  for (const [from, to] of illegalTransitions) {
+    it(`rejects the illegal ${from} -> ${to} transition without mutation`, () => {
+      const clock = new ManualClock();
+      const store = createStore(clock);
+      const requestId = `illegal-${from}-${to}`;
 
-    const result = store.tryTransition('illegal-transition', 'created');
+      createTask(store, requestId, {
+        initialState: from === 'cancelling' ? 'working' : from,
+      });
+      if (from === 'cancelling') {
+        expect(
+          store.tryTransition(requestId, 'cancelling', {
+            requestedAt: START_TIME + 1,
+          }),
+        ).toMatchObject({ ok: true, snapshot: { state: 'cancelling' } });
+      }
 
-    expect(result).toMatchObject({
-      ok: false,
-      changed: false,
-      code: 'invalid_transition',
-      snapshot: before,
-    });
-    expect(store.getTask('illegal-transition')).toEqual(before);
-    store.dispose();
-  });
+      const before = store.getTask(requestId, { includeTerminalResponse: true });
+      expect(before).toMatchObject({ requestId, state: from });
 
-  it('keeps terminal state and retained response immutable after later operations', () => {
-    const clock = new ManualClock();
-    const store = createStore(clock, { terminalRetentionMs: 100 });
-    createTask(store, 'terminal-immutable', { initialState: 'working' });
+      const result = store.tryTransition(requestId, to);
 
-    const completed = store.completeTask('terminal-immutable', {
-      content: { type: 'text', text: 'the committed result' },
+      expect(result).toMatchObject({
+        ok: false,
+        changed: false,
+        code: terminalTaskStates.includes(from) ? 'terminal' : 'invalid_transition',
+        snapshot: before,
+      });
+      expect(store.getTask(requestId, { includeTerminalResponse: true })).toEqual(before);
+      store.dispose();
     });
-    expect(completed).toMatchObject({
-      state: 'completed',
-      terminalOutcome: 'completed',
-      content: { type: 'text', text: 'the committed result' },
-    });
-    const committed = JSON.parse(JSON.stringify(completed)) as TaskSnapshot;
+  }
 
-    expect(
-      store.failTask('terminal-immutable', createProtocolError('internal', 'late failure')),
-    ).toBe(undefined);
-    expect(
-      store.rejectTask('terminal-immutable', createProtocolError('malformed', 'late rejection')),
-    ).toBe(undefined);
-    expect(store.tryTransition('terminal-immutable', 'working')).toMatchObject({
-      ok: false,
-      changed: false,
-      code: 'terminal',
-      snapshot: committed,
+  for (const terminalState of terminalTaskStates) {
+    it(`keeps ${terminalState} state and response immutable after late operations`, () => {
+      const clock = new ManualClock();
+      const store = createStore(clock, { terminalRetentionMs: 100 });
+      const requestId = `terminal-immutable-${terminalState}`;
+      const initialState = terminalState === 'cancelled' ? 'accepted' : 'working';
+      createTask(store, requestId, { initialState, expiresAt: START_TIME + 100 });
+
+      let snapshot: TaskSnapshot | undefined;
+      if (terminalState === 'completed') {
+        snapshot = store.completeTask(requestId, {
+          content: { type: 'text', text: 'the committed result' },
+        });
+      } else if (terminalState === 'failed') {
+        snapshot = store.failTask(requestId, createProtocolError('internal', 'executor failed'));
+      } else if (terminalState === 'rejected') {
+        snapshot = store.rejectTask(
+          requestId,
+          createProtocolError('malformed', 'request rejected'),
+        );
+      } else if (terminalState === 'cancelled') {
+        const cancellation = store.cancelTask(requestId, {
+          caller: OWNER_RUNTIME,
+          reason: 'cancelled before execution',
+          requestedAt: START_TIME + 10,
+        });
+        expect(cancellation).toMatchObject({ ok: true, changed: true, state: 'cancelled' });
+        snapshot = cancellation.ok ? cancellation.snapshot : undefined;
+      } else {
+        clock.advanceBy(100);
+        snapshot = store.getTask(requestId);
+      }
+
+      expect(snapshot).toBeDefined();
+      if (snapshot === undefined) {
+        throw new Error(`failed to create ${terminalState} terminal fixture`);
+      }
+      const committed = JSON.parse(JSON.stringify(snapshot)) as TaskSnapshot;
+      expect(committed).toMatchObject({
+        requestId,
+        state: terminalState,
+        terminalOutcome: terminalState,
+        cancellationRequested: terminalState === 'cancelled',
+      });
+      if (terminalState === 'completed') {
+        expect(committed).toMatchObject({
+          content: { type: 'text', text: 'the committed result' },
+        });
+      } else {
+        const errorCode =
+          terminalState === 'failed'
+            ? 'internal'
+            : terminalState === 'rejected'
+              ? 'malformed'
+              : terminalState === 'cancelled'
+                ? 'cancelled'
+                : 'expired';
+        expect(committed).toMatchObject({ error: { code: errorCode } });
+      }
+
+      expect(
+        store.completeTask(requestId, {
+          content: { type: 'text', text: 'late completion' },
+        }),
+      ).toBe(undefined);
+      expect(store.failTask(requestId, createProtocolError('internal', 'late failure'))).toBe(
+        undefined,
+      );
+      expect(store.rejectTask(requestId, createProtocolError('malformed', 'late rejection'))).toBe(
+        undefined,
+      );
+      expect(store.tryTransition(requestId, 'working')).toMatchObject({
+        ok: false,
+        changed: false,
+        code: 'terminal',
+        snapshot: committed,
+      });
+      expect(store.expireTask(requestId)).toEqual(committed);
+
+      const lateCancellation = store.cancelTask(requestId, OWNER_RUNTIME);
+      if (terminalState === 'cancelled') {
+        expect(lateCancellation).toMatchObject({
+          ok: true,
+          changed: false,
+          state: 'cancelled',
+          snapshot: committed,
+        });
+      } else {
+        expect(lateCancellation).toMatchObject({
+          ok: false,
+          changed: false,
+          code: 'not_cancelable',
+          snapshot: committed,
+        });
+      }
+      expect(
+        store.getStatusResult(requestId, {
+          caller: OWNER_RUNTIME,
+          includeTerminalResponse: true,
+        }),
+      ).toMatchObject({ ok: true, snapshot: committed });
+      expect(store.getTask(requestId, { includeTerminalResponse: true })).toEqual(committed);
+      store.dispose();
     });
-    expect(store.expireTask('terminal-immutable')).toEqual(committed);
-    expect(store.cancelTask('terminal-immutable', OWNER_RUNTIME)).toMatchObject({
-      ok: false,
-      changed: false,
-      code: 'not_cancelable',
-      snapshot: committed,
-    });
-    expect(store.getTask('terminal-immutable', { includeTerminalResponse: true })).toEqual(
-      committed,
-    );
-    store.dispose();
-  });
+  }
 
   it('authorizes status and cancellation by owner, local owner, or explicit policy', () => {
     const clock = new ManualClock();
@@ -257,12 +429,25 @@ describe('TaskStore lifecycle', () => {
       changed: true,
       state: 'cancelled',
     });
+    createTask(store, 'local-owned-task');
+    expect(store.cancelTask('local-owned-task', LOCAL_RUNTIME)).toMatchObject({
+      ok: true,
+      changed: true,
+      state: 'cancelled',
+      snapshot: { requestId: 'local-owned-task', state: 'cancelled' },
+    });
+    expect(store.cancelTask('local-owned-task', OTHER_RUNTIME)).toEqual({
+      ok: false,
+      changed: false,
+      code: 'unauthorized',
+    });
     expect(authorizationCalls).toEqual([
       { action: 'status', callerRuntimeId: OTHER_RUNTIME },
       { action: 'status', callerRuntimeId: OTHER_RUNTIME },
       { action: 'status', callerRuntimeId: 'runtime-authorized' },
       { action: 'cancel', callerRuntimeId: OTHER_RUNTIME },
       { action: 'cancel', callerRuntimeId: 'runtime-authorized' },
+      { action: 'cancel', callerRuntimeId: OTHER_RUNTIME },
     ]);
     store.dispose();
   });
@@ -317,6 +502,40 @@ describe('TaskStore lifecycle', () => {
     });
     expect(store.queuedSize).toBe(0);
     expect(expiredSnapshots).toEqual([snapshot]);
+    store.dispose();
+  });
+
+  it('uses the absolute deadline when createdAt is before now but expiry is still future', () => {
+    const clock = new ManualClock();
+    const expiredSnapshots: TaskSnapshot[] = [];
+    const store = createStore(clock, {
+      onExpired: (snapshot) => expiredSnapshots.push(snapshot),
+    });
+    clock.advanceBy(500);
+    const snapshot = createTask(store, 'absolute-deadline', {
+      initialState: 'queued',
+      createdAt: START_TIME,
+      expiresAt: START_TIME + 1_000,
+    });
+
+    expect(snapshot).toMatchObject({
+      state: 'queued',
+      createdAt: '2026-08-07T10:00:00.000Z',
+      expiresAt: '2026-08-07T10:00:01.000Z',
+    });
+    clock.advanceBy(499);
+    expect(store.getTask('absolute-deadline')).toMatchObject({ state: 'queued' });
+    expect(store.queuedSize).toBe(1);
+
+    clock.advanceBy(1);
+    expect(store.getTask('absolute-deadline')).toMatchObject({
+      state: 'expired',
+      terminalOutcome: 'expired',
+      error: { code: 'expired' },
+    });
+    expect(store.queuedSize).toBe(0);
+    expect(store.startTask('absolute-deadline')).toBe(undefined);
+    expect(expiredSnapshots).toEqual([store.getTask('absolute-deadline')]);
     store.dispose();
   });
 
@@ -458,6 +677,14 @@ describe('TaskStore lifecycle', () => {
       }),
     ).toBe(undefined);
     expect(cancellationStore.getTask('cancellation-wins')).toEqual(cancelled);
+    cancellationClock.advanceBy(100);
+    expect(cancellationStore.getTask('cancellation-wins')).toEqual(cancelled);
+    expect(cancellationStore.cancelTask('cancellation-wins', OWNER_RUNTIME)).toMatchObject({
+      ok: true,
+      changed: false,
+      state: 'cancelled',
+      snapshot: cancelled,
+    });
     cancellationStore.dispose();
 
     const expiryClock = new ManualClock();
@@ -482,6 +709,38 @@ describe('TaskStore lifecycle', () => {
     });
     expiryStore.dispose();
   });
+  for (const terminalState of ['failed', 'rejected'] as const) {
+    it(`returns not_cancelable for a late cancellation after ${terminalState}`, () => {
+      const clock = new ManualClock();
+      const store = createStore(clock);
+      const requestId = `late-cancel-${terminalState}`;
+      createTask(store, requestId, {
+        initialState: 'working',
+        expiresAt: START_TIME + 100,
+      });
+
+      const committed =
+        terminalState === 'failed'
+          ? store.failTask(requestId, createProtocolError('internal', 'executor failed'))
+          : store.rejectTask(requestId, createProtocolError('malformed', 'request rejected'));
+      expect(committed).toMatchObject({
+        requestId,
+        state: terminalState,
+        terminalOutcome: terminalState,
+        error: { code: terminalState === 'failed' ? 'internal' : 'malformed' },
+      });
+      expect(store.cancelTask(requestId, OWNER_RUNTIME)).toMatchObject({
+        ok: false,
+        changed: false,
+        code: 'not_cancelable',
+        snapshot: committed,
+      });
+
+      clock.advanceBy(100);
+      expect(store.getTask(requestId)).toEqual(committed);
+      store.dispose();
+    });
+  }
 
   it('returns not_found for unknown or purged tasks without leaking ownership', () => {
     const clock = new ManualClock();
