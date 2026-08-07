@@ -52,3 +52,17 @@ intentionally waits 25 ms after `exited` before asserting that no later diagnost
 These fixtures support the mandatory Node harness suite only. Future real-Pi lifecycle tests are a
 separate integration concern under `tests/integration/` and must not be confused with, or required
 by, the portable fixtures.
+
+## Pi lifecycle fixtures
+
+The following in-process fixtures are specific to the P2P-006 lifecycle spike and remain separate
+from the portable process harness above:
+
+- `pi-runtime.ts` exports the in-process runtime factory backed by `createAgentSessionRuntime()`,
+  `createAgentSessionServices()`, `SessionManager`, `SettingsManager`, and a registered
+  `fauxProvider()`.
+- `pi-probe.ts` exports the inline lifecycle/custom-message probe and `bindPiProbe()` rebinding
+  helper.
+- `persisted-session.ts` exports isolated temporary-directory helpers for reload, resume, fork,
+  and clone scenarios.
+- `index.ts` is the import barrel for follow-on tests.
