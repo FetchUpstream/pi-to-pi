@@ -1,17 +1,13 @@
 import {
   asRuntimeId,
   createCanonicalPeerAddress,
+  isUuid,
   type CanonicalPeerAddress,
   type RuntimeId,
 } from '../identity.js';
 import { asRoomId, type RoomId, type RoomLike } from '../room.js';
 import { isPublishedNetworkName, normalizePeerLookupName, publishedNetworkBase } from './naming.js';
 
-const RUNTIME_ID_SHAPE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-
-function isRuntimeIdShaped(value: unknown): value is string {
-  return typeof value === 'string' && RUNTIME_ID_SHAPE_PATTERN.test(value);
-}
 /** The registry fields required by pure same-room lookup. */
 export interface PeerRecordLike {
   readonly runtimeId: RuntimeId | string;
@@ -356,15 +352,11 @@ export function resolvePeerTarget<TRecord extends PeerRecordLike>(
   currentRoom: RoomLike,
   records: readonly TRecord[],
 ): PeerLookupResult<TRecord> {
-  if (isRuntimeIdShaped(target)) {
+  if (isUuid(target)) {
     return lookupPeerByRuntimeId(target, currentRoom, records);
   }
 
-  try {
-    return lookupPeerByRuntimeId(target, currentRoom, records);
-  } catch {
-    return lookupPeerByName(target, currentRoom, records);
-  }
+  return lookupPeerByName(target, currentRoom, records);
 }
 
 /** Throwing counterpart for protocol code that treats non-found as an error. */

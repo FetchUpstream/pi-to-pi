@@ -154,4 +154,17 @@ describe('same-room collision-safe peer lookup', () => {
       expect(isolated.targetRooms).toEqual([ROOM_B]);
     }
   });
+  it('treats malformed and uppercase UUID-shaped targets as names', () => {
+    const uppercase = 'ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF';
+    const malformed = '11111111-1111-0111-8111-111111111111';
+
+    expect(resolvePeerTarget(uppercase, ROOM_A, [plannerA])).toEqual({
+      kind: 'not-found',
+      query: uppercase.toLowerCase(),
+    });
+    expect(resolvePeerTarget(malformed, ROOM_A, [plannerA])).toEqual({
+      kind: 'not-found',
+      query: malformed,
+    });
+  });
 });
