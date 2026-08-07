@@ -29,7 +29,7 @@ comparison does not change it.
 
 The focused suite is `tests/fixtures/local-ipc-http/http-candidate.test.ts`.
 On this Linux runner (`node v25.0.0`, repository minimum `node >=22.19.0`),
-all 12 tests passed. The checks cover:
+all 14 focused tests passed. The checks cover:
 
 | Behavior               | Evidence                                                                                                                                                            | Linux result |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
