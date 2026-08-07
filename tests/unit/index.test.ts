@@ -100,6 +100,20 @@ class FailingFirstRenameRegistry extends RuntimeRegistry {
   }
 }
 
+class FailingSecondRenameRegistry extends RuntimeRegistry {
+  private publicationCount = 0;
+
+  protected override publishCurrentName(): Promise<void> {
+    this.publicationCount += 1;
+    const publication = super.publishCurrentName();
+    if (this.publicationCount !== 3) {
+      return publication;
+    }
+    return publication.then(() => {
+      throw new Error('second overlapping rename fails after commit');
+    });
+  }
+}
 const replacementScenarios: ReadonlyArray<{
   readonly reason: Exclude<SessionStartEvent['reason'], 'startup'>;
   readonly replacementSessionId: string;
@@ -370,6 +384,50 @@ describe('Pi-to-Pi extension lifecycle integration', () => {
 
     const runtime = lifecycle.current();
     expect(runtime?.config.name).toBe('second');
+    expect(registry?.networkName).toBe(runtime?.publishedName.networkName);
+    expect(registry?.current()?.networkName).toBe(runtime?.publishedName.networkName);
+    expect(
+      await readRuntimeRecord(runtime!.room.roomId, runtime!.identity.runtimeId, {
+        rootDirectory: registryRoot,
+      }),
+    ).toEqual(registry?.current());
+
+    await lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
+  });
+
+  it('keeps the last committed native rename after a later publication fails', async () => {
+    let registry: FailingSecondRenameRegistry | undefined;
+    const lifecycle = createPiToPiLifecycle(
+      { getFlag: createFlags() },
+      {
+        registryOptions: {
+          rootDirectory: registryRoot,
+          renewalIntervalMs: 60_000,
+        },
+        createRegistry: (options) => {
+          registry = new FailingSecondRenameRegistry(options);
+          return registry;
+        },
+      },
+    );
+    const context = createContext('native-session-id', 'Planner');
+
+    await lifecycle.onSessionStart(startEvent('startup'), context);
+    const firstRename = lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'First' },
+      context,
+    );
+    const secondRename = lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'Second' },
+      context,
+    );
+
+    await expect(firstRename).resolves.toBeUndefined();
+    await expect(secondRename).rejects.toThrow('second overlapping rename fails after commit');
+
+    const runtime = lifecycle.current();
+    expect(runtime?.config.name).toBe('first');
+    expect(runtime?.publishedName.base).toBe('first');
     expect(registry?.networkName).toBe(runtime?.publishedName.networkName);
     expect(registry?.current()?.networkName).toBe(runtime?.publishedName.networkName);
     expect(
