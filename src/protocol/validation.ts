@@ -68,6 +68,8 @@ export interface ValidationOptions {
   readonly limits?: Partial<ProtocolLimits>;
   /** Optional request ID expected in an operation result or task snapshot. */
   readonly expectedRequestId?: string;
+  /** Original request deadline used to bound a message.reply expiry. */
+  readonly expectedRequestExpiresAt?: Date | number | string;
 }
 
 export type ProtocolValidationOptions = ValidationOptions;
@@ -476,25 +478,37 @@ function timestampExceedsLifetime(
   return compareTimestamps(later, addMilliseconds(earlier, maximumMilliseconds)) > 0;
 }
 
-function resolveNowTimestamp(value: ValidationOptions['now']): ParsedUtcTimestamp {
-  if (value === undefined) {
-    return timestampFromMilliseconds(Date.now());
-  }
+function resolveTimestampInput(value: Date | number | string, field: string): ParsedUtcTimestamp {
   if (typeof value === 'number') {
+    if (!Number.isFinite(value) || !Number.isSafeInteger(Math.trunc(value))) {
+      throw new RangeError(`${field} must be a finite safe number`);
+    }
     return timestampFromMilliseconds(value);
   }
   if (value instanceof Date) {
     const milliseconds = value.getTime();
     if (!Number.isSafeInteger(milliseconds)) {
-      throw new RangeError('now must be a valid Date');
+      throw new RangeError(`${field} must be a valid Date`);
     }
     return timestampFromMilliseconds(milliseconds);
   }
   const timestamp = parseUtcTimestampExact(value);
   if (timestamp === undefined) {
-    throw new RangeError('now must be a valid RFC 3339 UTC timestamp');
+    throw new RangeError(`${field} must be a valid RFC 3339 UTC timestamp`);
   }
   return timestamp;
+}
+
+function resolveNowTimestamp(value: ValidationOptions['now']): ParsedUtcTimestamp {
+  return value === undefined
+    ? timestampFromMilliseconds(Date.now())
+    : resolveTimestampInput(value, 'now');
+}
+
+function resolveExpectedRequestExpiresAt(
+  value: ValidationOptions['expectedRequestExpiresAt'],
+): ParsedUtcTimestamp | undefined {
+  return value === undefined ? undefined : resolveTimestampInput(value, 'expectedRequestExpiresAt');
 }
 
 function isUuidV4Value(value: unknown): value is string {
@@ -1572,7 +1586,11 @@ function resolveSchemaReference(index: SchemaIndex, reference: string): JsonSche
       for (const token of pointer) {
         if (isPlainObject(current) && hasOwn(current, token)) {
           current = current[token];
-        } else if (Array.isArray(current) && /^(?:0|[1-9]\d*)$/u.test(token)) {
+        } else if (
+          Array.isArray(current) &&
+          /^(?:0|[1-9]\d*)$/u.test(token) &&
+          Object.prototype.hasOwnProperty.call(current, token)
+        ) {
           current = current[Number(token)];
         } else {
           return undefined;
@@ -2293,6 +2311,29 @@ export function validateEnvelope(
       '$.expiresAt',
       'expiresAt is at or before now',
     );
+  }
+
+  const originalRequestDeadline =
+    operation === 'message.reply'
+      ? resolveExpectedRequestExpiresAt(options.expectedRequestExpiresAt)
+      : undefined;
+  if (originalRequestDeadline !== undefined) {
+    if (compareTimestamps(originalRequestDeadline, now) <= 0) {
+      return validationFailure(
+        'expired',
+        'protocol operation has expired',
+        '$.expiresAt',
+        'original request deadline is at or before now',
+      );
+    }
+    if (compareTimestamps(expiresAt, originalRequestDeadline) > 0) {
+      return validationFailure(
+        'malformed',
+        'protocol envelope is malformed',
+        '$.expiresAt',
+        'message.reply expiry must not exceed the original request deadline',
+      );
+    }
   }
 
   const payloadIssue = validatePayloadInternal(operation, value.payload, options);
