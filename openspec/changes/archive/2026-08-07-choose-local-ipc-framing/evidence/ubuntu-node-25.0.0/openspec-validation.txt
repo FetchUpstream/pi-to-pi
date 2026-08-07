@@ -1,0 +1,4 @@
+$ openspec validate choose-local-ipc-framing --type change --strict
+Change 'choose-local-ipc-framing' is valid
+OPEN_SPEC_VALIDATE_EXIT_STATUS=0
+EXIT_STATUS=0

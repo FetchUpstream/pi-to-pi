@@ -1,0 +1,66 @@
+--- artifact inventory (pre-run) ---
+sockets=3
+/tmp/p2p-059e39fc11315aeb6f7f61ea.sock
+/tmp/p2p-6e68cee92cde2d7af2d828c6.sock
+/tmp/p2p-7eeead740a674ea2c9e2c59f.sock
+named_pipes=0
+quarantine_entries=0
+temporary_dirs=11
+/tmp/p2p-clean-1V7H2M
+/tmp/p2p-clean-u5cGMu
+/tmp/p2p-direct-W38Erf
+/tmp/p2p-inspect-cFpXFs
+/tmp/p2p-inspect-HoLUbP
+/tmp/p2p-inspect-T95iJU
+/tmp/p2p-lock-cross-HEVjTi
+/tmp/p2p-reg-focused-Csvo0Z
+/tmp/p2p-reg-focused-euxR24
+/tmp/p2p-reg-focused-NvGQB8
+/tmp/p2p-reg-focused-NYl0Ev
+spike_children=0
+$ node --version (raw run 3)
+v25.0.0
+RAW_RUN_3_TEST_FILES= Test Files  6 passed (6)
+RAW_RUN_3_TESTS=      Tests  72 passed (72)
+RAW_RUN_3_EXIT_STATUS=0
+$ node --version (HTTP run 3)
+v25.0.0
+HTTP_RUN_3_TEST_FILES= Test Files  1 passed (1)
+HTTP_RUN_3_TESTS=      Tests  15 passed (15)
+HTTP_RUN_3_EXIT_STATUS=0
+--- artifact inventory (post-run) ---
+sockets=3
+/tmp/p2p-059e39fc11315aeb6f7f61ea.sock
+/tmp/p2p-6e68cee92cde2d7af2d828c6.sock
+/tmp/p2p-7eeead740a674ea2c9e2c59f.sock
+named_pipes=0
+quarantine_entries=0
+temporary_dirs=11
+/tmp/p2p-clean-1V7H2M
+/tmp/p2p-clean-u5cGMu
+/tmp/p2p-direct-W38Erf
+/tmp/p2p-inspect-cFpXFs
+/tmp/p2p-inspect-HoLUbP
+/tmp/p2p-inspect-T95iJU
+/tmp/p2p-lock-cross-HEVjTi
+/tmp/p2p-reg-focused-Csvo0Z
+/tmp/p2p-reg-focused-euxR24
+/tmp/p2p-reg-focused-NvGQB8
+/tmp/p2p-reg-focused-NYl0Ev
+spike_children=0
+--- artifact delta (post-run minus pre-run) ---
+new_sockets:
+new_named_pipes:
+new_quarantine_entries:
+new_temporary_dirs:
+new_spike_children:
+--- artifact delta (pre-run minus post-run) ---
+removed_sockets:
+removed_named_pipes:
+removed_quarantine_entries:
+removed_temporary_dirs:
+removed_spike_children:
+RESULT=PASS when both focused commands have exit status 0 and all artifact delta sections are empty.
+LIMITATION=This Ubuntu runner cannot enumerate Windows named-pipe objects; native Windows process/cleanup tests record that limitation and must run on Windows.
+CLEANUP_COMMAND_EXIT_STATUS=0
+EXIT_STATUS=0
