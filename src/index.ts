@@ -55,7 +55,10 @@ export function createPiToPiLifecycle(pi: Pick<ExtensionAPI, 'getFlag'>): PiToPi
         return;
       }
 
-      const config = resolveP2PConfig({ sessionName: event.name });
+      const config = resolveP2PConfig({
+        sessionName: event.name,
+        projectOverride: active.config.projectOverride,
+      });
       active = Object.freeze({ ...active, config });
     },
     onSessionShutdown(_event, _ctx): void {

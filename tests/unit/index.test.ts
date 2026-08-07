@@ -101,6 +101,32 @@ describe('Pi-to-Pi extension bootstrap', () => {
     expect(lifecycle.current()?.identity).toBe(before?.identity);
     expect(lifecycle.current()?.room).toBe(before?.room);
   });
+  it('preserves an explicit project when native session metadata changes', () => {
+    const getFlag = vi.fn<ExtensionAPI['getFlag']>((name) =>
+      name === 'p2p-project' ? 'Project Label' : undefined,
+    );
+    const lifecycle = createPiToPiLifecycle({ getFlag });
+    const context = {
+      cwd: '/path/that/does/not/need/to/exist',
+      sessionManager: {
+        getSessionId: () => 'native-session-id',
+        getSessionName: () => 'Native Name',
+      },
+    } as never;
+
+    lifecycle.onSessionStart({ type: 'session_start', reason: 'startup' }, context);
+    const before = lifecycle.current();
+    lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'Changed Native Name' },
+      context,
+    );
+
+    expect(lifecycle.current()?.config.name).toBe('changed-native-name');
+    expect(lifecycle.current()?.config.projectOverride).toBe('project-label');
+    expect(lifecycle.current()?.identity).toBe(before?.identity);
+    expect(lifecycle.current()?.room).toBe(before?.room);
+  });
+
   it('resolves the configured project room before using the Pi cwd', () => {
     const getFlag = vi.fn<ExtensionAPI['getFlag']>((name) =>
       name === 'p2p-project' ? 'Project Label' : undefined,
