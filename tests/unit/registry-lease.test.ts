@@ -436,6 +436,31 @@ describe('serialized lease and lifecycle cleanup', () => {
     expect(await readRuntimeRecord(ROOM_ID, RUNTIME_B, { rootDirectory: root, now })).toBeDefined();
     await replacement.shutdown();
   });
+  it('removes the last committed record when shutdown rejects a queued name publication', async () => {
+    const root = await temporaryRoot();
+    const registry = new RuntimeRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+
+    await registry.start();
+    expect(registry.current()?.networkName).toBe('planner');
+    const rename = registry.updateNetworkName('renamed');
+    const shutdown = registry.shutdown();
+
+    await expect(rename).rejects.toThrow('stopped');
+    expect(registry.networkName).toBe('planner');
+    expect(await shutdown).toBe(true);
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toBeUndefined();
+    expect(registry.current()).toBeUndefined();
+  });
   it('rejects a late direct renewal and leaves exact shutdown cleanup final', async () => {
     const root = await temporaryRoot();
     const registry = new RuntimeRegistry({
