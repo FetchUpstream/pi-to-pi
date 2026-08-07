@@ -7,6 +7,7 @@ semantics.
 Run the complete fixture evidence matrix on the native runner with:
 
 ```sh
+node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 22 || (major === 22 && minor < 19)) { console.error('Node >=22.19.0 required; found ' + process.version); process.exit(1); }"
 node --version
 npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-ipc-spike --reporter=verbose
 npm run typecheck
