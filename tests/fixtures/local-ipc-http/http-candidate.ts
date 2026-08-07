@@ -6,9 +6,11 @@
  * top of the path-based IPC endpoint accepted by `http.Server.listen` and
  * `http.request({ socketPath })`.
  */
-import { lstat, unlink } from 'node:fs/promises';
+import { link, lstat, rename, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { createConnection, type Socket } from 'node:net';
 import { createServer, request as createRequest } from 'node:http';
+import type { Duplex } from 'node:stream';
 import type {
   ClientRequest,
   IncomingHttpHeaders,
@@ -21,9 +23,11 @@ import { performance } from 'node:perf_hooks';
 import { createIpcEndpoint, type IpcEndpointOptions } from '../local-ipc/index.js';
 import {
   AbortError,
+  createPhaseDeadline,
   PhaseDeadlineExceededError,
   onAbort,
   throwIfAborted,
+  withDeadline,
   withPhaseDeadline,
 } from '../local-ipc-spike/test-helpers.js';
 
@@ -64,6 +68,8 @@ export interface HttpIpcServerOptions {
   readonly requestTimeoutMs?: number;
   /** Absolute deadline for executing one handler. */
   readonly handlerTimeoutMs?: number;
+  /** Absolute deadline for writing one response to the peer. */
+  readonly writeTimeoutMs?: number;
 }
 
 export interface HttpIpcRequestOptions {
@@ -95,6 +101,7 @@ export interface HttpIpcServer {
   readonly maxResponseBytes: number;
   readonly requestTimeoutMs: number;
   readonly handlerTimeoutMs: number;
+  readonly writeTimeoutMs: number;
   readonly keepAlive: false;
   readonly connectionCount: number;
   readonly requestCount: number;
@@ -160,6 +167,32 @@ interface NormalizedHttpIpcServerOptions {
   readonly maxResponseBytes: number;
   readonly requestTimeoutMs: number;
   readonly handlerTimeoutMs: number;
+  readonly writeTimeoutMs: number;
+}
+
+const endpointOperationLocks = new Map<string, Promise<void>>();
+
+/** Serialize candidate ownership transitions for an endpoint in this process. */
+async function withEndpointOperationLock<T>(
+  endpoint: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const predecessor = endpointOperationLocks.get(endpoint);
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  endpointOperationLocks.set(endpoint, current);
+
+  try {
+    await predecessor;
+    return await operation();
+  } finally {
+    release();
+    if (endpointOperationLocks.get(endpoint) === current) {
+      endpointOperationLocks.delete(endpoint);
+    }
+  }
 }
 
 function normalizeByteLimit(value: number | undefined, fallback: number, label: string): number {
@@ -262,7 +295,148 @@ function responseBodyText(message: string): Buffer {
   return Buffer.from(message, 'utf8');
 }
 
-function closeResponse(response: ServerResponse, statusCode: number, body: Buffer): void {
+function writeHttpResponse(
+  response: ServerResponse,
+  body: Buffer,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let finished = false;
+    let removeAbort = (): void => undefined;
+
+    const cleanup = (): void => {
+      response.off('finish', onFinish);
+      response.off('close', onClose);
+      response.off('error', onError);
+      removeAbort();
+    };
+    const settleSuccess = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const settleFailure = (error: unknown): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const onFinish = (): void => {
+      finished = true;
+      settleSuccess();
+    };
+    const onClose = (): void => {
+      if (!finished) {
+        settleFailure(new HttpIpcProtocolError('HTTP response closed before its body was written'));
+      }
+    };
+    const onError = (error: Error): void => {
+      settleFailure(error);
+    };
+
+    response.once('finish', onFinish);
+    response.once('close', onClose);
+    response.once('error', onError);
+    removeAbort = onAbort(signal, (error) => {
+      if (!response.destroyed) {
+        response.destroy();
+      }
+      settleFailure(error);
+    });
+    if (settled) {
+      return;
+    }
+
+    try {
+      response.end(body);
+    } catch (error: unknown) {
+      settleFailure(error);
+    }
+  });
+}
+
+function writeSocketAndEnd(
+  socket: Socket | Duplex,
+  body: Buffer,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let finished = false;
+    let removeAbort = (): void => undefined;
+
+    const cleanup = (): void => {
+      socket.off('finish', onFinish);
+      socket.off('close', onClose);
+      socket.off('error', onError);
+      removeAbort();
+    };
+    const settleSuccess = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const settleFailure = (error: unknown): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const onFinish = (): void => {
+      finished = true;
+      settleSuccess();
+    };
+    const onClose = (): void => {
+      if (!finished) {
+        settleFailure(
+          new HttpIpcProtocolError('HTTP socket closed before its response was written'),
+        );
+      }
+    };
+    const onError = (error: Error): void => {
+      settleFailure(error);
+    };
+
+    socket.once('finish', onFinish);
+    socket.once('close', onClose);
+    socket.once('error', onError);
+    removeAbort = onAbort(signal, (error) => {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+      settleFailure(error);
+    });
+    if (settled) {
+      return;
+    }
+
+    try {
+      socket.end(body, onFinish);
+    } catch (error: unknown) {
+      settleFailure(error);
+    }
+  });
+}
+
+async function closeResponse(
+  request: IncomingMessage,
+  response: ServerResponse,
+  statusCode: number,
+  body: Buffer,
+  signal: AbortSignal,
+  writeTimeoutMs: number,
+): Promise<void> {
   if (response.destroyed || response.writableEnded) {
     return;
   }
@@ -274,7 +448,22 @@ function closeResponse(response: ServerResponse, statusCode: number, body: Buffe
   response.shouldKeepAlive = false;
   response.setHeader('Connection', 'close');
   response.setHeader('Content-Length', body.byteLength);
-  response.end(body);
+  await withPhaseDeadline(
+    'response-write',
+    writeTimeoutMs,
+    (writeSignal) => writeHttpResponse(response, body, writeSignal),
+    {
+      signal,
+      onTimeout: () => {
+        if (!request.destroyed) {
+          request.destroy();
+        }
+        if (!response.destroyed) {
+          response.destroy();
+        }
+      },
+    },
+  );
 }
 
 function destroyRequestAfterResponse(request: IncomingMessage, response: ServerResponse): void {
@@ -428,10 +617,13 @@ async function handleRequest(
     }
 
     if (request.method !== HTTP_METHOD || request.url !== HTTP_PATH) {
-      closeResponse(
+      await closeResponse(
+        request,
         response,
         request.method === HTTP_METHOD ? 404 : 405,
         responseBodyText('not found'),
+        lifecycleController.signal,
+        options.writeTimeoutMs,
       );
       destroyRequestAfterResponse(request, response);
       return;
@@ -489,28 +681,52 @@ async function handleRequest(
     response.setHeader('Connection', 'close');
     response.setHeader('Content-Type', 'application/octet-stream');
     response.setHeader('Content-Length', body.byteLength);
-    response.end(body);
+    await closeResponse(
+      request,
+      response,
+      200,
+      body,
+      lifecycleController.signal,
+      options.writeTimeoutMs,
+    );
     destroyRequestAfterResponse(request, response);
   } catch (error: unknown) {
     if (error instanceof HttpIpcBodyLimitError) {
-      closeResponse(
+      await closeResponse(
+        request,
         response,
         error.side === 'request' ? 413 : 500,
         responseBodyText(error.message),
+        lifecycleController.signal,
+        options.writeTimeoutMs,
       );
       destroyRequestAfterResponse(request, response);
       return;
     }
     if (error instanceof PhaseDeadlineExceededError) {
       const statusCode = error.phase === 'request' ? 408 : 504;
-      closeResponse(response, statusCode, responseBodyText(error.message));
+      await closeResponse(
+        request,
+        response,
+        statusCode,
+        responseBodyText(error.message),
+        lifecycleController.signal,
+        options.writeTimeoutMs,
+      );
       destroyRequestAfterResponse(request, response);
       return;
     }
     if (lifecycleController.signal.aborted || error instanceof AbortError) {
       return;
     }
-    closeResponse(response, 500, responseBodyText('handler failed'));
+    await closeResponse(
+      request,
+      response,
+      500,
+      responseBodyText('handler failed'),
+      lifecycleController.signal,
+      options.writeTimeoutMs,
+    );
     destroyRequestAfterResponse(request, response);
   } finally {
     removeShutdownAbort();
@@ -540,12 +756,17 @@ function sameUnixSocketIdentity(
 }
 
 /**
- * A successful probe proves that another listener currently owns the path. A
- * probe that cannot finish is treated as live/unknown so cleanup never unlinks
- * an endpoint without first establishing that no replacement is listening.
+ * Probe for a listener without ever treating an incomplete probe as stale.
+ * The caller's absolute cleanup deadline bounds both the connection attempt and
+ * the final ownership decision.
  */
-async function hasLiveUnixListener(endpoint: string): Promise<boolean> {
+async function hasLiveUnixListener(
+  endpoint: string,
+  deadline: ReturnType<typeof createPhaseDeadline>,
+  signal: AbortSignal,
+): Promise<boolean> {
   let probe: Socket | undefined;
+  let removeAbort = (): void => undefined;
   const completion = new Promise<boolean>((resolve) => {
     let settled = false;
     const finish = (live: boolean): void => {
@@ -558,48 +779,44 @@ async function hasLiveUnixListener(endpoint: string): Promise<boolean> {
       }
       resolve(live);
     };
+    const onConnect = (): void => finish(true);
+    const onError = (): void => finish(false);
+    const onClose = (): void => finish(false);
 
     try {
       probe = createConnection(endpoint);
-      probe.once('connect', () => finish(true));
-      probe.once('error', () => finish(false));
+      probe.once('connect', onConnect);
+      probe.on('error', onError);
+      probe.once('close', onClose);
     } catch {
       finish(false);
     }
   });
 
-  try {
-    return await withPhaseDeadline(
-      'endpoint-cleanup-probe',
-      DEFAULT_HTTP_CLOSE_TIMEOUT_MS,
-      completion,
-      {
-        onTimeout: () => {
-          probe?.destroy();
-        },
-      },
-    );
-  } catch (error: unknown) {
-    if (error instanceof PhaseDeadlineExceededError) {
-      return true;
+  const destroyProbe = (): void => {
+    if (probe !== undefined && !probe.destroyed) {
+      probe.destroy();
     }
-    return true;
+  };
+  removeAbort = onAbort(signal, destroyProbe);
+  try {
+    return await withDeadline(completion, deadline, {
+      signal,
+      onTimeout: destroyProbe,
+    });
+  } finally {
+    removeAbort();
+    destroyProbe();
   }
 }
 
-/** Remove only the exact socket inode created by this bound server. */
-async function removeOwnedUnixSocket(
+async function removeOwnedUnixSocketWithinDeadline(
   endpoint: string,
-  identity: UnixSocketIdentity | undefined,
+  identity: UnixSocketIdentity,
+  deadline: ReturnType<typeof createPhaseDeadline>,
+  signal: AbortSignal,
 ): Promise<void> {
-  if (
-    identity === undefined ||
-    process.platform === 'win32' ||
-    endpointKind(endpoint) !== 'unix-socket'
-  ) {
-    return;
-  }
-
+  throwIfAborted(signal);
   let stat;
   try {
     stat = await lstat(endpoint);
@@ -609,12 +826,14 @@ async function removeOwnedUnixSocket(
     }
     throw error;
   }
+  throwIfAborted(signal);
   if (!stat.isSocket() || !sameUnixSocketIdentity(stat, identity)) {
     return;
   }
-  if (await hasLiveUnixListener(endpoint)) {
+  if (await hasLiveUnixListener(endpoint, deadline, signal)) {
     return;
   }
+  throwIfAborted(signal);
 
   const finalStat = await lstat(endpoint).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -622,6 +841,7 @@ async function removeOwnedUnixSocket(
     }
     throw error;
   });
+  throwIfAborted(signal);
   if (
     finalStat === undefined ||
     !finalStat.isSocket() ||
@@ -629,12 +849,53 @@ async function removeOwnedUnixSocket(
   ) {
     return;
   }
-  if (await hasLiveUnixListener(endpoint)) {
+  if (await hasLiveUnixListener(endpoint, deadline, signal)) {
+    return;
+  }
+  throwIfAborted(signal);
+
+  // Quarantine the directory entry atomically before unlinking it. If a
+  // replacement unlinked/rebound the endpoint during the final probe, the
+  // quarantined inode will fail the identity check and is restored with a
+  // non-overwriting hard link, so this operation never unlinks the replacement.
+  const quarantine = `${endpoint}.cleanup-${randomUUID()}`;
+  throwIfAborted(signal);
+  try {
+    await rename(endpoint, quarantine);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+  throwIfAborted(signal);
+
+  const quarantinedStat = await lstat(quarantine);
+  throwIfAborted(signal);
+  if (quarantinedStat.isSocket() && sameUnixSocketIdentity(quarantinedStat, identity)) {
+    try {
+      await unlink(quarantine);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+    }
     return;
   }
 
+  // A different inode was moved by the race. Restore it without replacing an
+  // endpoint that another listener may have claimed while the path was absent.
   try {
-    await unlink(endpoint);
+    await link(quarantine, endpoint);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      return;
+    }
+    throw error;
+  }
+  throwIfAborted(signal);
+  try {
+    await unlink(quarantine);
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
@@ -642,11 +903,102 @@ async function removeOwnedUnixSocket(
   }
 }
 
+/** Remove only the exact socket inode created by this bound server. */
+async function removeOwnedUnixSocket(
+  endpoint: string,
+  identity: UnixSocketIdentity | undefined,
+  timeoutMs: number,
+): Promise<void> {
+  if (
+    identity === undefined ||
+    process.platform === 'win32' ||
+    endpointKind(endpoint) !== 'unix-socket'
+  ) {
+    return;
+  }
+
+  await withEndpointOperationLock(endpoint, async () => {
+    const deadline = createPhaseDeadline('endpoint-cleanup', timeoutMs);
+    await withDeadline(
+      (signal) => removeOwnedUnixSocketWithinDeadline(endpoint, identity, deadline, signal),
+      deadline,
+    );
+  });
+}
+
 function forceCloseServer(server: Server, sockets: Set<Socket>): void {
   for (const socket of sockets) {
     socket.destroy();
   }
   server.closeAllConnections();
+}
+
+function waitForSetEmpty<T>(items: Set<T>, signal: AbortSignal): Promise<void> {
+  if (items.size === 0) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: NodeJS.Immediate | undefined;
+    let removeAbort = (): void => undefined;
+
+    const cleanup = (): void => {
+      if (timer !== undefined) {
+        clearImmediate(timer);
+      }
+      removeAbort();
+    };
+    const settle = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const check = (): void => {
+      if (items.size === 0) {
+        settle(resolve);
+        return;
+      }
+      timer = setImmediate(check);
+    };
+    removeAbort = onAbort(signal, (error) => settle(() => reject(error)));
+    if (!settled) {
+      check();
+    }
+  });
+}
+
+async function waitForServerResources(
+  closeOperation: Promise<void>,
+  sockets: Set<Socket>,
+  activeRequests: Set<AbortController>,
+  signal: AbortSignal,
+): Promise<void> {
+  const resourceController = new AbortController();
+  let closeFailure: unknown;
+  const removeAbort = onAbort(signal, (error) => resourceController.abort(error));
+  const observedClose = closeOperation.catch((error: unknown) => {
+    closeFailure = error;
+    resourceController.abort(error);
+    throw error;
+  });
+
+  try {
+    try {
+      await Promise.all([
+        observedClose,
+        waitForSetEmpty(sockets, resourceController.signal),
+        waitForSetEmpty(activeRequests, resourceController.signal),
+      ]);
+    } catch (error: unknown) {
+      throw closeFailure ?? error;
+    }
+  } finally {
+    removeAbort();
+    resourceController.abort();
+  }
 }
 
 async function closeServer(
@@ -674,34 +1026,32 @@ async function closeServer(
     socket.destroy();
   }
 
-  let closeFailure: unknown;
-  let closeOperation: Promise<void>;
-  try {
-    closeOperation = new Promise<void>((resolve, reject) => {
-      try {
-        server.close((error?: Error) => {
-          if (
-            error !== undefined &&
-            (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
-          ) {
-            reject(error);
-            return;
-          }
-          resolve();
-        });
-      } catch (error: unknown) {
-        reject(error);
-      }
-    });
-  } catch (error: unknown) {
-    closeFailure = error;
-    closeOperation = Promise.resolve();
-  }
+  const closeOperation = new Promise<void>((resolve, reject) => {
+    try {
+      server.close((error?: Error) => {
+        if (
+          error !== undefined &&
+          (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
+        ) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    } catch (error: unknown) {
+      reject(error);
+    }
+  });
+  const waitForResources = (signal: AbortSignal): Promise<void> =>
+    waitForServerResources(closeOperation, sockets, activeRequests, signal);
 
+  let closeFailure: unknown;
+  let resourcesConfirmed = false;
   try {
-    await withPhaseDeadline('close', timeoutMs, closeOperation, {
+    await withPhaseDeadline('close', timeoutMs, waitForResources, {
       onTimeout: () => forceCloseServer(server, sockets),
     });
+    resourcesConfirmed = true;
   } catch (error: unknown) {
     if (error instanceof PhaseDeadlineExceededError) {
       forceCloseServer(server, sockets);
@@ -709,24 +1059,27 @@ async function closeServer(
         await withPhaseDeadline(
           'close-force',
           DEFAULT_HTTP_FORCE_CLOSE_TIMEOUT_MS,
-          closeOperation,
+          waitForResources,
           { onTimeout: () => forceCloseServer(server, sockets) },
         );
+        resourcesConfirmed = true;
       } catch (forceError: unknown) {
-        if (!(forceError instanceof PhaseDeadlineExceededError)) {
-          closeFailure ??= forceError;
-        }
+        // Do not clean the endpoint or report a successful close when the
+        // forced resource-completion phase itself exceeded its deadline.
+        closeFailure = forceError;
       }
     } else {
-      closeFailure ??= error;
+      closeFailure = error;
     }
   }
 
   let cleanupFailure: unknown;
-  try {
-    await removeOwnedUnixSocket(endpoint, identity);
-  } catch (error: unknown) {
-    cleanupFailure = error;
+  if (resourcesConfirmed) {
+    try {
+      await removeOwnedUnixSocket(endpoint, identity, timeoutMs);
+    } catch (error: unknown) {
+      cleanupFailure = error;
+    }
   }
 
   if (closeFailure !== undefined && cleanupFailure !== undefined) {
@@ -771,6 +1124,11 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
       options.handlerTimeoutMs,
       DEFAULT_HTTP_HANDLER_TIMEOUT_MS,
       'handlerTimeoutMs',
+    ),
+    writeTimeoutMs: normalizeTimeout(
+      options.writeTimeoutMs,
+      DEFAULT_HTTP_WRITE_TIMEOUT_MS,
+      'writeTimeoutMs',
     ),
   };
   const counters: ServerCounters = { connectionCount: 0, requestCount: 0 };
@@ -824,28 +1182,44 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
     });
   });
   server.on('clientError', (_error, socket) => {
-    if (!socket.destroyed) {
-      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    if (socket.destroyed) {
+      return;
     }
+    const body = Buffer.from(
+      'HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+      'ascii',
+    );
+    void withPhaseDeadline(
+      'client-error-write',
+      normalized.writeTimeoutMs,
+      (signal) => writeSocketAndEnd(socket, body, signal),
+      { onTimeout: () => socket.destroy() },
+    ).catch(() => {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+    });
   });
 
   let ownedEndpoint: UnixSocketIdentity | undefined;
   const startedAt = performance.now();
   try {
-    await new Promise<void>((resolve, reject) => {
-      const onListening = (): void => {
-        server.off('error', onError);
-        resolve();
-      };
-      const onError = (error: Error): void => {
-        server.off('listening', onListening);
-        reject(error);
-      };
-      server.once('listening', onListening);
-      server.once('error', onError);
-      server.listen(normalized.endpoint);
+    await withEndpointOperationLock(normalized.endpoint, async () => {
+      await new Promise<void>((resolve, reject) => {
+        const onListening = (): void => {
+          server.off('error', onError);
+          resolve();
+        };
+        const onError = (error: Error): void => {
+          server.off('listening', onListening);
+          reject(error);
+        };
+        server.once('listening', onListening);
+        server.once('error', onError);
+        server.listen(normalized.endpoint);
+      });
+      ownedEndpoint = await captureOwnedUnixSocket(normalized.endpoint);
     });
-    ownedEndpoint = await captureOwnedUnixSocket(normalized.endpoint);
   } catch (error: unknown) {
     try {
       await closeServer(
@@ -873,6 +1247,7 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
     maxResponseBytes: normalized.maxResponseBytes,
     requestTimeoutMs: normalized.requestTimeoutMs,
     handlerTimeoutMs: normalized.handlerTimeoutMs,
+    writeTimeoutMs: normalized.writeTimeoutMs,
     keepAlive: false,
     get connectionCount(): number {
       return counters.connectionCount;
@@ -896,7 +1271,7 @@ export async function bindHttpIpc(options: HttpIpcServerOptions): Promise<HttpIp
         pendingHeaders,
         shutdownController,
         closeOptions,
-      ).finally(() => {
+      ).then(() => {
         boundServer = undefined;
       });
       return closePromise;

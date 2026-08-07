@@ -335,6 +335,16 @@ describe('HTTP over local IPC comparison candidate', () => {
     ).rejects.toBeInstanceOf(HttpIpcBodyLimitError);
   });
 
+  it('bounds server response writes and completes resource cleanup', async () => {
+    const candidate = await startServer(() => Buffer.from('late'), { writeTimeoutMs: 0 });
+
+    await expect(requestHttpIpc(candidate.endpoint, Buffer.from('request'))).rejects.toBeDefined();
+    expect(candidate.server.requestCount).toBe(1);
+
+    await candidate.server.close({ timeoutMs: 500 });
+    expect(candidate.server.activeConnectionCount).toBe(0);
+  });
+
   it('bounds raw HTTP response capture', async () => {
     const responseCandidate = await startServer(() => Buffer.alloc(64, 0x41));
     await expect(
@@ -443,6 +453,30 @@ describe('HTTP over local IPC comparison candidate', () => {
     }
   });
 
+  it('bounds endpoint cleanup by the caller deadline and preserves a failed close', async () => {
+    const candidate = await startServer((payload) => payload);
+    if (process.platform === 'win32') {
+      await candidate.server.close({ timeoutMs: 0 });
+      return;
+    }
+
+    try {
+      const firstClose = candidate.server.close({ timeoutMs: 0 });
+      await expect(firstClose).rejects.toMatchObject({
+        name: 'PhaseDeadlineExceededError',
+        phase: 'endpoint-cleanup',
+      });
+      await expect(candidate.server.close({ timeoutMs: 500 })).rejects.toMatchObject({
+        name: 'PhaseDeadlineExceededError',
+        phase: 'endpoint-cleanup',
+      });
+    } finally {
+      const index = runningServers.indexOf(candidate.server);
+      if (index >= 0) {
+        runningServers.splice(index, 1);
+      }
+    }
+  });
   it('represents Windows named pipes explicitly even when this run is not Windows', () => {
     const endpoint = createHttpIpcEndpoint({ platform: 'win32', runtimeId: 'http-test' });
     expect(getHttpIpcEndpointKind(endpoint)).toBe('named-pipe');
