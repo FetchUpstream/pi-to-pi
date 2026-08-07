@@ -24,16 +24,20 @@ watchers, or child processes.
 
 ### Requirement: Use settled state as the turn boundary
 
-The adapter SHALL treat `agent_settled` as the boundary at which a turn has no
-automatic retry, compaction, or queued continuation remaining. It MUST NOT
-complete request work solely on `agent_end`.
+The adapter SHALL treat `agent_settled` as the boundary at which Pi reports no
+automatic continuation remains. It MUST NOT complete request work solely on
+`agent_end`. The fixture demonstrates this boundary with a scripted retry;
+compaction and automatic queued-continuation paths are untested and are not
+guarantees of this spike.
 
-#### Scenario: Low-level run ends before settlement
+#### Scenario: Low-level run ends before scripted retry settles
 
-- **WHEN** Pi emits `agent_end` while a retry, compaction, or queued continuation
-  remains
+- **WHEN** Pi emits `agent_end` while a scripted retry remains
 - **THEN** the adapter observes that the context is not idle and leaves request
   state unresolved
+
+Compaction and automatic queued-continuation paths are not exercised by this
+fixture and remain untested.
 
 #### Scenario: Agent settles
 

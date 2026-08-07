@@ -58,9 +58,11 @@ message.
 - **THEN** the adapter rejects or records the reply as unmatched and does not
   complete another request
 
-#### Scenario: Agent run ends before automatic continuation
+#### Scenario: Agent run ends before scripted retry settles
 
-- **WHEN** `agent_end` occurs before a retry, compaction, or queued continuation
-  has settled
+- **WHEN** `agent_end` occurs before a scripted retry has settled
 - **THEN** the adapter does not emit a request reply merely because an assistant
   message is currently the newest transcript message
+
+This fixture does not exercise compaction or automatic queued-continuation paths;
+those lifecycle cases remain untested by this spike.

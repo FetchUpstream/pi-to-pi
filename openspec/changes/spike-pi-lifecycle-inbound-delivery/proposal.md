@@ -1,13 +1,13 @@
 ## Why
 
-The current extension scaffold proves only that Pi can load the package and register basic lifecycle hooks. Before implementing peer routing, Pi-to-Pi needs an executable contract for lifecycle boundaries, busy-agent delivery, retries/compaction, and request/reply correlation; otherwise a reply can be attributed to the wrong inbound request or the wrong session.
+The current extension scaffold proves only that Pi can load the package and register basic lifecycle hooks. Before implementing peer routing, Pi-to-Pi needs an executable contract for lifecycle boundaries, busy-agent delivery, scripted retry settling, and request/reply correlation; compaction and automatic queued-continuation behavior are explicitly untested in this spike.
 
 ## What Changes
 
 - Add deterministic in-process fixture tests against the current Pi extension API.
 - Verify lifecycle ordering and cleanup for startup, reload, new, resume, fork, clone, and shutdown.
 - Verify idle, busy-steer, and busy-follow-up custom-message delivery, including preservation of request IDs in `details`.
-- Verify that `agent_settled`, not `agent_end`, is the request-completion boundary.
+- Verify that `agent_settled`, not `agent_end`, is the request-completion boundary using scripted retry evidence; compaction and automatic queued-continuation paths remain untested.
 - Define explicit request-scoped reply correlation and session-scoped task metadata recovery.
 - Persist only task metadata needed for reload recovery; do not duplicate message bodies.
 - Record the resulting guarantees in a Pi integration ADR/test report.

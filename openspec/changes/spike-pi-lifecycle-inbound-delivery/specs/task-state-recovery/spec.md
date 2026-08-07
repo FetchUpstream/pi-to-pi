@@ -10,7 +10,9 @@ with an exact version-1, body-free schema containing:
 - `sessionId`, the immutable origin session identity captured when the task is
   accepted;
 - `ownerSessionId`, the current session identity that wrote the latest record;
-- `runtimeId`, the runtime identity that wrote the latest record;
+- `runtimeId`, a non-empty caller-supplied fixture provenance label; the fixture
+  does not derive or validate it from `AgentSessionRuntime`, enforce uniqueness,
+  or authenticate the writer; actual runtime identity is outside this spike;
 - `peerId`, the peer identity when known, otherwise `null`;
 - `state`, one of `accepted`, `completed`, `failed`, `expired`, or `superseded`;
 - `updatedAt`, an ISO timestamp;
@@ -19,19 +21,21 @@ with an exact version-1, body-free schema containing:
   required.
 
 The initial accepted record sets `sessionId` and `ownerSessionId` to the
-current session. Each transition preserves the immutable `sessionId`,
-`peerId`, and `expiresAt`; `ownerSessionId` and `runtimeId` identify the
-session and runtime that wrote that transition. For a `superseded` record, the
-destination `ownerSessionId` is audit-only and does not grant live ownership or
-completion authority. The adapter SHALL NOT duplicate
-request or response bodies in task metadata.
+current session. Each transition preserves the immutable `sessionId`, `peerId`,
+and `expiresAt`; `ownerSessionId` records the session that wrote the transition.
+In this fixture, `runtimeId` records a caller-supplied fixture option or transition
+argument and is not derived from or validated against the bound runtime object.
+For a `superseded` record, the destination `ownerSessionId` is audit-only and
+does not grant live ownership or completion authority. The adapter SHALL NOT
+duplicate request or response bodies in task metadata.
 
 #### Scenario: Accepted request is recorded
 
 - **WHEN** request `request-a` is accepted
 - **THEN** the session contains a body-free `p2p.task` record for `request-a`
   with `sessionId` and `ownerSessionId` equal to the current session identity,
-  a runtime identity, any known `peerId`, and state `accepted`
+  a caller-supplied `runtimeId` provenance label, any known `peerId`, and state
+  `accepted`
 
 #### Scenario: State transition is append-only
 
@@ -39,6 +43,25 @@ request or response bodies in task metadata.
 - **THEN** the adapter appends a new state record, preserves the immutable
   origin `sessionId`, and makes the latest record authoritative after folding
   records by `requestId`
+
+The fixture applies this transition matrix; expiry is evaluated at `now`, and a
+`null` `expiresAt` means that an accepted record does not expire:
+
+| Current latest state | Next state | Allowed condition | Result |
+| --- | --- | --- | --- |
+| no record | `accepted` | Initial append; `expiresAt` is an ISO timestamp or `null`; `reason` is `null` | Non-terminal |
+| `accepted` | `completed` or `failed` | Current session owns the record and it is unexpired, including `expiresAt: null` | Terminal |
+| `accepted` | `expired` | Current session owns the record and a non-null `expiresAt` is at or before `now` | Terminal |
+| `accepted` | `superseded` | Lifecycle-authorized inherited fork/clone record is unexpired and has a non-empty reason | Terminal; destination ownership is audit-only |
+| `accepted` | `accepted` | Never | Rejected |
+| `completed`, `failed`, `expired`, or `superseded` | Any state | Never; terminal records have no outgoing transitions | Rejected |
+
+An accepted record may be appended with an already-passed expiry, but recovery
+excludes it and only the explicit `accepted` → `expired` transition is valid.
+Every allowed transition appends a record, preserves `sessionId`, `peerId`, and
+`expiresAt`, and does not move `updatedAt` backwards. `requestId` is folded only
+within the selected session branch; this fixture does not establish process-global
+request ID uniqueness.
 
 ### Requirement: Recover non-terminal tasks after reload
 
@@ -89,8 +112,9 @@ The adapter SHALL treat copied non-terminal task records in a forked or cloned
 session as inherited history. Before the new session can complete such a task,
 it SHALL append a `superseded` record with a reason identifying the session
 replacement. The superseding record SHALL preserve the immutable `sessionId`,
-`peerId`, and `expiresAt`, and SHALL set `ownerSessionId` and `runtimeId` to the
-destination identities. Fork/clone replacement is superseded-only: it SHALL
+`peerId`, and `expiresAt`, and SHALL set `ownerSessionId` to the destination
+session and `runtimeId` to its caller-supplied fixture option. Fork/clone
+replacement is superseded-only: it SHALL
 not reopen copied work or create another non-terminal state for the inherited
 request.
 
@@ -112,4 +136,8 @@ request.
 This contract is exercised by the in-process faux-provider fixture and its
 isolated session files. It does not implement production task persistence,
 transport or router behavior, cross-process failure handling, or crash
-durability guarantees; those remain outside this spike's scope.
+durability guarantees; those remain outside this spike's scope. The fixture
+also retains every append-only `p2p.task` entry without pruning terminal records
+or bounding session-file history. This unbounded-retention limitation is measured
+against the repository retention convention in `SPEC.md`; production retention
+and garbage collection remain future work.
