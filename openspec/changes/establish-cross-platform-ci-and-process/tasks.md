@@ -20,13 +20,13 @@
 
 ## 4. Prove the harness acceptance cases
 
-- [ ] 4.1 Add a process smoke test that starts two independent fixtures concurrently, observes distinct readiness events, requests clean shutdown, and verifies both exit successfully.
-- [ ] 4.2 Add a bounded-timeout test for a deliberately hung fixture that asserts the expected rejection, captures diagnostics, terminates the child, and verifies cleanup.
-- [ ] 4.3 Add abrupt-termination coverage that verifies the portable kill helper on each operating system and remains safe when teardown repeats it.
-- [ ] 4.4 Add concurrent fixture and diagnostic assertions covering unique workspaces, independent stdout/stderr, CRLF event parsing, and no dependency on a global daemon.
+- [x] 4.1 Add a process smoke test that starts two independent fixtures concurrently, observes distinct readiness events, requests clean shutdown, and verifies both exit successfully.
+- [x] 4.2 Add a bounded-timeout test for a deliberately hung fixture that asserts the expected rejection, captures diagnostics, terminates the child, and verifies cleanup.
+- [x] 4.3 Add abrupt-termination coverage that verifies the portable kill helper on each operating system and remains safe when teardown repeats it.
+- [x] 4.4 Add concurrent fixture and diagnostic assertions covering unique workspaces, independent stdout/stderr, CRLF event parsing, and no dependency on a global daemon.
 
 ## 5. Integrate and document the reusable support
 
-- [ ] 5.1 Keep process helpers and fixtures under the established `tests/` boundaries so later protocol, registry, transport, and Pi tests can import them without importing final protocol code.
-- [ ] 5.2 Update test-directory documentation with fixture control conventions, cleanup expectations, and the distinction between Node harness tests and future real-Pi integration tests.
+- [x] 5.1 Keep process helpers and fixtures under the established `tests/` boundaries so later protocol, registry, transport, and Pi tests can import them without importing final protocol code.
+- [x] 5.2 Update test-directory documentation with fixture control conventions, cleanup expectations, and the distinction between Node harness tests and future real-Pi integration tests.
 - [ ] 5.3 Run formatting, linting, type checking, unit/integration/process tests, and build locally; resolve Linux, macOS, and Windows-specific failures surfaced by CI.
