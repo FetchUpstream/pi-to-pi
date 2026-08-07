@@ -17,6 +17,7 @@ import { asRoomId, type RoomId, type RoomLike } from '../room.js';
 import {
   asPublishedNetworkName,
   isPublishedNetworkName,
+  runtimeNameSuffix,
   type PublishedNetworkName,
 } from './naming.js';
 import {
@@ -286,12 +287,17 @@ function assertText(value: unknown, field: string, maxLength: number): string {
   return value;
 }
 
-function canonicalNetworkName(value: unknown): RegistryNetworkName {
+function canonicalNetworkName(value: unknown, runtimeId: RuntimeId): RegistryNetworkName {
   if (typeof value !== 'string') {
     throw new TypeError('network name must be text');
   }
   if (isPublishedNetworkName(value)) {
-    return asPublishedNetworkName(value);
+    const published = asPublishedNetworkName(value);
+    const separator = published.lastIndexOf('-');
+    if (published.slice(separator + 1) !== runtimeNameSuffix(runtimeId)) {
+      throw new TypeError('network name suffix must match runtime ID');
+    }
+    return published;
   }
   const normalized = asNormalizedName(value);
   if (normalized !== value) {
@@ -370,7 +376,7 @@ function validateRecordFields(
     networkName = '' as RegistryNetworkName;
   } else {
     try {
-      networkName = canonicalNetworkName(value.networkName);
+      networkName = canonicalNetworkName(value.networkName, runtimeId);
     } catch {
       errors.push({ field: 'networkName', message: 'must be a canonical network name' });
       networkName = '' as RegistryNetworkName;
@@ -1330,7 +1336,9 @@ function matchesCleanupExpectation(
   }
   if (options.expectedNetworkName !== undefined) {
     try {
-      if (record.networkName !== canonicalNetworkName(options.expectedNetworkName)) {
+      if (
+        record.networkName !== canonicalNetworkName(options.expectedNetworkName, record.runtimeId)
+      ) {
         return false;
       }
     } catch {
@@ -1527,7 +1535,7 @@ export class RuntimeRegistry {
       throw new RuntimeRegistryError('networkName is required');
     }
     try {
-      this.networkName = canonicalNetworkName(networkName);
+      this.networkName = canonicalNetworkName(networkName, this.runtimeId);
     } catch (error) {
       if (error instanceof RuntimeRegistryError) {
         throw error;

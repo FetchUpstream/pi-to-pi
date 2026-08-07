@@ -136,6 +136,38 @@ describe('runtime record validation and atomic publication', () => {
     ).toEqual(registry.current());
     await registry.shutdown();
   });
+  it('rejects a published suffix owned by another runtime', async () => {
+    const root = await temporaryRoot();
+    const owner = record(RUNTIME_A);
+    const wrongSuffix = {
+      ...owner,
+      networkName: buildNetworkName('planner', RUNTIME_B),
+    };
+
+    const validation = validateRuntimeRecord(wrongSuffix);
+    expect(validation.valid).toBe(false);
+    expect(validation.errors).toContainEqual({
+      field: 'networkName',
+      message: 'must be a canonical network name',
+    });
+    expect(parseRuntimeRecordJson(JSON.stringify(wrongSuffix)).valid).toBe(false);
+    await expect(
+      publishRuntimeRecordAtomically(wrongSuffix, { rootDirectory: root }),
+    ).rejects.toThrow('networkName');
+
+    expect(
+      () =>
+        new RuntimeRegistry({
+          runtimeId: RUNTIME_A,
+          sessionId: owner.sessionId,
+          roomId: ROOM_ID,
+          networkName: wrongSuffix.networkName,
+          endpoint: owner.endpoint,
+          rootDirectory: root,
+          now: 1_000,
+        }),
+    ).toThrow('networkName must be a canonical base or published network name');
+  });
 
   it('publishes a complete record atomically under a full runtime UUID key', async () => {
     const root = await temporaryRoot();
