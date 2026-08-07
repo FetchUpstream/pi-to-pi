@@ -21,9 +21,8 @@ import {
 The barrel exposes workspace, bounded-wait, output/JSON-lines, and managed-process helpers. The
 support modules do not import protocol, registry, transport, routing, or Pi implementation code;
 later tests can therefore reuse them without importing the final wire protocol. Support-module tests
-under `tests/support/` may import their module directly. The process-harness acceptance test
-(`tests/process/harness.test.ts`) is also an intentional direct-import exception: it imports
-`process.js`, `wait.js`, and `workspace.js` while exercising the harness implementation.
+under `tests/support/` may import their module directly to test that module's behavior. The process-harness
+test (`tests/process/harness.test.ts`) uses the public `../support/index.js` barrel.
 
 ## Fixture control and cleanup
 

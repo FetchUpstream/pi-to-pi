@@ -6,8 +6,7 @@ worker without a daemon, provider credentials, network service, TTY, or interact
 
 ## Support imports
 
-Process and integration consumers should use the reusable support barrel from `tests/support/index.ts`.
-The acceptance test's direct imports are an intentional exception documented in `tests/support/README.md`.
+Process-level harness tests import reusable helpers from the public `../support/index.js` barrel:
 
 ```ts
 import {
