@@ -92,6 +92,7 @@ export interface RuntimeShutdownReport {
 export type RuntimePersistenceSetTimeout = (callback: () => void, delayMs: number) => unknown;
 export type RuntimePersistenceClearTimeout = (handle: unknown) => void;
 export interface RuntimeOperationGuardState {
+  /** Keys are the sender runtime generation plus the wire operation ID. */
   readonly acceptedOperations: Map<string, AcceptedOperationRecord>;
   readonly unreachableResults: Map<string, UnreachableRecord>;
 }
@@ -99,6 +100,41 @@ export interface RuntimeOperationGuardState {
 export interface RuntimeIdentityHistory {
   readonly issued: Map<string, number>;
   readonly retentionMs: number;
+}
+
+/** One sender-generation/operation destination state shared by local adapters. */
+export interface RuntimeDestinationGuardRecord {
+  readonly senderRuntimeId: string;
+  readonly operationId: string;
+  readonly recipientRuntimeId: string;
+  /** Sender runtime ID is the generation fence for this transport-independent guard. */
+  readonly generation: string | number;
+  readonly retainedUntil: number;
+  state: 'pending' | 'delivered' | 'unreachable';
+  unreachableMessage?: string;
+  timer?: unknown;
+  clearTimeout?: RuntimePersistenceClearTimeout;
+}
+
+const destinationGuardStates = new WeakMap<
+  RuntimeOperationGuardState,
+  Map<string, RuntimeDestinationGuardRecord>
+>();
+export function runtimeOperationGuardKey(senderRuntimeId: string, operationId: string): string {
+  return `${senderRuntimeId}\u0000${operationId}`;
+}
+
+/** Return the destination state machine associated with one guard state object. */
+export function runtimeDestinationGuardStateFor(
+  state: RuntimeOperationGuardState,
+): Map<string, RuntimeDestinationGuardRecord> {
+  const existing = destinationGuardStates.get(state);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const created = new Map<string, RuntimeDestinationGuardRecord>();
+  destinationGuardStates.set(state, created);
+  return created;
 }
 export interface RuntimePersistenceOptions {
   /** Use an already-created identity, without sharing any state with it. */
@@ -136,6 +172,9 @@ export interface RuntimeReloadOptions extends Omit<
 export interface AcceptedOperation {
   readonly operationId: string;
   readonly recipientRuntimeId: string;
+  /** Sender generation is part of the operation guard identity. */
+  readonly senderRuntimeId?: string;
+  readonly generation?: string;
 }
 
 export interface RuntimeUnreachableResult {
@@ -143,11 +182,14 @@ export interface RuntimeUnreachableResult {
   readonly operationId: string;
   readonly error: ProtocolError & { readonly code: 'unreachable' };
   readonly recipientRuntimeId?: string;
+  /** Sender generation is part of the operation guard identity. */
+  readonly senderRuntimeId?: string;
+  readonly generation?: string;
 }
 
 /** Error raised when a closed runtime or a stale operation is used. */
 export class RuntimePersistenceError extends Error {
-  readonly code: 'closed' | 'stale_operation' | 'identity_conflict';
+  readonly code: 'closed' | 'stale_operation' | 'identity_conflict' | 'busy';
   readonly operationId?: string;
   readonly recipientRuntimeId?: string;
 
@@ -167,6 +209,9 @@ type RuntimeDeadlineInput = string | number | Date;
 
 export interface AcceptedOperationRecord {
   readonly value: AcceptedOperation;
+  readonly senderRuntimeId: string;
+  /** Sender runtime ID is also the generation fence for this guard. */
+  readonly generation: string;
   readonly retainedUntil: number;
   stale: boolean;
   timer?: unknown;
@@ -174,6 +219,9 @@ export interface AcceptedOperationRecord {
 }
 export interface UnreachableRecord {
   readonly value: RuntimeUnreachableResult;
+  readonly senderRuntimeId: string;
+  /** Sender runtime ID is also the generation fence for this guard. */
+  readonly generation: string;
   readonly recipientRuntimeId?: string;
   readonly message: string;
   readonly retainedUntil: number;
@@ -184,8 +232,14 @@ export interface UnreachableRecord {
 const DEFAULT_SHUTDOWN_HOOK_TIMEOUT_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_IDENTIFIER_LENGTH = 256;
-const MAX_RETENTION_GRACE_MS = DEDUPE_RETENTION_GRACE_MS;
+const MIN_RETENTION_GRACE_MS = DEDUPE_RETENTION_GRACE_MS;
+const MAX_RETENTION_GRACE_MS = Number.MAX_SAFE_INTEGER;
 const MAX_OPERATION_DEADLINE_HORIZON_MS = MAX_REQUEST_TTL_MS;
+export const RUNTIME_ID_GUARD_RETENTION_MS =
+  MAX_OPERATION_DEADLINE_HORIZON_MS + MIN_RETENTION_GRACE_MS;
+const MAX_OPERATION_GUARD_ENTRIES = 4_096;
+const MAX_RUNTIME_ID_HISTORY_ENTRIES = 4_096;
+const MAX_SHUTDOWN_HOOKS = 256;
 const runtimeGuardStates = new WeakMap<object, RuntimeOperationGuardState>();
 function defaultSetTimeout(callback: () => void, delayMs: number): unknown {
   return globalThis.setTimeout(callback, delayMs);
@@ -214,12 +268,30 @@ function finiteNow(value: number): number {
 
 function validateRetentionGrace(value: number | undefined, fallback: number): number {
   const grace = value ?? fallback;
-  if (!Number.isSafeInteger(grace) || grace < 0 || grace > MAX_RETENTION_GRACE_MS) {
+  if (
+    !Number.isSafeInteger(grace) ||
+    grace < MIN_RETENTION_GRACE_MS ||
+    grace > MAX_RETENTION_GRACE_MS
+  ) {
     throw new RangeError(
-      `retentionGraceMs must be a non-negative safe integer no greater than ${MAX_RETENTION_GRACE_MS}`,
+      `retentionGraceMs must be a safe integer between ${MIN_RETENTION_GRACE_MS} and ${MAX_RETENTION_GRACE_MS}`,
     );
   }
   return grace;
+}
+
+function validateRuntimeIdRetention(
+  value: number | undefined,
+  fallback: number,
+  minimum = RUNTIME_ID_GUARD_RETENTION_MS,
+): number {
+  const retention = value ?? fallback;
+  if (retention !== Infinity && (!Number.isSafeInteger(retention) || retention < minimum)) {
+    throw new RangeError(
+      `runtimeIdRetentionMs must be Infinity or a safe integer of at least ${minimum}`,
+    );
+  }
+  return retention;
 }
 
 function deadlineMs(value: RuntimeDeadlineInput | undefined, nowMs: number): number {
@@ -240,6 +312,9 @@ function deadlineMs(value: RuntimeDeadlineInput | undefined, nowMs: number): num
   }
   if (!Number.isSafeInteger(parsed)) {
     throw new TypeError('operation expiry must be a finite safe timestamp');
+  }
+  if (parsed <= nowMs) {
+    throw new RangeError('operation expiry is already elapsed');
   }
   if (parsed > nowMs + MAX_OPERATION_DEADLINE_HORIZON_MS) {
     throw new RangeError('operation expiry exceeds the v1 deadline horizon');
@@ -453,20 +528,20 @@ function assertCachedReplacementOptions(
 function validateReloadOptions(options: RuntimeReloadOptions): void {
   validateShutdownOptions(options.shutdown);
   if (options.retentionGraceMs !== undefined) {
-    validateRetentionGrace(options.retentionGraceMs, DEDUPE_RETENTION_GRACE_MS);
+    validateRetentionGrace(options.retentionGraceMs, MIN_RETENTION_GRACE_MS);
   }
   if (options.dedupeStoreOptions?.retentionGraceMs !== undefined) {
-    validateRetentionGrace(options.dedupeStoreOptions.retentionGraceMs, DEDUPE_RETENTION_GRACE_MS);
+    validateRetentionGrace(options.dedupeStoreOptions.retentionGraceMs, MIN_RETENTION_GRACE_MS);
   }
   if (
-    options.runtimeIdRetentionMs !== undefined &&
-    (!Number.isSafeInteger(options.runtimeIdRetentionMs) ||
-      options.runtimeIdRetentionMs < 0 ||
-      options.runtimeIdRetentionMs > MAX_RETENTION_GRACE_MS)
+    options.retentionGraceMs !== undefined &&
+    options.dedupeStoreOptions?.retentionGraceMs !== undefined &&
+    options.retentionGraceMs !== options.dedupeStoreOptions.retentionGraceMs
   ) {
-    throw new RangeError(
-      `runtimeIdRetentionMs must be a non-negative safe integer no greater than ${MAX_RETENTION_GRACE_MS}`,
-    );
+    throw new RangeError('retentionGraceMs conflicts with dedupeStoreOptions.retentionGraceMs');
+  }
+  if (options.runtimeIdRetentionMs !== undefined) {
+    validateRuntimeIdRetention(options.runtimeIdRetentionMs, RUNTIME_ID_GUARD_RETENTION_MS);
   }
 }
 
@@ -607,7 +682,7 @@ export class RuntimePersistence {
   private readonly setTimeout: RuntimePersistenceSetTimeout;
   private readonly clearTimeout: RuntimePersistenceClearTimeout;
   private readonly retentionGraceMs: number;
-  private readonly runtimeIdentityHistory: RuntimeIdentityHistory;
+  public readonly runtimeIdentityHistory: RuntimeIdentityHistory;
   public readonly operationGuardState: RuntimeOperationGuardState;
   private readonly acceptedOperations: Map<string, AcceptedOperationRecord>;
   private readonly unreachableResults: Map<string, UnreachableRecord>;
@@ -617,28 +692,57 @@ export class RuntimePersistence {
     this.now = options.now ?? (() => Date.now());
     this.setTimeout = options.setTimeout ?? defaultSetTimeout;
     this.clearTimeout = options.clearTimeout ?? defaultClearTimeout;
+    const configuredGrace = options.retentionGraceMs;
+    const dedupeConfiguredGrace = options.dedupeStoreOptions?.retentionGraceMs;
+    if (
+      configuredGrace !== undefined &&
+      dedupeConfiguredGrace !== undefined &&
+      configuredGrace !== dedupeConfiguredGrace
+    ) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'retentionGraceMs conflicts with dedupeStoreOptions.retentionGraceMs',
+      );
+    }
+    const effectiveRetentionGrace = validateRetentionGrace(
+      configuredGrace ?? dedupeConfiguredGrace,
+      MIN_RETENTION_GRACE_MS,
+    );
+    const requiredRuntimeRetention = MAX_OPERATION_DEADLINE_HORIZON_MS + effectiveRetentionGrace;
+    const requestedRuntimeRetention = options.runtimeIdRetentionMs;
     const history =
       options.runtimeIdentityHistory ??
       ({
         issued: new Map<string, number>(),
-        retentionMs: options.runtimeIdRetentionMs ?? DEDUPE_RETENTION_GRACE_MS,
+        retentionMs: requestedRuntimeRetention ?? requiredRuntimeRetention,
       } satisfies RuntimeIdentityHistory);
-    if (
-      !Number.isSafeInteger(history.retentionMs) ||
-      history.retentionMs < 0 ||
-      history.retentionMs > MAX_RETENTION_GRACE_MS
-    ) {
-      throw new RangeError(
-        `runtimeIdRetentionMs must be a non-negative safe integer no greater than ${MAX_RETENTION_GRACE_MS}`,
+    const historyRetention = validateRuntimeIdRetention(
+      history.retentionMs,
+      requiredRuntimeRetention,
+      requiredRuntimeRetention,
+    );
+    if (requestedRuntimeRetention !== undefined && requestedRuntimeRetention !== historyRetention) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'runtimeIdRetentionMs conflicts with the shared runtime identity history',
       );
     }
     const nowMs = finiteNow(this.now());
     pruneRuntimeIdentityHistory(history, nowMs);
     this.runtimeIdentityHistory = history;
+    const cachedGuardState = runtimeGuardStates.get(history);
+    if (
+      options.operationGuardState !== undefined &&
+      cachedGuardState !== undefined &&
+      options.operationGuardState !== cachedGuardState
+    ) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'operationGuardState conflicts with the shared runtime identity history',
+      );
+    }
     const guardState =
-      options.operationGuardState ??
-      runtimeGuardStates.get(history) ??
-      sharedRuntimeOperationGuardState;
+      options.operationGuardState ?? cachedGuardState ?? sharedRuntimeOperationGuardState;
     runtimeGuardStates.set(history, guardState);
     this.operationGuardState = guardState;
     this.acceptedOperations = guardState.acceptedOperations;
@@ -650,13 +754,16 @@ export class RuntimePersistence {
         'runtimeId has already been issued in this runtime replacement chain',
       );
     }
+    if (history.issued.size >= MAX_RUNTIME_ID_HISTORY_ENTRIES) {
+      throw new RuntimePersistenceError(
+        'busy',
+        'runtime identity history has reached its bounded capacity',
+      );
+    }
     this.sessionId = this.identity.sessionId;
     this.runtimeId = this.identity.runtimeId;
     this.onShutdownTask = options.onShutdownTask;
-    this.retentionGraceMs = validateRetentionGrace(
-      options.retentionGraceMs ?? options.dedupeStoreOptions?.retentionGraceMs,
-      DEDUPE_RETENTION_GRACE_MS,
-    );
+    this.retentionGraceMs = effectiveRetentionGrace;
 
     const taskOptions = options.taskStoreOptions ?? {};
     if (
@@ -705,6 +812,18 @@ export class RuntimePersistence {
   public get closed(): boolean {
     return this.lifecycleState === 'closed';
   }
+  public get operationRetentionGraceMs(): number {
+    return this.retentionGraceMs;
+  }
+  public get clock(): () => number {
+    return this.now;
+  }
+  public get timeoutScheduler(): RuntimePersistenceSetTimeout {
+    return this.setTimeout;
+  }
+  public get timeoutClearer(): RuntimePersistenceClearTimeout {
+    return this.clearTimeout;
+  }
 
   public isActive(): boolean {
     return this.active;
@@ -726,25 +845,27 @@ export class RuntimePersistence {
   }
 
   /**
-   * Record that an operation was delivered/accepted for one destination.  A
-   * later attempt to send that operation ID to a different runtime is refused;
-   * callers must create a new operation ID after rediscovery.
+   * Record that an operation was delivered/accepted for one destination. A
+   * later attempt to send that sender-generation/operation key elsewhere is refused.
    */
   public recordAcceptedOperation(
     operationId: string,
     recipientRuntimeId: string,
     expiresAt?: RuntimeDeadlineInput,
+    senderRuntimeId?: string,
   ): AcceptedOperation {
     this.assertActive();
     const normalizedOperationId = requireText(operationId, 'operationId');
     const normalizedRecipient = requireText(recipientRuntimeId, 'recipientRuntimeId');
+    const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
+    const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
     const nowMs = finiteNow(this.now());
-    this.prune(nowMs);
     const requestedRetainedUntil =
       expiresAt === undefined
         ? undefined
         : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
-    const previousUnreachable = this.unreachableResults.get(normalizedOperationId);
+    this.prune(nowMs);
+    const previousUnreachable = this.unreachableResults.get(key);
     if (previousUnreachable !== undefined) {
       if (previousUnreachable.recipientRuntimeId !== normalizedRecipient) {
         throw new RuntimePersistenceError(
@@ -759,7 +880,7 @@ export class RuntimePersistence {
         { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
       );
     }
-    const previous = this.acceptedOperations.get(normalizedOperationId);
+    const previous = this.acceptedOperations.get(key);
     if (previous !== undefined) {
       if (previous.stale || previous.value.recipientRuntimeId !== normalizedRecipient) {
         // Once a caller has tried to move an accepted ID to a replacement,
@@ -768,27 +889,35 @@ export class RuntimePersistence {
         throw new RuntimePersistenceError(
           'stale_operation',
           'an accepted operation cannot be replayed at a replacement runtime; create a new operationId',
-          {
-            operationId: normalizedOperationId,
-            recipientRuntimeId: normalizedRecipient,
-          },
+          { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
         );
       }
       return previous.value;
+    }
+    if (this.acceptedOperations.size >= MAX_OPERATION_GUARD_ENTRIES) {
+      throw new RuntimePersistenceError(
+        'busy',
+        'operation guard capacity is temporarily exhausted',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
     }
     const retainedUntil =
       requestedRetainedUntil ?? retainedDeadline(undefined, nowMs, this.retentionGraceMs);
     const accepted = Object.freeze({
       operationId: normalizedOperationId,
       recipientRuntimeId: normalizedRecipient,
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
     });
     const record: AcceptedOperationRecord = {
       value: accepted,
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
       retainedUntil,
       stale: false,
     };
-    this.acceptedOperations.set(normalizedOperationId, record);
-    this.scheduleAcceptedOperation(normalizedOperationId, record);
+    this.acceptedOperations.set(key, record);
+    this.scheduleAcceptedOperation(key, record);
     return accepted;
   }
 
@@ -796,25 +925,38 @@ export class RuntimePersistence {
     operationId: string,
     recipientRuntimeId: string,
     expiresAt?: RuntimeDeadlineInput,
+    senderRuntimeId?: string,
   ): AcceptedOperation {
-    return this.recordAcceptedOperation(operationId, recipientRuntimeId, expiresAt);
+    return this.recordAcceptedOperation(
+      operationId,
+      recipientRuntimeId,
+      expiresAt,
+      senderRuntimeId,
+    );
   }
 
-  public canReplayOperation(operationId: string, recipientRuntimeId: string): boolean {
+  public canReplayOperation(
+    operationId: string,
+    recipientRuntimeId: string,
+    senderRuntimeId?: string,
+  ): boolean {
     if (!this.active) {
       return false;
     }
     let normalizedOperationId: string;
     let normalizedRecipient: string;
+    let normalizedSender: string;
     try {
       normalizedOperationId = requireText(operationId, 'operationId');
       normalizedRecipient = requireText(recipientRuntimeId, 'recipientRuntimeId');
+      normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
       this.prune(finiteNow(this.now()));
     } catch {
       return false;
     }
-    const previous = this.acceptedOperations.get(normalizedOperationId);
-    const unreachable = this.unreachableResults.get(normalizedOperationId);
+    const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
+    const previous = this.acceptedOperations.get(key);
+    const unreachable = this.unreachableResults.get(key);
     if (previous !== undefined && previous.value.recipientRuntimeId !== normalizedRecipient) {
       previous.stale = true;
     }
@@ -825,11 +967,16 @@ export class RuntimePersistence {
     );
   }
 
-  public assertReplayAllowed(operationId: string, recipientRuntimeId: string): void {
+  public assertReplayAllowed(
+    operationId: string,
+    recipientRuntimeId: string,
+    senderRuntimeId?: string,
+  ): void {
     this.assertActive();
     const normalizedOperationId = requireText(operationId, 'operationId');
     const normalizedRecipient = requireText(recipientRuntimeId, 'recipientRuntimeId');
-    if (!this.canReplayOperation(normalizedOperationId, normalizedRecipient)) {
+    const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
+    if (!this.canReplayOperation(normalizedOperationId, normalizedRecipient, normalizedSender)) {
       throw new RuntimePersistenceError(
         'stale_operation',
         'operationId belongs to an earlier runtime endpoint; create a new operationId',
@@ -838,38 +985,49 @@ export class RuntimePersistence {
     }
   }
 
-  public assertOperationReplaySafe(operationId: string, recipientRuntimeId: string): void {
-    this.assertReplayAllowed(operationId, recipientRuntimeId);
+  public assertOperationReplaySafe(
+    operationId: string,
+    recipientRuntimeId: string,
+    senderRuntimeId?: string,
+  ): void {
+    this.assertReplayAllowed(operationId, recipientRuntimeId, senderRuntimeId);
   }
 
   /** Always returns a fresh UUIDv4 for a retry after a runtime replacement. */
-  public createRetryOperationId(operationId: string, recipientRuntimeId: string): OperationId {
-    // A retry is a new operation by definition.  Validate the old operation and
-    // the replacement recipient, but never reject the supported replacement case.
+  public createRetryOperationId(
+    operationId: string,
+    recipientRuntimeId: string,
+    senderRuntimeId?: string,
+  ): OperationId {
     this.assertActive();
     const normalizedOperationId = requireText(operationId, 'operationId');
     const normalizedRecipient = requireText(recipientRuntimeId, 'recipientRuntimeId');
+    const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
     this.prune(finiteNow(this.now()));
-    const previous = this.acceptedOperations.get(normalizedOperationId);
+    const previous = this.acceptedOperations.get(
+      runtimeOperationGuardKey(normalizedSender, normalizedOperationId),
+    );
     if (previous !== undefined && previous.value.recipientRuntimeId !== normalizedRecipient) {
       previous.stale = true;
     }
     return randomUUID() as OperationId;
   }
 
-  public newOperationIdForRetry(operationId: string, recipientRuntimeId: string): OperationId {
-    return this.createRetryOperationId(operationId, recipientRuntimeId);
+  public newOperationIdForRetry(
+    operationId: string,
+    recipientRuntimeId: string,
+    senderRuntimeId?: string,
+  ): OperationId {
+    return this.createRetryOperationId(operationId, recipientRuntimeId, senderRuntimeId);
   }
 
-  /**
-   * Convert a lost local delivery into a protocol-shaped result.  This is a
-   * local observation, not a failed/completed remote task outcome.
-   */
+  /** Convert a lost local delivery into a protocol-shaped result. */
   public reportUnreachable(
     operationId: string,
     recipientRuntimeId?: string,
     message = 'delivery could not be established with the runtime endpoint',
     expiresAt?: RuntimeDeadlineInput,
+    senderRuntimeId?: string,
   ): RuntimeUnreachableResult {
     this.assertActive();
     const normalizedOperationId = requireText(operationId, 'operationId');
@@ -877,14 +1035,16 @@ export class RuntimePersistence {
       recipientRuntimeId === undefined
         ? undefined
         : requireText(recipientRuntimeId, 'recipientRuntimeId');
+    const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
     const normalizedMessage = requireText(message, 'message');
+    const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
     const nowMs = finiteNow(this.now());
-    this.prune(nowMs);
     const requestedRetainedUntil =
       expiresAt === undefined
         ? undefined
         : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
-    const accepted = this.acceptedOperations.get(normalizedOperationId);
+    this.prune(nowMs);
+    const accepted = this.acceptedOperations.get(key);
     if (
       accepted !== undefined &&
       (accepted.stale || accepted.value.recipientRuntimeId !== normalizedRecipient)
@@ -896,7 +1056,7 @@ export class RuntimePersistence {
       );
     }
 
-    const previous = this.unreachableResults.get(normalizedOperationId);
+    const previous = this.unreachableResults.get(key);
     if (previous !== undefined) {
       const sameRecipient = previous.recipientRuntimeId === normalizedRecipient;
       if (sameRecipient && previous.message === normalizedMessage) {
@@ -905,6 +1065,13 @@ export class RuntimePersistence {
       throw new RuntimePersistenceError(
         'identity_conflict',
         'an unreachable result cannot be overwritten with a conflicting destination or result',
+        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+      );
+    }
+    if (this.unreachableResults.size >= MAX_OPERATION_GUARD_ENTRIES) {
+      throw new RuntimePersistenceError(
+        'busy',
+        'unreachable-result guard capacity is temporarily exhausted',
         { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
       );
     }
@@ -918,6 +1085,8 @@ export class RuntimePersistence {
       operationId: normalizedOperationId,
       error: error as ProtocolError & { readonly code: 'unreachable' },
       ...(normalizedRecipient === undefined ? {} : { recipientRuntimeId: normalizedRecipient }),
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
     });
     const retainedUntil =
       accepted?.retainedUntil ??
@@ -925,12 +1094,14 @@ export class RuntimePersistence {
       retainedDeadline(undefined, nowMs, this.retentionGraceMs);
     const record: UnreachableRecord = {
       value: result,
+      senderRuntimeId: normalizedSender,
+      generation: normalizedSender,
       recipientRuntimeId: normalizedRecipient,
       message: normalizedMessage,
       retainedUntil,
     };
-    this.unreachableResults.set(normalizedOperationId, record);
-    this.scheduleUnreachableResult(normalizedOperationId, record);
+    this.unreachableResults.set(key, record);
+    this.scheduleUnreachableResult(key, record);
     return result;
   }
 
@@ -939,15 +1110,28 @@ export class RuntimePersistence {
     recipientRuntimeId?: string,
     message?: string,
     expiresAt?: RuntimeDeadlineInput,
+    senderRuntimeId?: string,
   ): RuntimeUnreachableResult {
-    return this.reportUnreachable(operationId, recipientRuntimeId, message, expiresAt);
+    return this.reportUnreachable(
+      operationId,
+      recipientRuntimeId,
+      message,
+      expiresAt,
+      senderRuntimeId,
+    );
   }
 
-  public getUnreachable(operationId: string): RuntimeUnreachableResult | undefined {
+  public getUnreachable(
+    operationId: string,
+    senderRuntimeId?: string,
+  ): RuntimeUnreachableResult | undefined {
     this.assertActive();
     const normalizedOperationId = requireText(operationId, 'operationId');
+    const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
     this.prune(finiteNow(this.now()));
-    return this.unreachableResults.get(normalizedOperationId)?.value;
+    return this.unreachableResults.get(
+      runtimeOperationGuardKey(normalizedSender, normalizedOperationId),
+    )?.value;
   }
 
   /** Prune expired operation guards and unreachable observations. */
@@ -960,15 +1144,15 @@ export class RuntimePersistence {
       throw new RangeError('runtime persistence clock must return a finite number');
     }
     let removed = 0;
-    for (const [operationId, record] of this.acceptedOperations) {
+    for (const [operationKey, record] of this.acceptedOperations) {
       if (record.retainedUntil <= nowMs) {
-        this.removeAcceptedOperation(operationId, record);
+        this.removeAcceptedOperation(operationKey, record);
         removed += 1;
       }
     }
-    for (const [operationId, record] of this.unreachableResults) {
+    for (const [operationKey, record] of this.unreachableResults) {
       if (record.retainedUntil <= nowMs) {
-        this.removeUnreachableResult(operationId, record);
+        this.removeUnreachableResult(operationKey, record);
         removed += 1;
       }
     }
@@ -979,8 +1163,15 @@ export class RuntimePersistence {
     operationId: string,
     recipientRuntimeId?: string,
     expiresAt?: RuntimeDeadlineInput,
+    senderRuntimeId?: string,
   ): RuntimeUnreachableResult {
-    return this.reportUnreachable(operationId, recipientRuntimeId, undefined, expiresAt);
+    return this.reportUnreachable(
+      operationId,
+      recipientRuntimeId,
+      undefined,
+      expiresAt,
+      senderRuntimeId,
+    );
   }
 
   /**
@@ -1060,6 +1251,62 @@ export class RuntimePersistence {
       assertCachedReplacementOptions(options, this.replacementOptions, this.replacementRuntime);
       return this.replacementRuntime;
     }
+    if (
+      options.runtimeIdentityHistory !== undefined &&
+      options.runtimeIdentityHistory !== this.runtimeIdentityHistory
+    ) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'replacement must share the existing runtime identity history',
+      );
+    }
+    if (
+      options.operationGuardState !== undefined &&
+      options.operationGuardState !== this.operationGuardState
+    ) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'replacement must share the existing operation guard state',
+      );
+    }
+    if (
+      options.runtimeIdRetentionMs !== undefined &&
+      options.runtimeIdRetentionMs !== this.runtimeIdentityHistory.retentionMs
+    ) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'runtimeIdRetentionMs cannot change within a replacement chain',
+      );
+    }
+    if (options.now !== undefined && options.now !== this.now) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'replacement must share the persistence clock',
+      );
+    }
+    if (options.setTimeout !== undefined && options.setTimeout !== this.setTimeout) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'replacement must share the persistence timer scheduler',
+      );
+    }
+    if (options.clearTimeout !== undefined && options.clearTimeout !== this.clearTimeout) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'replacement must share the persistence timer clearer',
+      );
+    }
+    if (
+      (options.retentionGraceMs !== undefined &&
+        options.retentionGraceMs !== this.retentionGraceMs) ||
+      (options.dedupeStoreOptions?.retentionGraceMs !== undefined &&
+        options.dedupeStoreOptions.retentionGraceMs !== this.retentionGraceMs)
+    ) {
+      throw new RuntimePersistenceError(
+        'identity_conflict',
+        'replacement must share the operation retention grace',
+      );
+    }
     const nowMs = finiteNow(this.now());
     const identity = replacementIdentity(
       this.identity,
@@ -1073,10 +1320,11 @@ export class RuntimePersistence {
       taskStoreOptions: options.taskStoreOptions,
       dedupeStoreOptions: options.dedupeStoreOptions,
       onShutdownTask: options.onShutdownTask,
-      now: options.now ?? this.now,
-      setTimeout: options.setTimeout ?? this.setTimeout,
-      clearTimeout: options.clearTimeout ?? this.clearTimeout,
-      retentionGraceMs: options.retentionGraceMs ?? this.retentionGraceMs,
+      now: this.now,
+      setTimeout: this.setTimeout,
+      clearTimeout: this.clearTimeout,
+      retentionGraceMs: this.retentionGraceMs,
+      runtimeIdRetentionMs: this.runtimeIdentityHistory.retentionMs,
       runtimeIdentityHistory: this.runtimeIdentityHistory,
       operationGuardState: this.operationGuardState,
     });
@@ -1088,7 +1336,10 @@ export class RuntimePersistence {
     this.replacementRuntime = replacement;
     this.replacementOptions = options;
     try {
-      void this.shutdown(options.shutdown);
+      const shutdownPromise = this.shutdown(options.shutdown);
+      // A synchronous reload cannot await this promise, but it must observe a
+      // rejection so replacement does not create an unhandled shutdown failure.
+      shutdownPromise.catch(() => undefined);
     } catch (error) {
       this.replacementRuntime = undefined;
       this.replacementOptions = undefined;
@@ -1175,7 +1426,10 @@ export class RuntimePersistence {
     this.unreachableResults.delete(operationId);
   }
 
-  private trackShutdownHook<T>(promise: Promise<T>): Promise<T> {
+  private trackShutdownHook<T>(promise: Promise<T>): Promise<T> | undefined {
+    if (this.shutdownHooks.size >= MAX_SHUTDOWN_HOOKS) {
+      return undefined;
+    }
     const tracked = promise.finally(() => this.shutdownHooks.delete(tracked));
     this.shutdownHooks.add(tracked);
     return tracked;
@@ -1194,7 +1448,13 @@ export class RuntimePersistence {
       const invocation = Promise.resolve()
         .then(() => hook(task))
         .then((value) => normalizeShutdownDelivery(value));
-      return this.trackShutdownHook(invocation);
+      return (
+        this.trackShutdownHook(invocation) ??
+        Promise.resolve<RuntimeShutdownDelivery>({
+          status: 'unreachable',
+          error: new Error('runtime shutdown hook capacity is exhausted'),
+        })
+      );
     });
     const outcomes = await settlePromisesWithin(
       hookPromises,
