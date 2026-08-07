@@ -113,6 +113,7 @@ export async function createTestWorkspace(
   };
 
   let cleanupPromise: Promise<void> | undefined;
+  let cleanupComplete = false;
   let cleanupStarted = false;
   const cleanupHooks = new Set<WorkspaceCleanupHook>();
   const registerBeforeCleanup = (hook: WorkspaceCleanupHook): (() => void) => {
@@ -130,23 +131,29 @@ export async function createTestWorkspace(
   const runCleanup = async (): Promise<void> => {
     cleanupStarted = true;
     const errors: unknown[] = [];
-    for (const hook of cleanupHooks) {
+    for (const hook of [...cleanupHooks]) {
       try {
         await hook();
+        cleanupHooks.delete(hook);
       } catch (error) {
         errors.push(error);
       }
     }
-    cleanupHooks.clear();
     // Never remove the workspace while an owner reports that its child resources
     // could not be released; the original hook diagnostics must remain observable.
     if (errors.length > 0) {
       throwCleanupErrors(rootPath, errors);
     }
     await removeTestWorkspace(rootPath, cleanupOptions);
+    cleanupComplete = true;
   };
   const cleanup = (): Promise<void> => {
-    cleanupPromise ??= runCleanup();
+    if (cleanupComplete) {
+      return Promise.resolve();
+    }
+    cleanupPromise ??= runCleanup().finally(() => {
+      cleanupPromise = undefined;
+    });
     return cleanupPromise;
   };
   return Object.freeze({

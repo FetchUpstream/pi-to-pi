@@ -695,10 +695,7 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     if (this.cleanupPromise) {
       return this.cleanupPromise;
     }
-    this.cleanupPromise = this.killAbruptly().finally(() => {
-      this.workspaceUnregister?.();
-      this.workspaceUnregister = undefined;
-    });
+    this.cleanupPromise = this.killAbruptly();
     return this.cleanupPromise;
   }
 
@@ -781,6 +778,10 @@ export class ManagedProcess<TEvent = ManagedProcessEvent> {
     }
     this.closeResult = this.makeExitResult(finalCode, finalSignal);
     this.resolveClose(this.closeResult);
+    // Workspace ownership ends only after Node has observed process and stdio closure.
+    // A failed termination attempt must not make a still-live child unowned.
+    this.workspaceUnregister?.();
+    this.workspaceUnregister = undefined;
     this.cancelPendingCommandWrites();
     if (this.parserError) {
       this.rejectEventWaiters(this.parserError);
@@ -1109,7 +1110,11 @@ export class ManagedProcessGroup {
       return this.teardownPromise;
     }
     this.teardownStarted = true;
-    this.teardownPromise = this.runTeardown();
+    this.teardownPromise = this.runTeardown().catch((error: unknown) => {
+      // A later teardown may succeed after the OS reports the child's eventual closure.
+      this.teardownPromise = undefined;
+      throw error;
+    });
     return this.teardownPromise;
   }
 
@@ -1118,12 +1123,18 @@ export class ManagedProcessGroup {
   }
 
   private async runTeardown(): Promise<void> {
-    const results = await Promise.allSettled(
-      [...this.managedProcesses].map((process) => process.killAbruptly()),
-    );
-    this.managedProcesses.clear();
-    this.workspaceUnregister?.();
-    this.workspaceUnregister = undefined;
+    const processes = [...this.managedProcesses];
+    const results = await Promise.allSettled(processes.map((process) => process.killAbruptly()));
+    for (const [index, result] of results.entries()) {
+      const process = processes[index];
+      if (process && (result.status === 'fulfilled' || process.state === 'closed')) {
+        this.managedProcesses.delete(process);
+      }
+    }
+    if (this.managedProcesses.size === 0) {
+      this.workspaceUnregister?.();
+      this.workspaceUnregister = undefined;
+    }
 
     const errors = results
       .filter((result): result is PromiseRejectedResult => result.status === 'rejected')

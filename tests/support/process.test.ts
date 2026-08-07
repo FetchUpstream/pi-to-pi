@@ -215,6 +215,46 @@ describe('managed process support', () => {
     expect(await testWorkspaceExists(workspace.rootPath)).toBe(false);
   });
 
+  it('keeps a live child owned after teardown fails and removes the workspace only after close', async () => {
+    const workspace = await createTestWorkspace();
+    const managed = createManagedProcess({ workspace });
+    await managed.waitForReady();
+    const terminationFailure = new Error('termination failed while child remained live');
+    const kill = vi.spyOn(managed, 'killAbruptly').mockRejectedValueOnce(terminationFailure);
+
+    await expect(workspace.cleanup()).rejects.toBe(terminationFailure);
+    expect(managed.state).toBe('running');
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(true);
+
+    kill.mockRestore();
+    await managed.sendCommand({ command: 'shutdown' });
+    await managed.waitForClose();
+    await workspace.cleanup();
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(false);
+  });
+
+  it('retains failed group children for repeated teardown and blocks workspace removal', async () => {
+    const workspace = await createTestWorkspace();
+    const group = createManagedProcessGroup({ workspace });
+    const failed = group.spawn({ label: 'failed teardown fixture' });
+    const closed = group.spawn({ label: 'successful teardown fixture' });
+    await Promise.all([failed.waitForReady(), closed.waitForReady()]);
+    const terminationFailure = new Error('group child termination failed');
+    const kill = vi.spyOn(failed, 'killAbruptly').mockRejectedValueOnce(terminationFailure);
+
+    await expect(workspace.cleanup()).rejects.toBe(terminationFailure);
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(true);
+    expect(failed.state).toBe('running');
+    expect(closed.state).toBe('closed');
+    expect(group.processes).toEqual([failed]);
+
+    kill.mockRestore();
+    await group.teardown();
+    await workspace.cleanup();
+    expect(failed.state).toBe('closed');
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(false);
+  });
+
   it('does not spawn when workspace ownership registration fails', () => {
     const registrationFailure = new Error('registration rejected');
     const workspace = {

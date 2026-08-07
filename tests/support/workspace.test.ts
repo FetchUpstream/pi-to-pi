@@ -82,4 +82,29 @@ describe('test workspace support', () => {
 
     await removeTestWorkspace(workspace.rootPath);
   });
+
+  it('retries only failed owner hooks before removing the workspace', async () => {
+    const workspace = await createTestWorkspace();
+    const cleanupFailure = new Error('child still live');
+    let failingAttempts = 0;
+    let successfulAttempts = 0;
+    workspace.registerBeforeCleanup(() => {
+      successfulAttempts += 1;
+    });
+    workspace.registerBeforeCleanup(() => {
+      failingAttempts += 1;
+      if (failingAttempts === 1) {
+        throw cleanupFailure;
+      }
+    });
+
+    await expect(workspace.cleanup()).rejects.toBe(cleanupFailure);
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(true);
+    await workspace.cleanup();
+
+    expect(successfulAttempts).toBe(1);
+    expect(failingAttempts).toBe(2);
+    expect(await testWorkspaceExists(workspace.rootPath)).toBe(false);
+    await workspace.cleanup();
+  });
 });
