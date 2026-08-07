@@ -8,9 +8,9 @@
  * older endpoint after a newer one.
  */
 
+import { isSessionRuntimeIdentity, isUuidV4 } from '../identity.js';
 import type { RuntimeId, SessionId, UtcTimestamp } from '../protocol/messages.js';
 import type { SessionRuntimeIdentity } from '../identity.js';
-
 /** Default live-presence window and self-renewal cadence. */
 export const DEFAULT_LEASE_TTL_MS = 90_000;
 export const DEFAULT_LEASE_RENEWAL_INTERVAL_MS = 30_000;
@@ -86,6 +86,8 @@ export interface SerializedLeaseOptions {
   readonly ttlMs?: number;
   readonly renewalIntervalMs?: number;
   readonly onError?: LeaseErrorHandler;
+  /** Called synchronously when the lease stops or expires. */
+  readonly onStop?: () => void;
   readonly scheduler?: LeaseScheduler;
   readonly now?: LeaseClock;
 }
@@ -146,6 +148,41 @@ function sameIdentity(left: LeaseOwnerIdentity, right: LeaseOwnerIdentity): bool
   return left.sessionId === right.sessionId && left.runtimeId === right.runtimeId;
 }
 
+const MAX_ENDPOINT_LENGTH = 16_384;
+const FORBIDDEN_ENDPOINT_KEYS = new Set([
+  'apiKey',
+  'apiToken',
+  'capabilitySecret',
+  'capabilityToken',
+  'credentials',
+  'password',
+  'secret',
+  'token',
+]);
+
+function cloneOwnerIdentity(value: LeaseOwnerIdentity): LeaseOwnerIdentity {
+  if (!isIdentity(value)) {
+    throw new LeaseConfigurationError('identity must contain canonical sessionId and runtimeId');
+  }
+  return Object.freeze({
+    sessionId: value.sessionId,
+    runtimeId: value.runtimeId,
+  });
+}
+
+function cloneEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): RoutingEndpoint {
+  validateEndpoint(endpoint, runtimeId);
+  if (typeof endpoint === 'string') {
+    return endpoint;
+  }
+  return Object.freeze({
+    address: endpoint.address,
+    ...(endpoint.kind === undefined ? {} : { kind: endpoint.kind }),
+    ...(endpoint.transport === undefined ? {} : { transport: endpoint.transport }),
+    ...(endpoint.runtimeId === undefined ? {} : { runtimeId: endpoint.runtimeId }),
+  });
+}
+
 function isRenewalResult(value: unknown): value is LeaseRenewalResult {
   return (
     typeof value === 'object' && value !== null && ('endpoint' in value || 'identity' in value)
@@ -162,10 +199,11 @@ function isRenewalResult(value: unknown): value is LeaseRenewalResult {
 export class SerializedLease {
   public readonly ttlMs: number;
   public readonly renewalIntervalMs: number;
-  public identity: LeaseOwnerIdentity | undefined;
+  private ownerIdentity: LeaseOwnerIdentity | undefined;
 
   private readonly renewal: LeaseRenewal;
   private readonly onError: LeaseErrorHandler | undefined;
+  private readonly onStop: (() => void) | undefined;
   private readonly scheduler: LeaseScheduler;
   private readonly now: LeaseClock;
   private pending: Promise<void> = Promise.resolve();
@@ -173,6 +211,8 @@ export class SerializedLease {
   private state: LeaseState = 'idle';
   private startPromise: Promise<void> | undefined;
   private currentEndpoint: RoutingEndpoint | undefined;
+  private lifecycleGeneration = 0;
+  private endpointGeneration = 0;
   private issuedAt: number | null = null;
   private lastRenewedAt: number | null = null;
   private expiresAt: number | null = null;
@@ -193,13 +233,7 @@ export class SerializedLease {
       throw new LeaseConfigurationError('renew must be a function');
     }
     if (options.identity !== undefined) {
-      if (!isIdentity(options.identity)) {
-        throw new LeaseConfigurationError('identity must contain sessionId and runtimeId');
-      }
-      this.identity = Object.freeze({
-        sessionId: options.identity.sessionId,
-        runtimeId: options.identity.runtimeId,
-      });
+      this.ownerIdentity = cloneOwnerIdentity(options.identity);
     }
 
     this.renewal = options.renew;
@@ -210,12 +244,17 @@ export class SerializedLease {
       'renewalIntervalMs',
     );
     this.onError = options.onError;
+    this.onStop = options.onStop;
     this.scheduler = options.scheduler ?? defaultScheduler;
     this.now = options.now ?? Date.now;
-    if (options.endpoint !== undefined) {
-      validateEndpoint(options.endpoint);
-    }
-    this.currentEndpoint = options.endpoint;
+    this.currentEndpoint =
+      options.endpoint === undefined
+        ? undefined
+        : cloneEndpoint(options.endpoint, this.ownerIdentity?.runtimeId);
+  }
+
+  public get identity(): LeaseOwnerIdentity | undefined {
+    return this.ownerIdentity;
   }
 
   /** Queue one owner renewal behind all earlier owner renewals. */
@@ -224,6 +263,9 @@ export class SerializedLease {
       if (this.state === 'stopped') {
         throw new LeaseStoppedError();
       }
+      const lifecycleGeneration = this.lifecycleGeneration;
+      const ownerAtStart = this.ownerIdentity;
+      const endpointGeneration = this.endpointGeneration;
       const now = clockValue(this.now);
       if (this.state === 'expired' || (this.expiresAt !== null && now >= this.expiresAt)) {
         this.markExpired();
@@ -231,27 +273,66 @@ export class SerializedLease {
       }
 
       const result = await this.renewal();
-      if (this.stopped) {
+
+      // A callback may have been in flight while the lease was explicitly
+      // stopped/expired.  Such a callback is stale and must not mutate or
+      // resurrect this lease (including the first renewal with no deadline).
+      const stateAfterCallback = this.lifecycle as LeaseState;
+      if (stateAfterCallback === 'stopped') {
         throw new LeaseStoppedError();
       }
-      if (isRenewalResult(result)) {
-        if (result.identity !== undefined) {
-          if (this.identity !== undefined && !sameIdentity(this.identity, result.identity)) {
-            throw new LeaseConfigurationError('lease owner identity cannot be replaced');
-          }
-          this.identity ??= Object.freeze({
-            sessionId: result.identity.sessionId,
-            runtimeId: result.identity.runtimeId,
-          });
-        }
-        if (result.endpoint !== undefined) {
-          this.currentEndpoint = result.endpoint;
-        }
+      if (stateAfterCallback === 'expired') {
+        throw new LeaseExpiredError();
+      }
+      if (this.lifecycleGeneration !== lifecycleGeneration) {
+        throw new LeaseStoppedError();
       }
       const renewedAt = clockValue(this.now);
       if (this.expiresAt !== null && renewedAt >= this.expiresAt) {
         this.markExpired();
         throw new LeaseExpiredError();
+      }
+
+      let nextIdentity: LeaseOwnerIdentity | undefined;
+      let nextEndpoint: RoutingEndpoint | undefined;
+      if (isRenewalResult(result)) {
+        if (result.identity !== undefined) {
+          nextIdentity = cloneOwnerIdentity(result.identity);
+          if (ownerAtStart !== undefined && !sameIdentity(ownerAtStart, nextIdentity)) {
+            throw new LeaseConfigurationError('lease owner identity cannot be replaced');
+          }
+        }
+        const effectiveRuntimeId = (ownerAtStart ?? nextIdentity)?.runtimeId;
+        if (result.endpoint !== undefined) {
+          nextEndpoint = cloneEndpoint(result.endpoint, effectiveRuntimeId);
+        }
+      }
+      const stateBeforeCommit = this.lifecycle as LeaseState;
+      if (stateBeforeCommit === 'stopped') {
+        throw new LeaseStoppedError();
+      }
+      if (stateBeforeCommit === 'expired') {
+        throw new LeaseExpiredError();
+      }
+      if (this.lifecycleGeneration !== lifecycleGeneration) {
+        throw new LeaseStoppedError();
+      }
+
+      // The owner is immutable after the first accepted identity, and the
+      // callback generation must still be current immediately before commit.
+      if (this.ownerIdentity !== undefined && ownerAtStart !== undefined) {
+        if (!sameIdentity(this.ownerIdentity, ownerAtStart)) {
+          throw new LeaseConfigurationError('lease owner identity changed during renewal');
+        }
+      }
+      if (nextIdentity !== undefined) {
+        if (this.ownerIdentity !== undefined && !sameIdentity(this.ownerIdentity, nextIdentity)) {
+          throw new LeaseConfigurationError('lease owner identity cannot be replaced');
+        }
+        this.ownerIdentity ??= nextIdentity;
+      }
+      if (nextEndpoint !== undefined && endpointGeneration === this.endpointGeneration) {
+        this.currentEndpoint = nextEndpoint;
       }
       this.issuedAt ??= renewedAt;
       this.lastRenewedAt = renewedAt;
@@ -306,7 +387,11 @@ export class SerializedLease {
   /** Stop timer work and wait for one in-flight owner renewal. */
   public async stop(): Promise<void> {
     if (this.state !== 'stopped') {
+      const wasExpired = this.state === 'expired';
       this.state = 'stopped';
+      if (!wasExpired) {
+        this.invalidateLifecycle();
+      }
       if (this.timer !== undefined) {
         this.scheduler.clearInterval(this.timer);
         this.timer = undefined;
@@ -335,15 +420,34 @@ export class SerializedLease {
   }
 
   public get endpoint(): RoutingEndpoint | undefined {
-    return this.currentEndpoint;
+    return this.currentEndpoint === undefined
+      ? undefined
+      : cloneEndpoint(this.currentEndpoint, this.ownerIdentity?.runtimeId);
   }
 
   public updateEndpoint(endpoint: RoutingEndpoint): void {
-    validateEndpoint(endpoint);
     if (this.state === 'stopped' || this.state === 'expired') {
       throw new LeaseExpiredError();
     }
-    this.currentEndpoint = endpoint;
+    const now = clockValue(this.now);
+    if (this.expiresAt !== null && now >= this.expiresAt) {
+      this.markExpired();
+      throw new LeaseExpiredError();
+    }
+    const endpointCopy = cloneEndpoint(endpoint, this.ownerIdentity?.runtimeId);
+    this.endpointGeneration += 1;
+    // Publish the defensive copy immediately for callers that need the current
+    // endpoint synchronously.  The queue below orders later renewals behind it,
+    // and the generation check prevents an in-flight callback from overwriting it.
+    this.currentEndpoint = endpointCopy;
+    const operation = this.pending.then(() => undefined);
+    this.pending = operation.then(
+      () => undefined,
+      (error: unknown) => {
+        this.lastError = error;
+        return undefined;
+      },
+    );
   }
 
   public get running(): boolean {
@@ -367,7 +471,11 @@ export class SerializedLease {
   }
 
   public owns(identity: LeaseOwnerIdentity): boolean {
-    return this.identity !== undefined && sameIdentity(this.identity, identity);
+    return (
+      this.ownerIdentity !== undefined &&
+      isIdentity(identity) &&
+      sameIdentity(this.ownerIdentity, identity)
+    );
   }
 
   public snapshot(): LeaseSnapshot {
@@ -379,9 +487,11 @@ export class SerializedLease {
       state: this.state,
       running: this.running,
       stopped: this.stopped,
-      ...(this.identity === undefined ? {} : { sessionId: this.identity.sessionId }),
-      ...(this.identity === undefined ? {} : { runtimeId: this.identity.runtimeId }),
-      ...(this.currentEndpoint === undefined ? {} : { endpoint: this.currentEndpoint }),
+      ...(this.ownerIdentity === undefined ? {} : { sessionId: this.ownerIdentity.sessionId }),
+      ...(this.ownerIdentity === undefined ? {} : { runtimeId: this.ownerIdentity.runtimeId }),
+      ...(this.currentEndpoint === undefined
+        ? {}
+        : { endpoint: cloneEndpoint(this.currentEndpoint, this.ownerIdentity?.runtimeId) }),
       ttlMs: this.ttlMs,
       renewalIntervalMs: this.renewalIntervalMs,
       issuedAt: this.issuedAt,
@@ -402,45 +512,96 @@ export class SerializedLease {
   }
 
   private markExpired(): void {
+    if (this.state === 'stopped' || this.state === 'expired') {
+      return;
+    }
     this.state = 'expired';
+    this.invalidateLifecycle();
     if (this.timer !== undefined) {
       this.scheduler.clearInterval(this.timer);
       this.timer = undefined;
     }
   }
+
+  private invalidateLifecycle(): void {
+    this.lifecycleGeneration += 1;
+    try {
+      this.onStop?.();
+    } catch (error: unknown) {
+      this.lastError = error;
+      this.onError?.(error);
+    }
+  }
 }
 
-function isIdentity(value: LeaseOwnerIdentity): value is SessionRuntimeIdentity {
+function isIdentity(value: unknown): value is SessionRuntimeIdentity {
   return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof value.sessionId === 'string' &&
-    value.sessionId.length > 0 &&
-    typeof value.runtimeId === 'string' &&
-    value.runtimeId.length > 0
+    isSessionRuntimeIdentity(value) && value.sessionId.length <= 512 && isUuidV4(value.runtimeId)
   );
 }
 
-function validateEndpoint(endpoint: RoutingEndpoint): void {
+const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
+
+function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): void {
   if (typeof endpoint === 'string') {
-    if (endpoint.trim().length === 0) {
-      throw new LeaseConfigurationError('routing endpoint must not be empty');
+    if (
+      endpoint.trim().length === 0 ||
+      endpoint.length > MAX_ENDPOINT_LENGTH ||
+      CONTROL_CHARACTER_PATTERN.test(endpoint)
+    ) {
+      throw new LeaseConfigurationError('routing endpoint must be bounded non-empty text');
     }
     return;
   }
   if (typeof endpoint !== 'object' || endpoint === null || Array.isArray(endpoint)) {
     throw new LeaseConfigurationError('routing endpoint must be an opaque string or descriptor');
   }
-  if (typeof endpoint.address !== 'string' || endpoint.address.trim().length === 0) {
-    throw new LeaseConfigurationError('routing endpoint address must not be empty');
+  if (
+    typeof endpoint.address !== 'string' ||
+    endpoint.address.trim().length === 0 ||
+    endpoint.address.length > MAX_ENDPOINT_LENGTH ||
+    CONTROL_CHARACTER_PATTERN.test(endpoint.address)
+  ) {
+    throw new LeaseConfigurationError('routing endpoint address must be bounded non-empty text');
   }
-  if (endpoint.kind !== undefined && endpoint.transport !== undefined) {
-    if (endpoint.kind !== endpoint.transport) {
-      throw new LeaseConfigurationError('routing endpoint kind and transport must agree');
-    }
+  if (
+    endpoint.kind !== undefined &&
+    (typeof endpoint.kind !== 'string' ||
+      endpoint.kind.length > MAX_ENDPOINT_LENGTH ||
+      CONTROL_CHARACTER_PATTERN.test(endpoint.kind))
+  ) {
+    throw new LeaseConfigurationError('routing endpoint kind must be bounded text');
+  }
+  if (
+    endpoint.transport !== undefined &&
+    (typeof endpoint.transport !== 'string' ||
+      endpoint.transport.length > MAX_ENDPOINT_LENGTH ||
+      CONTROL_CHARACTER_PATTERN.test(endpoint.transport))
+  ) {
+    throw new LeaseConfigurationError('routing endpoint transport must be bounded text');
+  }
+  if (
+    endpoint.kind !== undefined &&
+    endpoint.transport !== undefined &&
+    endpoint.kind !== endpoint.transport
+  ) {
+    throw new LeaseConfigurationError('routing endpoint kind and transport must agree');
   }
   if (endpoint.kind === undefined && endpoint.transport === undefined) {
     throw new LeaseConfigurationError('routing endpoint must identify its transport kind');
+  }
+  if (endpoint.runtimeId !== undefined) {
+    if (!isUuidV4(endpoint.runtimeId)) {
+      throw new LeaseConfigurationError('routing endpoint runtimeId must be canonical');
+    }
+    if (runtimeId !== undefined && endpoint.runtimeId !== runtimeId) {
+      throw new LeaseConfigurationError('routing endpoint is not owned by the lease runtime');
+    }
+  }
+  for (const key of Object.keys(endpoint)) {
+    if (FORBIDDEN_ENDPOINT_KEYS.has(key)) {
+      throw new LeaseConfigurationError('routing endpoint cannot carry credentials');
+    }
   }
 }
 /** Options for calculating or renewing a lease expiry. */
