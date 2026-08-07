@@ -1524,6 +1524,7 @@ export class RuntimeRegistry {
   private currentNetworkName: RegistryNetworkName;
   private readonly cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
+  private shutdownCleanupRecords: readonly RuntimeRecord[] = [];
   private attemptedRecord: RuntimeRecord | undefined;
   private pendingPublication: Promise<void> = Promise.resolve();
   private shutdownRequested = false;
@@ -1594,6 +1595,15 @@ export class RuntimeRegistry {
     return this.currentRecord;
   }
 
+  private cleanupOptionsForRecord(record: RuntimeRecord): RuntimeRecordCleanupOptions {
+    return {
+      ...this.cleanupOptions,
+      expectedSessionId: record.sessionId,
+      expectedEndpoint: record.endpoint,
+      expectedNetworkName: record.networkName,
+    };
+  }
+
   private enqueuePublication(operation: () => Promise<void>): Promise<void> {
     const queued = this.pendingPublication.then(operation);
     this.pendingPublication = queued.then(
@@ -1620,6 +1630,7 @@ export class RuntimeRegistry {
     this.attemptedRecord = record;
     await publishRuntimeRecordAtomically(record, this.pathOptions);
     this.currentRecord = record;
+    this.shutdownCleanupRecords = [];
   }
 
   private async restoreCommittedRecord(
@@ -1630,15 +1641,19 @@ export class RuntimeRegistry {
       if (previousRecord !== undefined) {
         await publishRuntimeRecordAtomically(previousRecord, this.pathOptions);
       } else if (failedRecord !== undefined) {
-        await removeRuntimeRecord(this.roomId, this.runtimeId, {
-          ...this.pathOptions,
-          expectedSessionId: failedRecord.sessionId,
-          expectedEndpoint: failedRecord.endpoint,
-          expectedNetworkName: failedRecord.networkName,
-        });
+        await removeRuntimeRecord(
+          this.roomId,
+          this.runtimeId,
+          this.cleanupOptionsForRecord(failedRecord),
+        );
       }
       this.currentRecord = previousRecord;
+      this.shutdownCleanupRecords = [];
     } catch (error) {
+      // Keep exact records that may still occupy the runtime key without exposing either as current.
+      this.shutdownCleanupRecords = [failedRecord, previousRecord].filter(
+        (record): record is RuntimeRecord => record !== undefined,
+      );
       this.currentRecord = undefined;
       throw error;
     }
@@ -1727,17 +1742,23 @@ export class RuntimeRegistry {
         // A rename stages the mutable name before its queued publication commits;
         // remove the exact record that was last committed to disk instead.
         const committedRecord = this.currentRecord;
-        const cleanupOptions =
-          committedRecord === undefined
-            ? this.cleanupOptions
-            : {
-                ...this.cleanupOptions,
-                expectedSessionId: committedRecord.sessionId,
-                expectedEndpoint: committedRecord.endpoint,
-                expectedNetworkName: committedRecord.networkName,
-              };
-        const removed = await removeRuntimeRecord(this.roomId, this.runtimeId, cleanupOptions);
+        const cleanupRecords =
+          committedRecord === undefined ? this.shutdownCleanupRecords : [committedRecord];
+        let removed = false;
+        if (cleanupRecords.length === 0) {
+          removed = await removeRuntimeRecord(this.roomId, this.runtimeId, this.cleanupOptions);
+        } else {
+          for (const record of cleanupRecords) {
+            removed =
+              (await removeRuntimeRecord(
+                this.roomId,
+                this.runtimeId,
+                this.cleanupOptionsForRecord(record),
+              )) || removed;
+          }
+        }
         this.currentRecord = undefined;
+        this.shutdownCleanupRecords = [];
         return removed;
       })();
     }

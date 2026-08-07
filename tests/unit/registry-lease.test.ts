@@ -507,6 +507,56 @@ describe('serialized lease and lifecycle cleanup', () => {
     }
   });
 
+  it('cleans up a candidate after publication and restoration both fail', async () => {
+    const root = await temporaryRoot();
+    const registry = new RuntimeRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+    const originalRename = renameMock.getMockImplementation()!;
+    let recordRenameCount = 0;
+    renameMock.mockImplementation(async (source, target, flags) => {
+      if (String(target).endsWith(`${RUNTIME_A}.json`)) {
+        recordRenameCount += 1;
+        if (recordRenameCount === 3) {
+          throw new Error('restoration publication fails');
+        }
+      }
+      await originalRename(source, target, flags);
+      if (recordRenameCount === 2) {
+        throw new Error('post-rename publication fails');
+      }
+    });
+
+    try {
+      await registry.start();
+      await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
+        'restoration publication fails',
+      );
+      expect(registry.networkName).toBe('planner');
+      expect(registry.current()).toBeUndefined();
+      expect(
+        await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+      ).toMatchObject({
+        networkName: 'renamed',
+        sessionId: 'session-a',
+        endpoint: '/tmp/endpoint-a',
+      });
+      await expect(registry.shutdown()).resolves.toBe(true);
+      expect(
+        await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+      ).toBeUndefined();
+      expect(registry.current()).toBeUndefined();
+    } finally {
+      renameMock.mockImplementation(originalRename);
+    }
+  });
+
   it('rolls back a failed rename before exposing a stale record', async () => {
     const root = await temporaryRoot();
     const registry = new RuntimeRegistry({
