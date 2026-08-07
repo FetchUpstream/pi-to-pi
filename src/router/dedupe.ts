@@ -6,12 +6,17 @@
  * with an empty deduplication set.
  */
 
-import { createHash } from 'node:crypto';
-
 import { DEFAULT_REQUEST_TTL_MS, DEDUPE_RETENTION_GRACE_MS } from '../config.js';
 import { createProtocolError } from '../protocol/errors.js';
 import type { ProtocolError } from '../protocol/errors.js';
 import type { OperationName, ProtocolEnvelope } from '../protocol/messages.js';
+import {
+  ProtocolValidationError,
+  canonicalizeJson as sharedCanonicalizeJson,
+  parseRfc3339Utc,
+  validatedRequestProjection,
+  type CanonicalRequestProjection,
+} from '../protocol/validation.js';
 
 /** Operations whose delivery can cause a mutation and must be deduplicated. */
 export const DEDUPE_OPERATION_NAMES = [
@@ -63,176 +68,31 @@ export function makeDedupeKey(senderRuntimeId: string, operationId: string): Ded
 export const createDedupeKey = makeDedupeKey;
 export const keyForOperation = makeDedupeKey;
 
-/**
- * The binding may carry credentials alongside the application envelope.  These
- * names are intentionally removed only for fingerprinting; they are never
- * logged or retained by this module.
- */
-const CREDENTIAL_FIELD_NAMES = new Set([
-  'credential',
-  'credentials',
-  'accessToken',
-  'capabilityToken',
-  'authorization',
-  'authentication',
-]);
-const EXPLICIT_BINDING_CREDENTIAL_FIELD_NAMES = new Set([
-  'bindingCredential',
-  'bindingCredentials',
-]);
-const BINDING_CONTAINER_NAMES = new Set(['binding', 'bindingMetadata', 'transport']);
-const SENDER_FIELD_NAME = 'sender';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+function requireProjection(operation: unknown): CanonicalRequestProjection {
+  const projection = validatedRequestProjection(operation);
+  if (!projection.ok) {
+    throw new ProtocolValidationError(projection.error);
+  }
+  return projection.value;
 }
 
-/**
- * Remove binding-only fields without changing the application payload.  Generic
- * credential names are ignored at the operation/sender/binding boundary; the
- * same names inside application metadata remain application data.
- */
-function withoutBindingCredentials(
-  value: unknown,
-  seen: Set<object>,
-  root: boolean,
-  bindingBoundary = false,
-  senderBoundary = false,
-): unknown {
-  if (value === null || typeof value !== 'object') {
-    return value;
-  }
+/** Reuse the protocol validator's canonical JSON serializer. */
+export const canonicalizeJson = sharedCanonicalizeJson;
+export const canonicalizeJSON = sharedCanonicalizeJson;
+export const canonicalJson = sharedCanonicalizeJson;
 
-  if (seen.has(value)) {
-    throw new TypeError('operation fingerprint cannot contain cyclic data');
-  }
-  seen.add(value);
-
-  try {
-    if (Array.isArray(value)) {
-      return value.map((item) =>
-        withoutBindingCredentials(item, seen, false, bindingBoundary, senderBoundary),
-      );
-    }
-
-    const result: Record<string, unknown> = {};
-    const object = value as Record<string, unknown>;
-    for (const key of Object.keys(object)) {
-      const isCredentialField =
-        EXPLICIT_BINDING_CREDENTIAL_FIELD_NAMES.has(key) ||
-        ((root || bindingBoundary || senderBoundary) && CREDENTIAL_FIELD_NAMES.has(key));
-      if (isCredentialField) {
-        continue;
-      }
-      if ((root || bindingBoundary) && BINDING_CONTAINER_NAMES.has(key)) {
-        continue;
-      }
-
-      const child = object[key];
-      // Undefined properties are omitted by JSON serialization and therefore
-      // cannot be part of the wire fingerprint.
-      if (child !== undefined) {
-        result[key] = withoutBindingCredentials(
-          child,
-          seen,
-          false,
-          bindingBoundary || BINDING_CONTAINER_NAMES.has(key),
-          senderBoundary || (root && key === SENDER_FIELD_NAME),
-        );
-      }
-    }
-    return result;
-  } finally {
-    seen.delete(value);
-  }
-}
-
-/**
- * RFC 8785-style canonical JSON for JSON-compatible values.
- *
- * JavaScript's JSON.stringify number formatting matches the ECMAScript number
- * serialization required by JCS for finite numbers (including -0 -> 0).  Keys
- * are sorted by their UTF-16 code units, arrays retain their order, and no
- * insignificant whitespace is emitted.
- */
-export function canonicalizeJson(value: unknown): string {
-  const stack = new Set<object>();
-
-  const write = (current: unknown): string => {
-    if (current === null) {
-      return 'null';
-    }
-
-    switch (typeof current) {
-      case 'string':
-        return JSON.stringify(current);
-      case 'boolean':
-        return current ? 'true' : 'false';
-      case 'number': {
-        if (!Number.isFinite(current)) {
-          throw new TypeError('canonical JSON cannot contain non-finite numbers');
-        }
-        return JSON.stringify(current);
-      }
-      case 'undefined':
-        throw new TypeError('canonical JSON cannot contain undefined at the root');
-      case 'bigint':
-        throw new TypeError('canonical JSON cannot contain bigint values');
-      case 'function':
-      case 'symbol':
-        throw new TypeError('canonical JSON cannot contain non-JSON values');
-      case 'object':
-        break;
-      default:
-        throw new TypeError('canonical JSON contains an unsupported value');
-    }
-
-    if (stack.has(current)) {
-      throw new TypeError('canonical JSON cannot contain cyclic data');
-    }
-    stack.add(current);
-
-    try {
-      if (Array.isArray(current)) {
-        return `[${current.map((item) => (item === undefined ? 'null' : write(item))).join(',')}]`;
-      }
-
-      const object = current as Record<string, unknown>;
-      const keys = Object.keys(object).sort();
-      const members: string[] = [];
-      for (const key of keys) {
-        const member = object[key];
-        // Match JSON serialization for optional JS-only properties.  Wire
-        // envelopes are JSON and therefore cannot carry undefined members.
-        if (member === undefined || typeof member === 'function' || typeof member === 'symbol') {
-          continue;
-        }
-        members.push(`${JSON.stringify(key)}:${write(member)}`);
-      }
-      return `{${members.join(',')}}`;
-    } finally {
-      stack.delete(current);
-    }
-  };
-
-  return write(value);
-}
-
-/** Canonical wire data used for operation identity comparisons. */
+/** Canonical immutable operation data after common envelope validation. */
 export function canonicalizeOperation(operation: unknown, bindingCredentials?: unknown): string {
-  // Credentials supplied as a separate binding argument are deliberately not
-  // incorporated.  Keeping the parameter documents the boundary for callers.
   void bindingCredentials;
-  return canonicalizeJson(withoutBindingCredentials(operation, new Set<object>(), true));
+  return requireProjection(operation).canonical;
 }
 
 export const canonicalOperation = canonicalizeOperation;
 
-/** SHA-256 over canonical operation data, represented as lowercase hex. */
+/** SHA-256 fingerprint over the shared validated canonical projection. */
 export function fingerprintOperation(operation: unknown, bindingCredentials?: unknown): string {
-  return createHash('sha256')
-    .update(canonicalizeOperation(operation, bindingCredentials), 'utf8')
-    .digest('hex');
+  void bindingCredentials;
+  return requireProjection(operation).fingerprint;
 }
 
 export const operationFingerprint = fingerprintOperation;
@@ -261,7 +121,7 @@ export interface DedupeStoreOptions {
   };
   /** Defaults to the protocol's ten-minute grace period. */
   readonly retentionGraceMs?: number;
-  /** Used only for malformed test inputs that omit expiresAt. */
+  /** Retained for source compatibility; validated operations must include expiresAt. */
   readonly defaultTtlMs?: number;
   /** Informational owner identity; it is not part of the composite key. */
   readonly runtimeId?: string;
@@ -368,6 +228,9 @@ function cloneValue<T>(value: T): T {
     return value;
   }
 }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 function operationObject(operation: unknown): Record<string, unknown> {
   if (!isRecord(operation)) {
@@ -383,45 +246,9 @@ function operationName(operation: unknown): string | undefined {
   return operation.operation;
 }
 
-function normalizedExpiry(
-  rawExpiry: unknown,
-  nowMs: number,
-  defaultTtlMs: number,
-): { value: string | number; milliseconds: number } {
-  if (rawExpiry === undefined) {
-    return { value: nowMs + defaultTtlMs, milliseconds: nowMs + defaultTtlMs };
-  }
-
-  if (rawExpiry instanceof Date) {
-    const milliseconds = rawExpiry.getTime();
-    if (!Number.isFinite(milliseconds)) {
-      throw new TypeError('expiresAt must be a valid timestamp');
-    }
-    return { value: milliseconds, milliseconds };
-  }
-
-  if (typeof rawExpiry === 'number') {
-    if (!Number.isFinite(rawExpiry)) {
-      throw new TypeError('expiresAt must be a finite timestamp');
-    }
-    return { value: rawExpiry, milliseconds: rawExpiry };
-  }
-
-  if (typeof rawExpiry === 'string' && rawExpiry.length > 0) {
-    const milliseconds = Date.parse(rawExpiry);
-    if (!Number.isFinite(milliseconds)) {
-      throw new TypeError('expiresAt must be a valid timestamp');
-    }
-    return { value: rawExpiry, milliseconds };
-  }
-
-  throw new TypeError('expiresAt must be an RFC 3339 timestamp or millisecond deadline');
-}
-
 function normalizedOperation(
   operation: DedupeOperation,
   nowMs: number,
-  defaultTtlMs: number,
   retentionGraceMs: number,
 ): NormalizedOperation {
   const object = operationObject(operation);
@@ -430,52 +257,39 @@ function normalizedOperation(
     throw new TypeError(`operation ${String(rawOperation)} is not deduplicated`);
   }
 
-  const rawOperationId = object.operationId;
-  if (typeof rawOperationId !== 'string' || rawOperationId.length === 0) {
-    throw new TypeError('operationId must be a non-empty string');
+  const rawExpiresAtMs = parseRfc3339Utc(object.expiresAt);
+  let projection = validatedRequestProjection(operation, { now: nowMs });
+  if (!projection.ok && projection.error.code === 'expired' && rawExpiresAtMs !== undefined) {
+    projection = validatedRequestProjection(operation, { now: rawExpiresAtMs - 1 });
   }
-
+  if (!projection.ok) {
+    throw new ProtocolValidationError(projection.error);
+  }
+  const envelope = projection.value.envelope;
+  const rawOperationId = envelope.operationId;
+  const senderRuntimeId = envelope.sender.runtimeId;
   const directRuntimeId = object.senderRuntimeId;
-  const sender = object.sender;
-  const nestedRuntimeId = isRecord(sender) ? sender.runtimeId : undefined;
-  const senderRuntimeId =
-    typeof directRuntimeId === 'string'
-      ? directRuntimeId
-      : typeof nestedRuntimeId === 'string'
-        ? nestedRuntimeId
-        : undefined;
-
-  if (senderRuntimeId === undefined || senderRuntimeId.length === 0) {
-    throw new TypeError('senderRuntimeId is required for deduplication');
-  }
-  if (
-    typeof directRuntimeId === 'string' &&
-    typeof nestedRuntimeId === 'string' &&
-    directRuntimeId !== nestedRuntimeId
-  ) {
+  if (typeof directRuntimeId === 'string' && directRuntimeId !== senderRuntimeId) {
     throw new TypeError('senderRuntimeId does not match sender.runtimeId');
   }
-
-  const expiry = normalizedExpiry(object.expiresAt, nowMs, defaultTtlMs);
+  const expiresAtMs = parseRfc3339Utc(envelope.expiresAt);
+  if (expiresAtMs === undefined) {
+    throw new TypeError('validated expiresAt must be an RFC 3339 timestamp');
+  }
   const key = makeDedupeKey(senderRuntimeId, rawOperationId);
-  const fingerprint = fingerprintOperation(operation);
-
-  // Validate the grace-period arithmetic once at the boundary so retention
-  // cannot silently wrap or create an unbounded record.
-  const retainedUntil = expiry.milliseconds + retentionGraceMs;
+  const retainedUntil = expiresAtMs + retentionGraceMs;
   if (!Number.isFinite(retainedUntil)) {
     throw new RangeError('deduplication retention deadline must be finite');
   }
-
   return {
     operation: rawOperation,
     operationId: rawOperationId,
     senderRuntimeId,
-    expiresAt: expiry.value,
-    expiresAtMs: expiry.milliseconds,
+    expiresAt: envelope.expiresAt,
+    expiresAtMs,
     retainedUntil,
     key,
-    fingerprint,
+    fingerprint: projection.value.fingerprint,
   };
 }
 
@@ -950,7 +764,7 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     if (!Number.isFinite(nowMs)) {
       throw new RangeError('deduplication clock must return a finite number');
     }
-    return normalizedOperation(operation, nowMs, this.defaultTtlMs, this.retentionGraceMs);
+    return normalizedOperation(operation, nowMs, this.retentionGraceMs);
   }
 
   private newDecision(normalized: NormalizedOperation): DedupeDecision<Outcome, TaskReference> {

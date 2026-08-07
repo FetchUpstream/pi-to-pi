@@ -1,5 +1,15 @@
 import { createHash } from 'node:crypto';
 
+import { isSafeIdentifier, isUuidV4 as canonicalIsUuidV4 } from '../identity.js';
+import { isRoomId } from '../room.js';
+import {
+  createProtocolConfig,
+  DEFAULT_QUEUE_LIMIT,
+  MAX_CONTROL_TTL_MS,
+  MAX_ENVELOPE_BYTES,
+  MAX_REQUEST_TTL_MS,
+  MAX_SCHEMA_BYTES,
+} from '../config.js';
 import {
   JSON_SCHEMA_DRAFT_2020_12,
   OPERATION_NAMES,
@@ -25,11 +35,11 @@ import {
 } from './errors.js';
 import type { ProtocolLimits } from './agent-card.js';
 import {
-  MAX_CONTROL_TTL_MS,
-  MAX_ENVELOPE_BYTES,
-  MAX_REQUEST_TTL_MS,
-  MAX_SCHEMA_BYTES,
-} from '../config.js';
+  isTerminalOutcome,
+  isTerminalTaskState,
+  TASK_STATES,
+  type TaskState,
+} from './task-state.js';
 
 /** Error classes emitted by the validation boundary. */
 export type ValidationErrorCode =
@@ -56,6 +66,8 @@ export interface ValidationOptions {
   readonly maxDepth?: number;
   readonly maxNodes?: number;
   readonly limits?: Partial<ProtocolLimits>;
+  /** Optional request ID expected in an operation result or task snapshot. */
+  readonly expectedRequestId?: string;
 }
 
 export type ProtocolValidationOptions = ValidationOptions;
@@ -66,11 +78,15 @@ export const DEFAULT_VALIDATION_MAX_DEPTH = 128;
 /** The default maximum number of JSON nodes inspected in one validation pass. */
 export const DEFAULT_VALIDATION_MAX_NODES = 200_000;
 
-const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+/** Future timestamps are tolerated only within a small same-host clock-skew window. */
+export const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/** Error messages are deliberately short and contain no control characters. */
+export const MAX_PROTOCOL_ERROR_MESSAGE_LENGTH = 512;
+
 const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const RFC3339_UTC_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/u;
 const SCHEMA_ANCHOR_PATTERN = /^[A-Za-z][A-Za-z0-9._-]*$/u;
-const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
 const JSON_SCHEMA_TYPES = new Set([
   'null',
   'boolean',
@@ -81,7 +97,16 @@ const JSON_SCHEMA_TYPES = new Set([
   'string',
 ]);
 const FORMAT_ASSERTION_VOCABULARY = 'https://json-schema.org/draft/2020-12/vocab/format-assertion';
+const SUPPORTED_REQUIRED_VOCABULARIES = new Set([
+  'https://json-schema.org/draft/2020-12/vocab/core',
+  'https://json-schema.org/draft/2020-12/vocab/applicator',
+  'https://json-schema.org/draft/2020-12/vocab/validation',
+  'https://json-schema.org/draft/2020-12/vocab/meta-data',
+  'https://json-schema.org/draft/2020-12/vocab/format-annotation',
+  'https://json-schema.org/draft/2020-12/vocab/content',
+]);
 const LOCAL_REFERENCE_PATTERN = /^(?:|#(?:[^\s]*))$/u;
+const MAX_SAFE_REGEX_PATTERN_LENGTH = 1024;
 const REQUIRED_ENVELOPE_FIELDS = [
   'protocolVersion',
   'operation',
@@ -94,24 +119,7 @@ const REQUIRED_ENVELOPE_FIELDS = [
   'traceId',
   'payload',
 ] as const;
-const TERMINAL_OUTCOMES = new Set(['completed', 'failed', 'rejected', 'cancelled', 'expired']);
 const ADMISSION_STATES = new Set(['accepted', 'queued']);
-const FINGERPRINT_CREDENTIAL_KEYS = new Set([
-  'auth',
-  'authorization',
-  'access token',
-  'accesstoken',
-  'bindingcredential',
-  'bindingcredentials',
-  'capabilitytoken',
-  'credential',
-  'credentials',
-  'password',
-  'refreshtoken',
-  'secret',
-  'secretkey',
-  'token',
-]);
 
 type UnknownRecord = Record<string, unknown>;
 type InternalCode = ValidationErrorCode;
@@ -141,6 +149,8 @@ interface ResolvedLimits {
   readonly maxSchemaBytes: number;
   readonly maxDepth: number;
   readonly maxNodes: number;
+  readonly maxRequestTtlMs: number;
+  readonly maxControlTtlMs: number;
 }
 
 interface SchemaIndex {
@@ -150,8 +160,16 @@ interface SchemaIndex {
   readonly references: readonly { readonly ref: string; readonly path: string }[];
 }
 
+interface EvaluationBudget {
+  readonly maxOperations: number;
+  operations: number;
+  exhausted: boolean;
+}
+
 interface SchemaContext extends SchemaIndex {
   readonly maxDepth: number;
+  readonly budget: EvaluationBudget;
+  readonly regexCache: Map<string, RegExp>;
 }
 
 interface SchemaValidationResult {
@@ -220,29 +238,57 @@ function success<Value>(value: Value): ValidationSuccess<Value> {
   return { ok: true, value };
 }
 
-function resolvePositiveLimit(value: number | undefined, fallback: number, field: string): number {
+function isSafeHumanReadableMessage(value: unknown): value is string {
+  return (
+    isSafeIdentifier(value) &&
+    value.length <= MAX_PROTOCOL_ERROR_MESSAGE_LENGTH &&
+    value.trim() === value &&
+    value.trim().length > 0
+  );
+}
+
+function resolvePositiveLimit(
+  value: number | undefined,
+  fallback: number,
+  field: string,
+  ceiling = fallback,
+): number {
   const resolved = value ?? fallback;
   if (!Number.isSafeInteger(resolved) || resolved <= 0) {
     throw new RangeError(`${field} must be a positive safe integer`);
   }
-  return resolved;
+  return Math.min(resolved, ceiling);
 }
 
 function resolveLimits(options: ValidationOptions): ResolvedLimits {
-  const configured = options.limits;
+  const configured = createProtocolConfig(options.limits);
   return {
     maxEnvelopeBytes: resolvePositiveLimit(
-      options.maxEnvelopeBytes ?? configured?.maxEnvelopeBytes,
-      MAX_ENVELOPE_BYTES,
+      options.maxEnvelopeBytes,
+      configured.maxEnvelopeBytes,
       'maxEnvelopeBytes',
+      Math.min(MAX_ENVELOPE_BYTES, configured.maxEnvelopeBytes),
     ),
     maxSchemaBytes: resolvePositiveLimit(
-      options.maxSchemaBytes ?? configured?.maxSchemaBytes,
-      MAX_SCHEMA_BYTES,
+      options.maxSchemaBytes,
+      configured.maxSchemaBytes,
       'maxSchemaBytes',
+      Math.min(MAX_SCHEMA_BYTES, configured.maxSchemaBytes),
     ),
-    maxDepth: resolvePositiveLimit(options.maxDepth, DEFAULT_VALIDATION_MAX_DEPTH, 'maxDepth'),
-    maxNodes: resolvePositiveLimit(options.maxNodes, DEFAULT_VALIDATION_MAX_NODES, 'maxNodes'),
+    maxDepth: resolvePositiveLimit(
+      options.maxDepth,
+      DEFAULT_VALIDATION_MAX_DEPTH,
+      'maxDepth',
+      DEFAULT_VALIDATION_MAX_DEPTH,
+    ),
+    maxNodes: resolvePositiveLimit(
+      options.maxNodes,
+      DEFAULT_VALIDATION_MAX_NODES,
+      'maxNodes',
+      DEFAULT_VALIDATION_MAX_NODES,
+    ),
+    maxRequestTtlMs: configured.maxRequestTtlMs,
+    maxControlTtlMs: configured.maxControlTtlMs,
   };
 }
 
@@ -252,15 +298,15 @@ function resolveNow(value: ValidationOptions['now']): number {
   }
 
   if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new RangeError('now must be finite');
+    if (!Number.isSafeInteger(value)) {
+      throw new RangeError('now must be a finite safe integer');
     }
     return value;
   }
 
   if (value instanceof Date) {
     const milliseconds = value.getTime();
-    if (!Number.isFinite(milliseconds)) {
+    if (!Number.isSafeInteger(milliseconds)) {
       throw new RangeError('now must be a valid Date');
     }
     return milliseconds;
@@ -273,12 +319,8 @@ function resolveNow(value: ValidationOptions['now']): number {
   return milliseconds;
 }
 
-function isSafeIdentifier(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && !CONTROL_CHARACTER_PATTERN.test(value);
-}
-
 function isUuidV4Value(value: unknown): value is string {
-  return typeof value === 'string' && UUID_V4_PATTERN.test(value);
+  return canonicalIsUuidV4(value);
 }
 
 /** Return whether a canonical UUIDv4 wire string. */
@@ -329,7 +371,15 @@ function jsonStringByteLength(value: string): number {
 
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
-    if (code === 0x22 || code === 0x5c) {
+    if (
+      code === 0x22 ||
+      code === 0x5c ||
+      code === 0x08 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0c ||
+      code === 0x0d
+    ) {
       bytes += 2;
     } else if (code <= 0x1f) {
       bytes += 6;
@@ -633,6 +683,85 @@ function addSchemaReference(
   references.push({ ref: value, path: `${path}.${key}` });
   return undefined;
 }
+function validateRegexPattern(
+  pattern: string,
+  path: string,
+  keyword: string,
+): InternalIssue | undefined {
+  if (pattern.length > MAX_SAFE_REGEX_PATTERN_LENGTH) {
+    return issue('incompatible', path, 'regular expression exceeds the safety limit', keyword);
+  }
+  try {
+    new RegExp(pattern, 'u');
+  } catch {
+    return issue('malformed', path, 'pattern is not a valid regular expression', keyword);
+  }
+  if (
+    /\\(?:[1-9]\d*|k<[^>]+>)/u.test(pattern) ||
+    /\(\?(?:=|!|<=|<!)/u.test(pattern) ||
+    /\)[?+*{]/u.test(pattern)
+  ) {
+    return issue(
+      'incompatible',
+      path,
+      'regular expression uses unsupported or unsafe constructs',
+      keyword,
+    );
+  }
+  return undefined;
+}
+
+function createEvaluationBudget(maxOperations: number): EvaluationBudget {
+  return { maxOperations, operations: 0, exhausted: false };
+}
+
+function consumeEvaluationBudget(budget: EvaluationBudget, cost = 1): boolean {
+  if (budget.exhausted) {
+    return false;
+  }
+  budget.operations += cost;
+  if (budget.operations > budget.maxOperations) {
+    budget.exhausted = true;
+    return false;
+  }
+  return true;
+}
+
+function budgetFailure(path: string): SchemaValidationResult {
+  return { valid: false, path, reason: 'schema evaluation budget exceeded' };
+}
+
+function schemaRegex(context: SchemaContext, pattern: string): RegExp | undefined {
+  const cached = context.regexCache.get(pattern);
+  if (cached !== undefined) {
+    return cached;
+  }
+  if (!consumeEvaluationBudget(context.budget)) {
+    return undefined;
+  }
+  try {
+    const expression = new RegExp(pattern, 'u');
+    context.regexCache.set(pattern, expression);
+    return expression;
+  } catch {
+    return undefined;
+  }
+}
+
+function testSchemaRegex(
+  context: SchemaContext,
+  pattern: string,
+  value: string,
+): { readonly matched: boolean; readonly exhausted: boolean } {
+  if (!consumeEvaluationBudget(context.budget)) {
+    return { matched: false, exhausted: true };
+  }
+  const expression = schemaRegex(context, pattern);
+  if (expression === undefined) {
+    return { matched: false, exhausted: context.budget.exhausted };
+  }
+  return { matched: expression.test(value), exhausted: false };
+}
 
 function validateSchemaShape(
   value: JsonSchema,
@@ -667,13 +796,17 @@ function validateSchemaShape(
     }
   }
 
-  for (const key of ['$ref', '$dynamicRef', '$recursiveRef'] as const) {
+  if (hasOwn(value, '$ref')) {
+    const referenceIssue = addSchemaReference(references, value.$ref, path, '$ref');
+    if (referenceIssue !== undefined) {
+      seen.delete(value);
+      return referenceIssue;
+    }
+  }
+  for (const key of ['$dynamicRef', '$recursiveRef'] as const) {
     if (hasOwn(value, key)) {
-      const referenceIssue = addSchemaReference(references, value[key], path, key);
-      if (referenceIssue !== undefined) {
-        seen.delete(value);
-        return referenceIssue;
-      }
+      seen.delete(value);
+      return issue('incompatible', `${path}.${key}`, `${key} is not supported`, key);
     }
   }
 
@@ -684,15 +817,12 @@ function validateSchemaShape(
     seen.delete(value);
     return issue('malformed', `${path}.$anchor`, 'schema anchor is invalid', '$anchor');
   }
-  if (
-    hasOwn(value, '$dynamicAnchor') &&
-    (typeof value.$dynamicAnchor !== 'string' || !SCHEMA_ANCHOR_PATTERN.test(value.$dynamicAnchor))
-  ) {
+  if (hasOwn(value, '$dynamicAnchor')) {
     seen.delete(value);
     return issue(
-      'malformed',
+      'incompatible',
       `${path}.$dynamicAnchor`,
-      'schema dynamic anchor is invalid',
+      'dynamic anchors are not supported',
       '$dynamicAnchor',
     );
   }
@@ -717,12 +847,14 @@ function validateSchemaShape(
           '$vocabulary',
         );
       }
-      if (vocabulary === FORMAT_ASSERTION_VOCABULARY && required) {
+      if (required && !SUPPORTED_REQUIRED_VOCABULARIES.has(vocabulary)) {
         seen.delete(value);
         return issue(
           'incompatible',
           `${path}.$vocabulary.${vocabulary}`,
-          'format assertion vocabulary is not enabled',
+          vocabulary === FORMAT_ASSERTION_VOCABULARY
+            ? 'format assertion vocabulary is not enabled'
+            : 'required schema vocabulary is not supported',
           '$vocabulary',
         );
       }
@@ -900,23 +1032,21 @@ function validateSchemaShape(
       seen.delete(value);
       return issue('malformed', `${path}.pattern`, 'pattern must be a string', 'pattern');
     }
-    try {
-      new RegExp(pattern, 'u');
-    } catch {
+    const patternIssue = validateRegexPattern(pattern, `${path}.pattern`, 'pattern');
+    if (patternIssue !== undefined) {
       seen.delete(value);
-      return issue(
-        'malformed',
-        `${path}.pattern`,
-        'pattern is not a valid regular expression',
-        'pattern',
-      );
+      return patternIssue;
     }
   }
 
-  for (const key of ['uniqueItems', 'unevaluatedItems', 'unevaluatedProperties'] as const) {
-    if (key === 'uniqueItems' && hasOwn(value, key) && typeof value[key] !== 'boolean') {
+  if (hasOwn(value, 'uniqueItems') && typeof value.uniqueItems !== 'boolean') {
+    seen.delete(value);
+    return issue('malformed', `${path}.uniqueItems`, 'uniqueItems must be boolean', 'uniqueItems');
+  }
+  for (const key of ['unevaluatedItems', 'unevaluatedProperties'] as const) {
+    if (hasOwn(value, key)) {
       seen.delete(value);
-      return issue('malformed', `${path}.${key}`, `${key} must be boolean`, key);
+      return issue('incompatible', `${path}.${key}`, `${key} is not supported`, key);
     }
   }
   if (hasOwn(value, 'contains') && !isSchemaValue(value.contains)) {
@@ -934,8 +1064,6 @@ function validateSchemaShape(
     'not',
     'propertyNames',
     'then',
-    'unevaluatedItems',
-    'unevaluatedProperties',
   ] as const) {
     if (hasOwn(value, key)) {
       schemaChildren.push([key, value[key]]);
@@ -956,6 +1084,13 @@ function validateSchemaShape(
       return issue('malformed', `${path}.${key}`, `${key} must be an object of schemas`, key);
     }
     for (const [name, child] of Object.entries(value[key])) {
+      if (key === 'patternProperties') {
+        const patternIssue = validateRegexPattern(name, `${path}.${key}.${name}`, key);
+        if (patternIssue !== undefined) {
+          seen.delete(value);
+          return patternIssue;
+        }
+      }
       schemaChildren.push([`${key}.${name}`, child]);
     }
   }
@@ -1257,20 +1392,21 @@ function validateProtocolErrorValue(
     return issue('malformed', path, 'error must be an object');
   }
   if (
+    !hasOwn(value, 'code') ||
     typeof value.code !== 'string' ||
     !PROTOCOL_ERROR_CODES.includes(value.code as ProtocolErrorCode)
   ) {
     return issue('malformed', `${path}.code`, 'error code is not recognized', 'code');
   }
-  if (typeof value.message !== 'string' || value.message.length === 0) {
+  if (!hasOwn(value, 'message') || !isSafeHumanReadableMessage(value.message)) {
     return issue(
       'malformed',
       `${path}.message`,
-      'error message must be a non-empty string',
+      'error message must be a concise safe human-readable string',
       'message',
     );
   }
-  if (typeof value.retryable !== 'boolean') {
+  if (!hasOwn(value, 'retryable') || typeof value.retryable !== 'boolean') {
     return issue('malformed', `${path}.retryable`, 'retryable must be boolean', 'retryable');
   }
   const code = value.code as ProtocolErrorCode;
@@ -1384,7 +1520,11 @@ function validatePayloadInternal(
       return undefined;
     }
     case 'message.reply': {
-      if (typeof payload.outcome !== 'string' || !TERMINAL_OUTCOMES.has(payload.outcome)) {
+      if (
+        !hasOwn(payload, 'outcome') ||
+        typeof payload.outcome !== 'string' ||
+        !isTerminalOutcome(payload.outcome)
+      ) {
         return issue('malformed', `${path}.outcome`, 'reply outcome is unsupported', 'outcome');
       }
       const outcome = payload.outcome as MessageReplyPayload['outcome'];
@@ -1595,7 +1735,7 @@ export function validateEnvelope(
       'sender must be an object',
     );
   }
-  if (!isSafeIdentifier(value.sender.sessionId)) {
+  if (!hasOwn(value.sender, 'sessionId') || !isSafeIdentifier(value.sender.sessionId)) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -1603,7 +1743,7 @@ export function validateEnvelope(
       'sessionId must be a non-empty safe string',
     );
   }
-  if (!isSafeIdentifier(value.sender.runtimeId)) {
+  if (!hasOwn(value.sender, 'runtimeId') || !isSafeIdentifier(value.sender.runtimeId)) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -1619,12 +1759,12 @@ export function validateEnvelope(
       'recipientRuntimeId must be a non-empty safe string',
     );
   }
-  if (!isSafeIdentifier(value.roomId)) {
+  if (!isRoomId(value.roomId)) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
       '$.roomId',
-      'roomId must be a non-empty safe string',
+      'roomId must be a canonical r1 room ID',
     );
   }
   if (typeof value.traceId !== 'string' || !TRACE_ID_PATTERN.test(value.traceId)) {
@@ -1665,22 +1805,25 @@ export function validateEnvelope(
 
   const deadlineLimit =
     operation === 'peer.describe' || operation === 'task.status' || operation === 'task.cancel'
-      ? MAX_CONTROL_TTL_MS
-      : MAX_REQUEST_TTL_MS;
+      ? limits.maxControlTtlMs
+      : limits.maxRequestTtlMs;
   if (expiresAt - createdAt > deadlineLimit) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
       '$.expiresAt',
-      'operation deadline exceeds the v1 limit',
+      'operation deadline exceeds the configured v1 limit',
     );
   }
 
-  let now: number;
-  try {
-    now = resolveNow(options.now);
-  } catch {
-    now = Date.now();
+  const now = resolveNow(options.now);
+  if (createdAt > now + MAX_CLOCK_SKEW_MS) {
+    return validationFailure(
+      'malformed',
+      'protocol envelope is malformed',
+      '$.createdAt',
+      'createdAt is too far in the future',
+    );
   }
   if (expiresAt <= now) {
     return validationFailure(
@@ -1711,44 +1854,445 @@ export function validateEnvelope(
 export const validateProtocolEnvelope = validateEnvelope;
 export const validateOperationEnvelope = validateEnvelope;
 export const validateMessageEnvelope = validateEnvelope;
+function validateAgentCardInternal(value: unknown, path: string): InternalIssue | undefined {
+  if (!isPlainObject(value)) {
+    return issue('malformed', path, 'agent card must be an object');
+  }
+  if (!hasOwn(value, 'name') || !isSafeIdentifier(value.name) || value.name.length > 256) {
+    return issue('malformed', `${path}.name`, 'agent card name is invalid', 'name');
+  }
+  if (
+    hasOwn(value, 'description') &&
+    (!isSafeIdentifier(value.description) || value.description.length > 1024)
+  ) {
+    return issue(
+      'malformed',
+      `${path}.description`,
+      'agent card description is invalid',
+      'description',
+    );
+  }
+  if (!hasOwn(value, 'sessionId') || !isSafeIdentifier(value.sessionId)) {
+    return issue('malformed', `${path}.sessionId`, 'agent card sessionId is invalid', 'sessionId');
+  }
+  if (!hasOwn(value, 'runtimeId') || !isSafeIdentifier(value.runtimeId)) {
+    return issue('malformed', `${path}.runtimeId`, 'agent card runtimeId is invalid', 'runtimeId');
+  }
+  if (
+    !hasOwn(value, 'supportedProtocolVersions') ||
+    !Array.isArray(value.supportedProtocolVersions) ||
+    value.supportedProtocolVersions.length === 0 ||
+    !value.supportedProtocolVersions.includes(PROTOCOL_VERSION) ||
+    !value.supportedProtocolVersions.every((version) => version === PROTOCOL_VERSION)
+  ) {
+    return issue(
+      'incompatible',
+      `${path}.supportedProtocolVersions`,
+      'agent card must advertise exactly supported protocol versions',
+      'supportedProtocolVersions',
+    );
+  }
+  if (
+    !hasOwn(value, 'operations') ||
+    !Array.isArray(value.operations) ||
+    value.operations.length === 0
+  ) {
+    return issue(
+      'malformed',
+      `${path}.operations`,
+      'agent card operations are required',
+      'operations',
+    );
+  }
+  const seenOperations = new Set<string>();
+  for (const [index, operation] of value.operations.entries()) {
+    const operationPath = `${path}.operations[${index}]`;
+    if (
+      !isPlainObject(operation) ||
+      !hasOwn(operation, 'operation') ||
+      typeof operation.operation !== 'string'
+    ) {
+      return issue('malformed', operationPath, 'operation capability is invalid', 'operation');
+    }
+    if (!OPERATION_NAMES.includes(operation.operation as OperationName)) {
+      return issue(
+        'incompatible',
+        `${operationPath}.operation`,
+        'operation is unsupported',
+        'operation',
+      );
+    }
+    if (seenOperations.has(operation.operation)) {
+      return issue(
+        'malformed',
+        `${operationPath}.operation`,
+        'operation capability is duplicated',
+        'operation',
+      );
+    }
+    seenOperations.add(operation.operation);
+    if (hasOwn(operation, 'description') && !isSafeIdentifier(operation.description)) {
+      return issue(
+        'malformed',
+        `${operationPath}.description`,
+        'operation description is invalid',
+        'description',
+      );
+    }
+  }
+  if (
+    !hasOwn(value, 'contentCapabilities') ||
+    !Array.isArray(value.contentCapabilities) ||
+    value.contentCapabilities.length === 0
+  ) {
+    return issue(
+      'malformed',
+      `${path}.contentCapabilities`,
+      'content capabilities are required',
+      'contentCapabilities',
+    );
+  }
+  const seenContentTypes = new Set<string>();
+  for (const [index, capability] of value.contentCapabilities.entries()) {
+    const capabilityPath = `${path}.contentCapabilities[${index}]`;
+    if (
+      !isPlainObject(capability) ||
+      !hasOwn(capability, 'type') ||
+      (capability.type !== 'text' && capability.type !== 'json')
+    ) {
+      return issue('malformed', capabilityPath, 'content capability type is invalid', 'type');
+    }
+    if (seenContentTypes.has(capability.type)) {
+      return issue(
+        'malformed',
+        `${capabilityPath}.type`,
+        'content capability is duplicated',
+        'type',
+      );
+    }
+    seenContentTypes.add(capability.type);
+    if (hasOwn(capability, 'supportsSchema') && typeof capability.supportsSchema !== 'boolean') {
+      return issue(
+        'malformed',
+        `${capabilityPath}.supportsSchema`,
+        'supportsSchema must be boolean',
+        'supportsSchema',
+      );
+    }
+  }
+  if (!hasOwn(value, 'capabilities') || !isPlainObject(value.capabilities)) {
+    return issue(
+      'malformed',
+      `${path}.capabilities`,
+      'agent capabilities are required',
+      'capabilities',
+    );
+  }
+  for (const capabilityName of ['supportsCancellation', 'supportsNotifications'] as const) {
+    if (
+      !hasOwn(value.capabilities, capabilityName) ||
+      typeof value.capabilities[capabilityName] !== 'boolean'
+    ) {
+      return issue(
+        'malformed',
+        `${path}.capabilities.${capabilityName}`,
+        `${capabilityName} must be boolean`,
+        capabilityName,
+      );
+    }
+  }
+  if (!hasOwn(value, 'limits') || !isPlainObject(value.limits)) {
+    return issue('malformed', `${path}.limits`, 'protocol limits are required', 'limits');
+  }
+  const limitCeilings: Record<string, number> = {
+    requestTtlMs: MAX_REQUEST_TTL_MS,
+    maxRequestTtlMs: MAX_REQUEST_TTL_MS,
+    maxControlTtlMs: MAX_CONTROL_TTL_MS,
+    maxEnvelopeBytes: MAX_ENVELOPE_BYTES,
+    maxSchemaBytes: MAX_SCHEMA_BYTES,
+    maxQueueEntries: DEFAULT_QUEUE_LIMIT,
+  };
+  for (const [name, ceiling] of Object.entries(limitCeilings)) {
+    const limit = value.limits[name];
+    if (
+      !hasOwn(value.limits, name) ||
+      typeof limit !== 'number' ||
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      limit > ceiling
+    ) {
+      return issue(
+        'malformed',
+        `${path}.limits.${name}`,
+        `${name} must be a positive value within the v1 ceiling`,
+        name,
+      );
+    }
+  }
+  const requestTtlMs = value.limits.requestTtlMs;
+  const maxRequestTtlMs = value.limits.maxRequestTtlMs;
+  if (
+    typeof requestTtlMs !== 'number' ||
+    typeof maxRequestTtlMs !== 'number' ||
+    requestTtlMs > maxRequestTtlMs
+  ) {
+    return issue(
+      'malformed',
+      `${path}.limits.requestTtlMs`,
+      'requestTtlMs must not exceed maxRequestTtlMs',
+      'requestTtlMs',
+    );
+  }
+  return undefined;
+}
+
+function validateTaskSnapshotInternal(
+  value: unknown,
+  path: string,
+  options: ValidationOptions,
+): InternalIssue | undefined {
+  if (!isPlainObject(value)) {
+    return issue('malformed', path, 'task snapshot must be an object');
+  }
+  if (!hasOwn(value, 'requestId') || !isUuidV4Value(value.requestId)) {
+    return issue(
+      'malformed',
+      `${path}.requestId`,
+      'task snapshot requestId must be a UUIDv4',
+      'requestId',
+    );
+  }
+  if (options.expectedRequestId !== undefined && value.requestId !== options.expectedRequestId) {
+    return issue(
+      'malformed',
+      `${path}.requestId`,
+      'task snapshot requestId does not match the expected request',
+      'requestId',
+    );
+  }
+  if (
+    !hasOwn(value, 'state') ||
+    typeof value.state !== 'string' ||
+    !(TASK_STATES as readonly string[]).includes(value.state)
+  ) {
+    return issue('malformed', `${path}.state`, 'task snapshot state is invalid', 'state');
+  }
+  const state = value.state as TaskState;
+  const timestampFields = ['createdAt', 'updatedAt', 'expiresAt'] as const;
+  const timestamps = new Map<string, number>();
+  for (const field of timestampFields) {
+    if (!hasOwn(value, field)) {
+      return issue('malformed', `${path}.${field}`, 'task snapshot timestamp is required', field);
+    }
+    const timestamp = parseUtcTimestamp(value[field]);
+    if (timestamp === undefined) {
+      return issue('malformed', `${path}.${field}`, 'task snapshot timestamp is invalid', field);
+    }
+    timestamps.set(field, timestamp);
+  }
+  if (timestamps.get('updatedAt')! < timestamps.get('createdAt')!) {
+    return issue(
+      'malformed',
+      `${path}.updatedAt`,
+      'task snapshot updatedAt must not precede createdAt',
+      'updatedAt',
+    );
+  }
+  if (timestamps.get('expiresAt')! <= timestamps.get('createdAt')!) {
+    return issue(
+      'malformed',
+      `${path}.expiresAt`,
+      'task snapshot expiry must be later than creation',
+      'expiresAt',
+    );
+  }
+  if (!hasOwn(value, 'cancellationRequested') || typeof value.cancellationRequested !== 'boolean') {
+    return issue(
+      'malformed',
+      `${path}.cancellationRequested`,
+      'cancellationRequested must be boolean',
+      'cancellationRequested',
+    );
+  }
+  if (hasOwn(value, 'cancellation')) {
+    if (
+      !isPlainObject(value.cancellation) ||
+      !hasOwn(value.cancellation, 'state') ||
+      (value.cancellation.state !== 'not_requested' && value.cancellation.state !== 'requested')
+    ) {
+      return issue(
+        'malformed',
+        `${path}.cancellation`,
+        'cancellation snapshot is invalid',
+        'cancellation',
+      );
+    }
+    const requested = value.cancellation.state === 'requested';
+    if (requested !== value.cancellationRequested) {
+      return issue(
+        'malformed',
+        `${path}.cancellation.state`,
+        'cancellation state does not match cancellationRequested',
+        'state',
+      );
+    }
+    if (
+      hasOwn(value.cancellation, 'requestedAt') &&
+      parseUtcTimestamp(value.cancellation.requestedAt) === undefined
+    ) {
+      return issue(
+        'malformed',
+        `${path}.cancellation.requestedAt`,
+        'cancellation requestedAt must be a valid timestamp',
+        'requestedAt',
+      );
+    }
+  }
+  const terminal = isTerminalTaskState(state);
+  if (terminal) {
+    if (
+      !hasOwn(value, 'terminalOutcome') ||
+      typeof value.terminalOutcome !== 'string' ||
+      !isTerminalOutcome(value.terminalOutcome)
+    ) {
+      return issue(
+        'malformed',
+        `${path}.terminalOutcome`,
+        'terminal task state requires a matching outcome',
+        'terminalOutcome',
+      );
+    }
+    if (value.terminalOutcome !== state) {
+      return issue(
+        'malformed',
+        `${path}.terminalOutcome`,
+        'terminal outcome must match task state',
+        'terminalOutcome',
+      );
+    }
+  } else if (hasOwn(value, 'terminalOutcome')) {
+    return issue(
+      'malformed',
+      `${path}.terminalOutcome`,
+      'nonterminal task cannot include terminalOutcome',
+      'terminalOutcome',
+    );
+  }
+  if (hasOwn(value, 'content')) {
+    const contentIssue = validateTypedContentInternal(value.content, `${path}.content`, options);
+    if (contentIssue !== undefined) {
+      return contentIssue;
+    }
+  }
+  if (hasOwn(value, 'error')) {
+    const errorIssue = validateProtocolErrorValue(value.error, `${path}.error`, options);
+    if (errorIssue !== undefined) {
+      return errorIssue;
+    }
+  }
+  if (hasOwn(value, 'content') && hasOwn(value, 'error')) {
+    return issue('malformed', path, 'task snapshot cannot contain both content and error');
+  }
+  return undefined;
+}
 
 function validateResultForOperation(
   operation: OperationName,
   result: unknown,
   path: string,
+  responseOperationId: unknown,
+  options: ValidationOptions,
 ): InternalIssue | undefined {
   if (!isPlainObject(result)) {
     return issue('malformed', path, 'operation result must be an object');
   }
   switch (operation) {
-    case 'peer.describe':
-      return undefined;
+    case 'peer.describe': {
+      if (!hasOwn(result, 'agentCard')) {
+        return issue(
+          'malformed',
+          `${path}.agentCard`,
+          'peer.describe result requires an agent card',
+          'agentCard',
+        );
+      }
+      return validateAgentCardInternal(result.agentCard, `${path}.agentCard`);
+    }
     case 'message.request':
-      if (!isUuidV4Value(result.requestId)) {
-        return issue('malformed', `${path}.requestId`, 'requestId must be a UUIDv4');
+      if (!hasOwn(result, 'requestId') || !isUuidV4Value(result.requestId)) {
+        return issue('malformed', `${path}.requestId`, 'requestId must be a UUIDv4', 'requestId');
       }
-      return typeof result.state === 'string' && ADMISSION_STATES.has(result.state)
-        ? undefined
-        : issue('malformed', `${path}.state`, 'request result state must be accepted or queued');
+      if (result.requestId !== responseOperationId) {
+        return issue(
+          'malformed',
+          `${path}.requestId`,
+          'request result requestId must match response operationId',
+          'requestId',
+        );
+      }
+      if (
+        !hasOwn(result, 'state') ||
+        typeof result.state !== 'string' ||
+        !ADMISSION_STATES.has(result.state)
+      ) {
+        return issue(
+          'malformed',
+          `${path}.state`,
+          'request result state must be accepted or queued',
+          'state',
+        );
+      }
+      return undefined;
     case 'message.reply':
-      if (!isUuidV4Value(result.requestId)) {
-        return issue('malformed', `${path}.requestId`, 'requestId must be a UUIDv4');
+      if (!hasOwn(result, 'requestId') || !isUuidV4Value(result.requestId)) {
+        return issue('malformed', `${path}.requestId`, 'requestId must be a UUIDv4', 'requestId');
       }
-      if (typeof result.outcome !== 'string' || !TERMINAL_OUTCOMES.has(result.outcome)) {
-        return issue('malformed', `${path}.outcome`, 'reply result outcome is invalid');
+      if (
+        options.expectedRequestId !== undefined &&
+        result.requestId !== options.expectedRequestId
+      ) {
+        return issue(
+          'malformed',
+          `${path}.requestId`,
+          'reply result requestId does not match the expected request',
+          'requestId',
+        );
       }
-      return result.delivered === true
+      if (
+        !hasOwn(result, 'outcome') ||
+        typeof result.outcome !== 'string' ||
+        !isTerminalOutcome(result.outcome)
+      ) {
+        return issue('malformed', `${path}.outcome`, 'reply result outcome is invalid', 'outcome');
+      }
+      return hasOwn(result, 'delivered') && result.delivered === true
         ? undefined
-        : issue('malformed', `${path}.delivered`, 'reply result must acknowledge delivery');
+        : issue(
+            'malformed',
+            `${path}.delivered`,
+            'reply result must acknowledge delivery',
+            'delivered',
+          );
     case 'message.notify':
-      return result.delivered === true
+      return hasOwn(result, 'delivered') && result.delivered === true
         ? undefined
-        : issue('malformed', `${path}.delivered`, 'notification result must acknowledge delivery');
+        : issue(
+            'malformed',
+            `${path}.delivered`,
+            'notification result must acknowledge delivery',
+            'delivered',
+          );
     case 'task.status':
     case 'task.cancel':
-      return isPlainObject(result.snapshot)
-        ? undefined
-        : issue('malformed', `${path}.snapshot`, 'task result must include a snapshot');
+      if (!hasOwn(result, 'snapshot')) {
+        return issue(
+          'malformed',
+          `${path}.snapshot`,
+          'task result must include a snapshot',
+          'snapshot',
+        );
+      }
+      return validateTaskSnapshotInternal(result.snapshot, `${path}.snapshot`, options);
     default:
       return issue('incompatible', '$.operation', 'operation is unsupported');
   }
@@ -1785,7 +2329,7 @@ export function validateOperationResponse(
       'response must be an object',
     );
   }
-  if (typeof value.protocolVersion !== 'string') {
+  if (!hasOwn(value, 'protocolVersion') || typeof value.protocolVersion !== 'string') {
     return validationFailure(
       'malformed',
       'operation response is malformed',
@@ -1801,7 +2345,7 @@ export function validateOperationResponse(
       'unsupported protocol version',
     );
   }
-  if (typeof value.operation !== 'string') {
+  if (!hasOwn(value, 'operation') || typeof value.operation !== 'string') {
     return validationFailure(
       'malformed',
       'operation response is malformed',
@@ -1817,7 +2361,7 @@ export function validateOperationResponse(
       'unsupported operation',
     );
   }
-  if (!isUuidV4Value(value.operationId)) {
+  if (!hasOwn(value, 'operationId') || !isUuidV4Value(value.operationId)) {
     return validationFailure(
       'malformed',
       'operation response is malformed',
@@ -1825,7 +2369,11 @@ export function validateOperationResponse(
       'operationId must be a UUIDv4',
     );
   }
-  if (typeof value.traceId !== 'string' || !TRACE_ID_PATTERN.test(value.traceId)) {
+  if (
+    !hasOwn(value, 'traceId') ||
+    typeof value.traceId !== 'string' ||
+    !TRACE_ID_PATTERN.test(value.traceId)
+  ) {
     return validationFailure(
       'malformed',
       'operation response is malformed',
@@ -1856,7 +2404,13 @@ export function validateOperationResponse(
       return internalIssueFailure(errorIssue);
     }
   } else {
-    const resultIssue = validateResultForOperation(operation, value.result, '$.result');
+    const resultIssue = validateResultForOperation(
+      operation,
+      value.result,
+      '$.result',
+      value.operationId,
+      options,
+    );
     if (resultIssue !== undefined) {
       return internalIssueFailure(resultIssue);
     }
@@ -1868,7 +2422,10 @@ export function validateOperationResponse(
 export const validateProtocolOperationResponse = validateOperationResponse;
 export const validateResponse = validateOperationResponse;
 
-function deepEqualJson(left: JsonValue, right: JsonValue): boolean {
+function deepEqualJson(left: JsonValue, right: JsonValue, budget?: EvaluationBudget): boolean {
+  if (budget !== undefined && !consumeEvaluationBudget(budget)) {
+    return false;
+  }
   if (Object.is(left, right)) {
     return true;
   }
@@ -1879,7 +2436,12 @@ function deepEqualJson(left: JsonValue, right: JsonValue): boolean {
     if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
       return false;
     }
-    return left.every((entry, index) => deepEqualJson(entry, right[index]));
+    for (let index = 0; index < left.length; index += 1) {
+      if (!deepEqualJson(left[index], right[index], budget)) {
+        return false;
+      }
+    }
+    return true;
   }
   if (isPlainObject(left) && isPlainObject(right)) {
     const leftKeys = Object.keys(left).sort();
@@ -1890,7 +2452,12 @@ function deepEqualJson(left: JsonValue, right: JsonValue): boolean {
     ) {
       return false;
     }
-    return leftKeys.every((key) => deepEqualJson(left[key] as JsonValue, right[key] as JsonValue));
+    for (const key of leftKeys) {
+      if (!deepEqualJson(left[key] as JsonValue, right[key] as JsonValue, budget)) {
+        return false;
+      }
+    }
+    return true;
   }
   return false;
 }
@@ -1916,14 +2483,8 @@ function schemaTypeMatches(value: JsonValue, type: string): boolean {
   }
 }
 function schemaReference(value: UnknownRecord): string | undefined {
-  if (typeof value.$ref === 'string') {
+  if (hasOwn(value, '$ref') && typeof value.$ref === 'string') {
     return value.$ref;
-  }
-  if (typeof value.$dynamicRef === 'string') {
-    return value.$dynamicRef;
-  }
-  if (typeof value.$recursiveRef === 'string') {
-    return value.$recursiveRef;
   }
   return undefined;
 }
@@ -1936,6 +2497,9 @@ function matchesSchema(
   depth: number,
   activeRefs: Set<string>,
 ): SchemaValidationResult {
+  if (!consumeEvaluationBudget(context.budget)) {
+    return budgetFailure(path);
+  }
   if (depth > context.maxDepth) {
     return { valid: false, path, reason: 'maximum schema evaluation depth exceeded' };
   }
@@ -1966,68 +2530,122 @@ function matchesSchema(
       return { valid: false, path, reason: 'value does not match schema type' };
     }
   }
-  if (hasOwn(schema, 'const') && !deepEqualJson(value, schema.const as JsonValue)) {
+  if (hasOwn(schema, 'const') && !deepEqualJson(value, schema.const as JsonValue, context.budget)) {
+    if (context.budget.exhausted) {
+      return budgetFailure(path);
+    }
     return { valid: false, path, reason: 'value does not match const' };
   }
-  if (
-    Array.isArray(schema.enum) &&
-    !schema.enum.some((entry) => deepEqualJson(value, entry as JsonValue))
-  ) {
-    return { valid: false, path, reason: 'value is not in enum' };
+  if (hasOwn(schema, 'enum') && Array.isArray(schema.enum)) {
+    let matched = false;
+    for (const entry of schema.enum) {
+      if (deepEqualJson(value, entry as JsonValue, context.budget)) {
+        matched = true;
+        break;
+      }
+      if (context.budget.exhausted) {
+        return budgetFailure(path);
+      }
+    }
+    if (!matched) {
+      return { valid: false, path, reason: 'value is not in enum' };
+    }
   }
 
   if (typeof value === 'number') {
-    if (isFiniteNumber(schema.multipleOf)) {
+    if (hasOwn(schema, 'multipleOf') && isFiniteNumber(schema.multipleOf)) {
       const quotient = value / schema.multipleOf;
       if (Math.abs(quotient - Math.round(quotient)) > 1e-12) {
         return { valid: false, path, reason: 'number is not a multipleOf value' };
       }
     }
-    if (isFiniteNumber(schema.minimum) && value < schema.minimum) {
+    if (hasOwn(schema, 'minimum') && isFiniteNumber(schema.minimum) && value < schema.minimum) {
       return { valid: false, path, reason: 'number is below minimum' };
     }
-    if (isFiniteNumber(schema.maximum) && value > schema.maximum) {
+    if (hasOwn(schema, 'maximum') && isFiniteNumber(schema.maximum) && value > schema.maximum) {
       return { valid: false, path, reason: 'number is above maximum' };
     }
-    if (isFiniteNumber(schema.exclusiveMinimum) && value <= schema.exclusiveMinimum) {
+    if (
+      hasOwn(schema, 'exclusiveMinimum') &&
+      isFiniteNumber(schema.exclusiveMinimum) &&
+      value <= schema.exclusiveMinimum
+    ) {
       return { valid: false, path, reason: 'number is not above exclusiveMinimum' };
     }
-    if (isFiniteNumber(schema.exclusiveMaximum) && value >= schema.exclusiveMaximum) {
+    if (
+      hasOwn(schema, 'exclusiveMaximum') &&
+      isFiniteNumber(schema.exclusiveMaximum) &&
+      value >= schema.exclusiveMaximum
+    ) {
       return { valid: false, path, reason: 'number is not below exclusiveMaximum' };
     }
   }
 
   if (typeof value === 'string') {
     const length = Array.from(value).length;
-    if (isNonNegativeInteger(schema.minLength) && length < schema.minLength) {
+    if (
+      hasOwn(schema, 'minLength') &&
+      isNonNegativeInteger(schema.minLength) &&
+      length < schema.minLength
+    ) {
       return { valid: false, path, reason: 'string is shorter than minLength' };
     }
-    if (isNonNegativeInteger(schema.maxLength) && length > schema.maxLength) {
+    if (
+      hasOwn(schema, 'maxLength') &&
+      isNonNegativeInteger(schema.maxLength) &&
+      length > schema.maxLength
+    ) {
       return { valid: false, path, reason: 'string is longer than maxLength' };
     }
-    if (typeof schema.pattern === 'string' && !new RegExp(schema.pattern, 'u').test(value)) {
-      return { valid: false, path, reason: 'string does not match pattern' };
+    if (hasOwn(schema, 'pattern') && typeof schema.pattern === 'string') {
+      const patternResult = testSchemaRegex(context, schema.pattern, value);
+      if (patternResult.exhausted) {
+        return budgetFailure(path);
+      }
+      if (!patternResult.matched) {
+        return { valid: false, path, reason: 'string does not match pattern' };
+      }
     }
     // `format` is deliberately annotation-only in the default v1 contract.
   }
 
   if (Array.isArray(value)) {
-    if (isNonNegativeInteger(schema.minItems) && value.length < schema.minItems) {
+    if (
+      hasOwn(schema, 'minItems') &&
+      isNonNegativeInteger(schema.minItems) &&
+      value.length < schema.minItems
+    ) {
       return { valid: false, path, reason: 'array is shorter than minItems' };
     }
-    if (isNonNegativeInteger(schema.maxItems) && value.length > schema.maxItems) {
+    if (
+      hasOwn(schema, 'maxItems') &&
+      isNonNegativeInteger(schema.maxItems) &&
+      value.length > schema.maxItems
+    ) {
       return { valid: false, path, reason: 'array is longer than maxItems' };
     }
-    if (schema.uniqueItems === true) {
-      for (let index = 0; index < value.length; index += 1) {
-        for (let other = index + 1; other < value.length; other += 1) {
-          if (deepEqualJson(value[index], value[other])) {
-            return { valid: false, path, reason: 'array items are not unique' };
-          }
+    if (hasOwn(schema, 'uniqueItems') && schema.uniqueItems === true) {
+      const itemSignatures = new Set<string>();
+      for (const item of value) {
+        if (!consumeEvaluationBudget(context.budget)) {
+          return budgetFailure(path);
         }
+        let signature: string;
+        try {
+          signature = canonicalizeJsonWithinBudget(item, context.budget);
+        } catch {
+          if (context.budget.exhausted) {
+            return budgetFailure(path);
+          }
+          return { valid: false, path, reason: 'array items are not valid JSON' };
+        }
+        if (itemSignatures.has(signature)) {
+          return { valid: false, path, reason: 'array items are not unique' };
+        }
+        itemSignatures.add(signature);
       }
     }
-    if (Array.isArray(schema.prefixItems)) {
+    if (hasOwn(schema, 'prefixItems') && Array.isArray(schema.prefixItems)) {
       for (let index = 0; index < schema.prefixItems.length && index < value.length; index += 1) {
         const childResult = matchesSchema(
           value[index],
@@ -2042,12 +2660,15 @@ function matchesSchema(
         }
       }
     }
-    if (hasOwn(schema, 'items') && isSchemaValue(schema.items)) {
-      const start = Array.isArray(schema.prefixItems) ? schema.prefixItems.length : 0;
-      for (let index = start; index < value.length; index += 1) {
+    const prefixLength =
+      hasOwn(schema, 'prefixItems') && Array.isArray(schema.prefixItems)
+        ? schema.prefixItems.length
+        : 0;
+    if (hasOwn(schema, 'items')) {
+      for (let index = prefixLength; index < value.length; index += 1) {
         const childResult = matchesSchema(
           value[index],
-          schema.items,
+          schema.items as JsonSchema,
           context,
           `${path}[${index}]`,
           depth + 1,
@@ -2058,12 +2679,12 @@ function matchesSchema(
         }
       }
     }
-    if (hasOwn(schema, 'contains') && isSchemaValue(schema.contains)) {
+    if (hasOwn(schema, 'contains')) {
       let matching = 0;
       for (let index = 0; index < value.length; index += 1) {
         const childResult = matchesSchema(
           value[index],
-          schema.contains,
+          schema.contains as JsonSchema,
           context,
           `${path}[${index}]`,
           depth + 1,
@@ -2072,11 +2693,18 @@ function matchesSchema(
         if (childResult.valid) {
           matching += 1;
         }
+        if (context.budget.exhausted) {
+          return budgetFailure(path);
+        }
       }
-      const minimum = isNonNegativeInteger(schema.minContains) ? schema.minContains : 1;
-      const maximum = isNonNegativeInteger(schema.maxContains)
-        ? schema.maxContains
-        : Number.POSITIVE_INFINITY;
+      const minimum =
+        hasOwn(schema, 'minContains') && isNonNegativeInteger(schema.minContains)
+          ? schema.minContains
+          : 1;
+      const maximum =
+        hasOwn(schema, 'maxContains') && isNonNegativeInteger(schema.maxContains)
+          ? schema.maxContains
+          : Number.POSITIVE_INFINITY;
       if (matching < minimum || matching > maximum) {
         return { valid: false, path, reason: 'array does not satisfy contains' };
       }
@@ -2085,18 +2713,20 @@ function matchesSchema(
 
   if (isPlainObject(value)) {
     if (
+      hasOwn(schema, 'minProperties') &&
       isNonNegativeInteger(schema.minProperties) &&
       Object.keys(value).length < schema.minProperties
     ) {
       return { valid: false, path, reason: 'object has fewer than minProperties' };
     }
     if (
+      hasOwn(schema, 'maxProperties') &&
       isNonNegativeInteger(schema.maxProperties) &&
       Object.keys(value).length > schema.maxProperties
     ) {
       return { valid: false, path, reason: 'object has more than maxProperties' };
     }
-    if (Array.isArray(schema.required)) {
+    if (hasOwn(schema, 'required') && Array.isArray(schema.required)) {
       for (const required of schema.required) {
         if (typeof required === 'string' && !hasOwn(value, required)) {
           return {
@@ -2107,12 +2737,12 @@ function matchesSchema(
         }
       }
     }
-    if (isPlainObject(schema.properties)) {
+    if (hasOwn(schema, 'properties') && isPlainObject(schema.properties)) {
       for (const [property, childSchema] of Object.entries(schema.properties)) {
-        if (hasOwn(value, property) && isSchemaValue(childSchema)) {
+        if (hasOwn(value, property)) {
           const childResult = matchesSchema(
             value[property] as JsonValue,
-            childSchema,
+            childSchema as JsonSchema,
             context,
             `${path}.${property}`,
             depth + 1,
@@ -2124,14 +2754,17 @@ function matchesSchema(
         }
       }
     }
-    if (isPlainObject(schema.patternProperties)) {
+    if (hasOwn(schema, 'patternProperties') && isPlainObject(schema.patternProperties)) {
       for (const [pattern, childSchema] of Object.entries(schema.patternProperties)) {
-        const expression = new RegExp(pattern, 'u');
         for (const property of Object.keys(value)) {
-          if (expression.test(property) && isSchemaValue(childSchema)) {
+          const patternResult = testSchemaRegex(context, pattern, property);
+          if (patternResult.exhausted) {
+            return budgetFailure(path);
+          }
+          if (patternResult.matched) {
             const childResult = matchesSchema(
               value[property] as JsonValue,
-              childSchema,
+              childSchema as JsonSchema,
               context,
               `${path}.${property}`,
               depth + 1,
@@ -2144,37 +2777,53 @@ function matchesSchema(
         }
       }
     }
-    if (hasOwn(schema, 'additionalProperties') && isSchemaValue(schema.additionalProperties)) {
-      const known = new Set<string>([
-        ...(isPlainObject(schema.properties) ? Object.keys(schema.properties) : []),
-      ]);
-      const patterns = isPlainObject(schema.patternProperties)
-        ? Object.entries(schema.patternProperties).map(([pattern]) => new RegExp(pattern, 'u'))
-        : [];
+    if (hasOwn(schema, 'additionalProperties')) {
+      const known = new Set<string>(
+        hasOwn(schema, 'properties') && isPlainObject(schema.properties)
+          ? Object.keys(schema.properties)
+          : [],
+      );
       for (const property of Object.keys(value)) {
-        if (!known.has(property) && !patterns.some((pattern) => pattern.test(property))) {
-          if (schema.additionalProperties === false) {
-            return {
-              valid: false,
-              path: `${path}.${property}`,
-              reason: 'additional property is not allowed',
-            };
+        if (known.has(property)) {
+          continue;
+        }
+        let matchedPattern = false;
+        if (hasOwn(schema, 'patternProperties') && isPlainObject(schema.patternProperties)) {
+          for (const pattern of Object.keys(schema.patternProperties)) {
+            const patternResult = testSchemaRegex(context, pattern, property);
+            if (patternResult.exhausted) {
+              return budgetFailure(path);
+            }
+            if (patternResult.matched) {
+              matchedPattern = true;
+              break;
+            }
           }
-          const childResult = matchesSchema(
-            value[property] as JsonValue,
-            schema.additionalProperties,
-            context,
-            `${path}.${property}`,
-            depth + 1,
-            new Set(activeRefs),
-          );
-          if (!childResult.valid) {
-            return childResult;
-          }
+        }
+        if (matchedPattern) {
+          continue;
+        }
+        if (schema.additionalProperties === false) {
+          return {
+            valid: false,
+            path: `${path}.${property}`,
+            reason: 'additional property is not allowed',
+          };
+        }
+        const childResult = matchesSchema(
+          value[property] as JsonValue,
+          schema.additionalProperties as JsonSchema,
+          context,
+          `${path}.${property}`,
+          depth + 1,
+          new Set(activeRefs),
+        );
+        if (!childResult.valid) {
+          return childResult;
         }
       }
     }
-    if (isPlainObject(schema.dependentRequired)) {
+    if (hasOwn(schema, 'dependentRequired') && isPlainObject(schema.dependentRequired)) {
       for (const [property, dependencies] of Object.entries(schema.dependentRequired)) {
         if (hasOwn(value, property) && Array.isArray(dependencies)) {
           for (const dependency of dependencies) {
@@ -2189,12 +2838,12 @@ function matchesSchema(
         }
       }
     }
-    if (isPlainObject(schema.dependentSchemas)) {
+    if (hasOwn(schema, 'dependentSchemas') && isPlainObject(schema.dependentSchemas)) {
       for (const [property, dependentSchema] of Object.entries(schema.dependentSchemas)) {
-        if (hasOwn(value, property) && isSchemaValue(dependentSchema)) {
+        if (hasOwn(value, property)) {
           const dependentResult = matchesSchema(
             value,
-            dependentSchema,
+            dependentSchema as JsonSchema,
             context,
             path,
             depth + 1,
@@ -2206,11 +2855,11 @@ function matchesSchema(
         }
       }
     }
-    if (isSchemaValue(schema.propertyNames)) {
+    if (hasOwn(schema, 'propertyNames')) {
       for (const property of Object.keys(value)) {
         const propertyResult = matchesSchema(
           property,
-          schema.propertyNames,
+          schema.propertyNames as JsonSchema,
           context,
           `${path}.${property}`,
           depth + 1,
@@ -2223,11 +2872,11 @@ function matchesSchema(
     }
   }
 
-  if (Array.isArray(schema.allOf)) {
+  if (hasOwn(schema, 'allOf') && Array.isArray(schema.allOf)) {
     for (const childSchema of schema.allOf) {
       const childResult = matchesSchema(
         value,
-        childSchema,
+        childSchema as JsonSchema,
         context,
         path,
         depth + 1,
@@ -2238,63 +2887,97 @@ function matchesSchema(
       }
     }
   }
-  if (
-    Array.isArray(schema.anyOf) &&
-    !schema.anyOf.some(
-      (childSchema) =>
-        matchesSchema(value, childSchema, context, path, depth + 1, new Set(activeRefs)).valid,
-    )
-  ) {
-    return { valid: false, path, reason: 'value does not match anyOf' };
+  if (hasOwn(schema, 'anyOf') && Array.isArray(schema.anyOf)) {
+    let matched = false;
+    for (const childSchema of schema.anyOf) {
+      const childResult = matchesSchema(
+        value,
+        childSchema as JsonSchema,
+        context,
+        path,
+        depth + 1,
+        new Set(activeRefs),
+      );
+      if (childResult.valid) {
+        matched = true;
+        break;
+      }
+      if (context.budget.exhausted) {
+        return budgetFailure(path);
+      }
+    }
+    if (!matched) {
+      return { valid: false, path, reason: 'value does not match anyOf' };
+    }
   }
-  if (Array.isArray(schema.oneOf)) {
-    const matches = schema.oneOf.filter(
-      (childSchema) =>
-        matchesSchema(value, childSchema, context, path, depth + 1, new Set(activeRefs)).valid,
-    ).length;
+  if (hasOwn(schema, 'oneOf') && Array.isArray(schema.oneOf)) {
+    let matches = 0;
+    for (const childSchema of schema.oneOf) {
+      const childResult = matchesSchema(
+        value,
+        childSchema as JsonSchema,
+        context,
+        path,
+        depth + 1,
+        new Set(activeRefs),
+      );
+      if (childResult.valid) {
+        matches += 1;
+      }
+      if (context.budget.exhausted) {
+        return budgetFailure(path);
+      }
+    }
     if (matches !== 1) {
       return { valid: false, path, reason: 'value does not match exactly one oneOf schema' };
     }
   }
-  if (
-    isSchemaValue(schema.not) &&
-    matchesSchema(value, schema.not, context, path, depth + 1, new Set(activeRefs)).valid
-  ) {
-    return { valid: false, path, reason: 'value matches a disallowed not schema' };
-  }
-  if (isSchemaValue(schema.if)) {
-    const condition = matchesSchema(
+  if (hasOwn(schema, 'not')) {
+    const notResult = matchesSchema(
       value,
-      schema.if,
+      schema.not as JsonSchema,
       context,
       path,
       depth + 1,
       new Set(activeRefs),
-    ).valid;
-    if (condition && isSchemaValue(schema.then)) {
-      const thenResult = matchesSchema(
-        value,
-        schema.then,
-        context,
-        path,
-        depth + 1,
-        new Set(activeRefs),
-      );
-      if (!thenResult.valid) {
-        return thenResult;
-      }
+    );
+    if (context.budget.exhausted) {
+      return budgetFailure(path);
     }
-    if (!condition && isSchemaValue(schema.else)) {
-      const elseResult = matchesSchema(
+    if (notResult.valid) {
+      return { valid: false, path, reason: 'value matches a disallowed not schema' };
+    }
+  }
+  if (hasOwn(schema, 'if')) {
+    const conditionResult = matchesSchema(
+      value,
+      schema.if as JsonSchema,
+      context,
+      path,
+      depth + 1,
+      new Set(activeRefs),
+    );
+    if (context.budget.exhausted) {
+      return budgetFailure(path);
+    }
+    const conditionalSchema = conditionResult.valid
+      ? hasOwn(schema, 'then')
+        ? schema.then
+        : undefined
+      : hasOwn(schema, 'else')
+        ? schema.else
+        : undefined;
+    if (conditionalSchema !== undefined) {
+      const conditionalResult = matchesSchema(
         value,
-        schema.else,
+        conditionalSchema as JsonSchema,
         context,
         path,
         depth + 1,
         new Set(activeRefs),
       );
-      if (!elseResult.valid) {
-        return elseResult;
+      if (!conditionalResult.valid) {
+        return conditionalResult;
       }
     }
   }
@@ -2323,7 +3006,12 @@ export function validateJsonValueAgainstSchema(
   }
   const limits = resolveLimits(options);
   const index = collectSchemaIndex(schemaResult.value);
-  const context: SchemaContext = { ...index, maxDepth: limits.maxDepth };
+  const context: SchemaContext = {
+    ...index,
+    maxDepth: limits.maxDepth,
+    budget: createEvaluationBudget(limits.maxNodes),
+    regexCache: new Map<string, RegExp>(),
+  };
   const match = matchesSchema(
     value as JsonValue,
     schemaResult.value,
@@ -2356,35 +3044,11 @@ export function matchesJsonSchema(
   return validateJsonValueAgainstSchema(value, schema, options).ok;
 }
 
-function removeCredentialFields(value: unknown, seen: Set<object>): unknown {
-  if (Array.isArray(value)) {
-    if (seen.has(value)) {
-      throw new TypeError('cyclic fingerprint data');
-    }
-    seen.add(value);
-    const result = value.map((entry) => removeCredentialFields(entry, seen));
-    seen.delete(value);
-    return result;
-  }
-  if (!isPlainObject(value)) {
-    return value;
-  }
-  if (seen.has(value)) {
-    throw new TypeError('cyclic fingerprint data');
-  }
-  seen.add(value);
-  const result: UnknownRecord = Object.create(null) as UnknownRecord;
-  for (const [key, child] of Object.entries(value)) {
-    const normalizedKey = key.replace(/[_-]/gu, '').toLowerCase();
-    if (FINGERPRINT_CREDENTIAL_KEYS.has(normalizedKey)) {
-      continue;
-    }
-    result[key] = removeCredentialFields(child, seen);
-  }
-  seen.delete(value);
-  return result;
-}
-
+/**
+ * Project only immutable wire fields. Binding credentials are transport
+ * metadata and are not envelope fields; application payload/content/metadata is
+ * retained verbatim, including credential-looking names such as `token`.
+ */
 function fingerprintData(envelope: ProtocolEnvelope): UnknownRecord {
   const candidate = envelope as unknown as UnknownRecord;
   const data: UnknownRecord = Object.create(null) as UnknownRecord;
@@ -2402,14 +3066,30 @@ function fingerprintData(envelope: ProtocolEnvelope): UnknownRecord {
     'parentOperationId',
     'payload',
   ]) {
-    if (hasOwn(candidate, key)) {
+    if (!hasOwn(candidate, key)) {
+      continue;
+    }
+    if (key === 'sender') {
+      const sender = candidate.sender as UnknownRecord;
+      const senderProjection: UnknownRecord = Object.create(null) as UnknownRecord;
+      if (hasOwn(sender, 'sessionId')) {
+        senderProjection.sessionId = sender.sessionId;
+      }
+      if (hasOwn(sender, 'runtimeId')) {
+        senderProjection.runtimeId = sender.runtimeId;
+      }
+      data.sender = senderProjection;
+    } else {
       data[key] = candidate[key];
     }
   }
-  return removeCredentialFields(data, new Set<object>()) as UnknownRecord;
+  return data;
 }
 
-function canonicalizeValue(value: unknown, seen: Set<object>): string {
+function canonicalizeValue(value: unknown, seen: Set<object>, budget?: EvaluationBudget): string {
+  if (budget !== undefined && !consumeEvaluationBudget(budget)) {
+    throw new TypeError('canonical JSON evaluation budget exceeded');
+  }
   if (value === null) {
     return 'null';
   }
@@ -2439,7 +3119,7 @@ function canonicalizeValue(value: unknown, seen: Set<object>): string {
 
   let result: string;
   if (Array.isArray(value)) {
-    result = `[${value.map((entry) => canonicalizeValue(entry, seen)).join(',')}]`;
+    result = `[${value.map((entry) => canonicalizeValue(entry, seen, budget)).join(',')}]`;
   } else if (isPlainObject(value)) {
     if (Object.getOwnPropertySymbols(value).length > 0) {
       seen.delete(value);
@@ -2447,7 +3127,10 @@ function canonicalizeValue(value: unknown, seen: Set<object>): string {
     }
     const members = Object.keys(value)
       .sort()
-      .map((key) => `${canonicalizeValue(key, seen)}:${canonicalizeValue(value[key], seen)}`);
+      .map(
+        (key) =>
+          `${canonicalizeValue(key, seen, budget)}:${canonicalizeValue(value[key], seen, budget)}`,
+      );
     result = `{${members.join(',')}}`;
   } else {
     seen.delete(value);
@@ -2463,16 +3146,52 @@ export function canonicalizeJson(value: unknown): string {
   return canonicalizeValue(value, new Set<object>());
 }
 
+function canonicalizeJsonWithinBudget(value: unknown, budget: EvaluationBudget): string {
+  return canonicalizeValue(value, new Set<object>(), budget);
+}
+
 export const canonicalizeJSON = canonicalizeJson;
 export const canonicalJson = canonicalizeJson;
 
-/** Return the canonical immutable operation data used by request fingerprinting. */
-export function canonicalRequestData(value: unknown, options: ValidationOptions = {}): string {
+export interface CanonicalRequestProjection {
+  readonly envelope: ProtocolEnvelope;
+  readonly canonical: string;
+  readonly fingerprint: string;
+}
+
+/** Validate once, then derive the sole canonical request projection/fingerprint. */
+export function validatedRequestProjection(
+  value: unknown,
+  options: ValidationOptions = {},
+): ValidationResult<CanonicalRequestProjection> {
   const envelopeResult = validateEnvelope(value, options);
   if (!envelopeResult.ok) {
-    throw new ProtocolValidationError(envelopeResult.error);
+    return envelopeResult as ValidationFailure;
   }
-  return canonicalizeJson(fingerprintData(envelopeResult.value));
+  try {
+    const canonical = canonicalizeJson(fingerprintData(envelopeResult.value));
+    const fingerprint = createHash('sha256').update(canonical, 'utf8').digest('hex');
+    return success({ envelope: envelopeResult.value, canonical, fingerprint });
+  } catch (error) {
+    return validationFailure(
+      'malformed',
+      'request fingerprint cannot be computed',
+      '$',
+      error instanceof Error ? error.message : 'canonical JSON failure',
+    );
+  }
+}
+
+export const validateAndFingerprintRequest = validatedRequestProjection;
+export const validateCanonicalRequest = validatedRequestProjection;
+
+/** Return the canonical immutable operation data used by request fingerprinting. */
+export function canonicalRequestData(value: unknown, options: ValidationOptions = {}): string {
+  const projection = validatedRequestProjection(value, options);
+  if (!projection.ok) {
+    throw new ProtocolValidationError(projection.error);
+  }
+  return projection.value.canonical;
 }
 
 /** Hash immutable operation data with SHA-256, excluding binding credentials. */
@@ -2480,8 +3199,11 @@ export function canonicalRequestFingerprint(
   value: unknown,
   options: ValidationOptions = {},
 ): string {
-  const canonical = canonicalRequestData(value, options);
-  return createHash('sha256').update(canonical, 'utf8').digest('hex');
+  const projection = validatedRequestProjection(value, options);
+  if (!projection.ok) {
+    throw new ProtocolValidationError(projection.error);
+  }
+  return projection.value.fingerprint;
 }
 
 export const requestFingerprint = canonicalRequestFingerprint;
@@ -2493,20 +3215,8 @@ export function tryRequestFingerprint(
   value: unknown,
   options: ValidationOptions = {},
 ): ValidationResult<string> {
-  const envelopeResult = validateEnvelope(value, options);
-  if (!envelopeResult.ok) {
-    return envelopeResult as ValidationFailure;
-  }
-  try {
-    return success(canonicalRequestFingerprint(envelopeResult.value, options));
-  } catch (error) {
-    return validationFailure(
-      'malformed',
-      'request fingerprint cannot be computed',
-      '$',
-      error instanceof Error ? error.message : 'canonical JSON failure',
-    );
-  }
+  const projection = validatedRequestProjection(value, options);
+  return projection.ok ? success(projection.value.fingerprint) : (projection as ValidationFailure);
 }
 
 export class ProtocolValidationError extends TypeError {

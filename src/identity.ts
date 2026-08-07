@@ -65,7 +65,7 @@ function requireRuntimeId(value: string): RuntimeId {
   return asRuntimeId(requireIdentifier(value, 'runtimeId'));
 }
 
-function isSafeIdentifier(value: unknown): value is string {
+export function isSafeIdentifier(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && !CONTROL_CHARACTER_PATTERN.test(value);
 }
 
