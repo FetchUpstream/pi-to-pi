@@ -16,6 +16,7 @@ import {
   parseRfc3339Utc,
   validatedRequestProjection,
   type CanonicalRequestProjection,
+  type ValidationOptions,
 } from '../protocol/validation.js';
 
 /** Operations whose delivery can cause a mutation and must be deduplicated. */
@@ -28,7 +29,9 @@ export const DEDUPE_OPERATION_NAMES = [
 
 export type DedupeOperationName = (typeof DEDUPE_OPERATION_NAMES)[number];
 export type DeduplicatedOperationName = DedupeOperationName;
-
+/** Validation context carried by a dedupe caller, never included in wire fingerprints. */
+export type DedupeValidationOptions = Pick<ValidationOptions, 'expectedRequestExpiresAt'>;
+export type DedupeOperationValidationOptions = DedupeValidationOptions;
 /** A loose input type is useful at the routing boundary before validation. */
 export interface DedupeOperationInput {
   readonly operation: OperationName | string;
@@ -39,6 +42,8 @@ export interface DedupeOperationInput {
   };
   readonly senderRuntimeId?: string;
   readonly expiresAt?: string | number | Date;
+  /** Original request deadline for message.reply; this out-of-band field is not fingerprinted. */
+  readonly expectedRequestExpiresAt?: ValidationOptions['expectedRequestExpiresAt'];
   readonly [key: string]: unknown;
 }
 
@@ -68,8 +73,46 @@ export function makeDedupeKey(senderRuntimeId: string, operationId: string): Ded
 export const createDedupeKey = makeDedupeKey;
 export const keyForOperation = makeDedupeKey;
 
-function requireProjection(operation: unknown): CanonicalRequestProjection {
-  const projection = validatedRequestProjection(operation);
+function isDedupeValidationOptions(value: unknown): value is DedupeValidationOptions {
+  return isRecord(value) && Object.prototype.hasOwnProperty.call(value, 'expectedRequestExpiresAt');
+}
+
+function operationValidationOptions(
+  operation: unknown,
+  validationOptions?: DedupeValidationOptions,
+): DedupeValidationOptions {
+  const hasExplicitExpectedDeadline =
+    validationOptions !== undefined &&
+    Object.prototype.hasOwnProperty.call(validationOptions, 'expectedRequestExpiresAt');
+  const expectedRequestExpiresAt = hasExplicitExpectedDeadline
+    ? validationOptions?.expectedRequestExpiresAt
+    : isRecord(operation)
+      ? (operation.expectedRequestExpiresAt as ValidationOptions['expectedRequestExpiresAt'])
+      : undefined;
+  return expectedRequestExpiresAt === undefined ? {} : { expectedRequestExpiresAt };
+}
+
+function operationWithoutValidationContext(operation: unknown): unknown {
+  if (
+    !isRecord(operation) ||
+    !Object.prototype.hasOwnProperty.call(operation, 'expectedRequestExpiresAt')
+  ) {
+    return operation;
+  }
+  const wireOperation = { ...operation };
+  delete wireOperation.expectedRequestExpiresAt;
+  return wireOperation;
+}
+
+function requireProjection(
+  operation: unknown,
+  validationOptions?: DedupeValidationOptions,
+  now?: ValidationOptions['now'],
+): CanonicalRequestProjection {
+  const projection = validatedRequestProjection(operationWithoutValidationContext(operation), {
+    ...(now === undefined ? {} : { now }),
+    ...operationValidationOptions(operation, validationOptions),
+  });
   if (!projection.ok) {
     throw new ProtocolValidationError(projection.error);
   }
@@ -82,17 +125,51 @@ export const canonicalizeJSON = sharedCanonicalizeJson;
 export const canonicalJson = sharedCanonicalizeJson;
 
 /** Canonical immutable operation data after common envelope validation. */
-export function canonicalizeOperation(operation: unknown, bindingCredentials?: unknown): string {
-  void bindingCredentials;
-  return requireProjection(operation).canonical;
+export function canonicalizeOperation(
+  operation: unknown,
+  validationOptions?: DedupeValidationOptions,
+): string;
+export function canonicalizeOperation(
+  operation: unknown,
+  bindingCredentials?: unknown,
+  validationOptions?: DedupeValidationOptions,
+): string;
+export function canonicalizeOperation(
+  operation: unknown,
+  bindingCredentialsOrOptions?: unknown,
+  validationOptions?: DedupeValidationOptions,
+): string {
+  const options =
+    validationOptions ??
+    (isDedupeValidationOptions(bindingCredentialsOrOptions)
+      ? bindingCredentialsOrOptions
+      : undefined);
+  return requireProjection(operation, options).canonical;
 }
 
 export const canonicalOperation = canonicalizeOperation;
 
 /** SHA-256 fingerprint over the shared validated canonical projection. */
-export function fingerprintOperation(operation: unknown, bindingCredentials?: unknown): string {
-  void bindingCredentials;
-  return requireProjection(operation).fingerprint;
+export function fingerprintOperation(
+  operation: unknown,
+  validationOptions?: DedupeValidationOptions,
+): string;
+export function fingerprintOperation(
+  operation: unknown,
+  bindingCredentials?: unknown,
+  validationOptions?: DedupeValidationOptions,
+): string;
+export function fingerprintOperation(
+  operation: unknown,
+  bindingCredentialsOrOptions?: unknown,
+  validationOptions?: DedupeValidationOptions,
+): string {
+  const options =
+    validationOptions ??
+    (isDedupeValidationOptions(bindingCredentialsOrOptions)
+      ? bindingCredentialsOrOptions
+      : undefined);
+  return requireProjection(operation, options).fingerprint;
 }
 
 export const operationFingerprint = fingerprintOperation;
@@ -250,6 +327,7 @@ function normalizedOperation(
   operation: DedupeOperation,
   nowMs: number,
   retentionGraceMs: number,
+  validationOptions?: DedupeValidationOptions,
 ): NormalizedOperation {
   const object = operationObject(operation);
   const rawOperation = object.operation;
@@ -258,9 +336,17 @@ function normalizedOperation(
   }
 
   const rawExpiresAtMs = parseRfc3339Utc(object.expiresAt);
-  let projection = validatedRequestProjection(operation, { now: nowMs });
+  const projectionOptions = operationValidationOptions(operation, validationOptions);
+  const wireOperation = operationWithoutValidationContext(operation);
+  let projection = validatedRequestProjection(wireOperation, {
+    now: nowMs,
+    ...projectionOptions,
+  });
   if (!projection.ok && projection.error.code === 'expired' && rawExpiresAtMs !== undefined) {
-    projection = validatedRequestProjection(operation, { now: rawExpiresAtMs - 1 });
+    projection = validatedRequestProjection(wireOperation, {
+      now: rawExpiresAtMs - 1,
+      ...projectionOptions,
+    });
   }
   if (!projection.ok) {
     throw new ProtocolValidationError(projection.error);
@@ -387,7 +473,10 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
   }
 
   /** Classify an operation without reserving it. */
-  public inspect(operation: DedupeOperation): DedupeDecision<Outcome, TaskReference> {
+  public inspect(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeDecision<Outcome, TaskReference> {
     this.ensureOpen();
     this.prune();
 
@@ -395,7 +484,7 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
       return ignoredDecision(operationName(operation)) as DedupeDecision<Outcome, TaskReference>;
     }
 
-    const normalized = this.normalize(operation);
+    const normalized = this.normalize(operation, validationOptions);
     const existing = this.records.get(normalized.key);
     if (existing === undefined) {
       return this.newDecision(normalized);
@@ -403,43 +492,61 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     return this.existingDecision(existing, normalized.fingerprint);
   }
 
-  public check(operation: DedupeOperation): DedupeDecision<Outcome, TaskReference> {
-    return this.inspect(operation);
+  public check(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeDecision<Outcome, TaskReference> {
+    return this.inspect(operation, validationOptions);
   }
 
-  public classify(operation: DedupeOperation): DedupeDecision<Outcome, TaskReference> {
-    return this.inspect(operation);
+  public classify(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeDecision<Outcome, TaskReference> {
+    return this.inspect(operation, validationOptions);
   }
 
   /** Return the stored record for a key, regardless of retry fingerprint. */
-  public getRecord(operation: DedupeOperation): DedupeRecord<Outcome, TaskReference> | undefined {
+  public getRecord(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeRecord<Outcome, TaskReference> | undefined {
     this.ensureOpen();
     this.prune();
     if (!isDedupeOperation(operationName(operation))) {
       return undefined;
     }
-    const normalized = this.normalize(operation);
+    const normalized = this.normalize(operation, validationOptions);
     const record = this.records.get(normalized.key);
     return record === undefined ? undefined : this.snapshot(record);
   }
 
-  public get(operation: DedupeOperation): DedupeRecord<Outcome, TaskReference> | undefined {
-    return this.getRecord(operation);
+  public get(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeRecord<Outcome, TaskReference> | undefined {
+    return this.getRecord(operation, validationOptions);
   }
 
-  public find(operation: DedupeOperation): DedupeRecord<Outcome, TaskReference> | undefined {
-    return this.getRecord(operation);
+  public find(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeRecord<Outcome, TaskReference> | undefined {
+    return this.getRecord(operation, validationOptions);
   }
 
-  public has(operation: DedupeOperation): boolean {
-    return this.getRecord(operation) !== undefined;
+  public has(operation: DedupeOperation, validationOptions?: DedupeValidationOptions): boolean {
+    return this.getRecord(operation, validationOptions) !== undefined;
   }
 
   /**
    * Reserve a new operation.  A reservation is not an acknowledgement; commit
    * the admission/delivery result before sending that acknowledgement.
    */
-  public reserve(operation: DedupeOperation): DedupeDecision<Outcome, TaskReference> {
+  public reserve(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeDecision<Outcome, TaskReference> {
     this.ensureOpen();
     this.prune();
 
@@ -447,7 +554,7 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
       return ignoredDecision(operationName(operation)) as DedupeDecision<Outcome, TaskReference>;
     }
 
-    const normalized = this.normalize(operation);
+    const normalized = this.normalize(operation, validationOptions);
     const existing = this.records.get(normalized.key);
     if (existing !== undefined) {
       return this.existingDecision(existing, normalized.fingerprint);
@@ -470,8 +577,11 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     };
   }
 
-  public begin(operation: DedupeOperation): DedupeDecision<Outcome, TaskReference> {
-    return this.reserve(operation);
+  public begin(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeDecision<Outcome, TaskReference> {
+    return this.reserve(operation, validationOptions);
   }
 
   /**
@@ -482,6 +592,7 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     target: DedupeOperation | DedupeReservation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
     this.ensureOpen();
     this.prune();
@@ -504,8 +615,8 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
       if (!isDedupeOperation(operationName(target))) {
         return ignoredDecision(operationName(target)) as DedupeDecision<Outcome, TaskReference>;
       }
-      this.release(target);
-      return this.busy(target);
+      this.release(target, validationOptions);
+      return this.busy(target, validationOptions);
     }
 
     if (this.isReservation(target)) {
@@ -549,7 +660,7 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
       return ignoredDecision(operationName(target)) as DedupeDecision<Outcome, TaskReference>;
     }
 
-    const reservation = this.reserve(target);
+    const reservation = this.reserve(target, validationOptions);
     if (reservation.kind !== 'new' || reservation.reservation === undefined) {
       return reservation;
     }
@@ -560,56 +671,63 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     operation: DedupeOperation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.commit(operation, result, taskReference);
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   public cache(
     operation: DedupeOperation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.commit(operation, result, taskReference);
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   public put(
     operation: DedupeOperation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.commit(operation, result, taskReference);
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   public setResult(
     operation: DedupeOperation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.commit(operation, result, taskReference);
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   public resolve(
     operation: DedupeOperation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.commit(operation, result, taskReference);
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   public cacheAdmission(
     operation: DedupeOperation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.commit(operation, result, taskReference);
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   public cacheDelivery(
     operation: DedupeOperation,
     result?: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.commit(operation, result, taskReference);
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   /**
@@ -619,21 +737,35 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
   public admit(operation: DedupeOperation): DedupeDecision<Outcome, TaskReference>;
   public admit(
     operation: DedupeOperation,
-    result: Outcome,
-    taskReference?: TaskReference,
+    validationOptions: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference>;
   public admit(
     operation: DedupeOperation,
-    result?: Outcome,
+    result: Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeDecision<Outcome, TaskReference>;
+  public admit(
+    operation: DedupeOperation,
+    resultOrValidationOptions?: Outcome | DedupeValidationOptions,
+    taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
     if (arguments.length === 1) {
       return this.reserve(operation);
     }
-    if (isBusyResult(result)) {
-      return this.busy(operation);
+    if (
+      validationOptions === undefined &&
+      taskReference === undefined &&
+      isDedupeValidationOptions(resultOrValidationOptions)
+    ) {
+      return this.reserve(operation, resultOrValidationOptions);
     }
-    return this.commit(operation, result, taskReference);
+    const result = resultOrValidationOptions as Outcome | undefined;
+    if (isBusyResult(result)) {
+      return this.busy(operation, validationOptions);
+    }
+    return this.commit(operation, result, taskReference, validationOptions);
   }
 
   /** Execute a producer only for a newly reserved operation. */
@@ -641,8 +773,9 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     operation: DedupeOperation,
     producer: () => Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    const reservation = this.reserve(operation);
+    const reservation = this.reserve(operation, validationOptions);
     if (reservation.kind !== 'new' || reservation.reservation === undefined) {
       return reservation;
     }
@@ -651,7 +784,7 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
       const result = producer();
       if (isBusyResult(result)) {
         this.release(reservation.reservation);
-        return this.busy(operation);
+        return this.busy(operation, validationOptions);
       }
       return this.commit(reservation.reservation, result, taskReference);
     } catch (error) {
@@ -664,20 +797,24 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     operation: DedupeOperation,
     producer: () => Outcome,
     taskReference?: TaskReference,
+    validationOptions?: DedupeValidationOptions,
   ): DedupeDecision<Outcome, TaskReference> {
-    return this.execute(operation, producer, taskReference);
+    return this.execute(operation, producer, taskReference, validationOptions);
   }
 
   /**
    * A busy admission is represented only as a response; it never creates a
    * record.  Queue policy may use this helper before calling reserve.
    */
-  public busy(operation: DedupeOperation): DedupeDecision<Outcome, TaskReference> {
+  public busy(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): DedupeDecision<Outcome, TaskReference> {
     this.ensureOpen();
     if (!isDedupeOperation(operationName(operation))) {
       return ignoredDecision(operationName(operation)) as DedupeDecision<Outcome, TaskReference>;
     }
-    const normalized = this.normalize(operation);
+    const normalized = this.normalize(operation, validationOptions);
     return {
       kind: 'busy',
       status: 'busy',
@@ -693,7 +830,10 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
   }
 
   /** Release only a pending reservation; committed outcomes are immutable. */
-  public release(target: DedupeOperation | DedupeReservation): boolean {
+  public release(
+    target: DedupeOperation | DedupeReservation,
+    validationOptions?: DedupeValidationOptions,
+  ): boolean {
     this.ensureOpen();
     this.prune();
 
@@ -706,7 +846,7 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
       if (!isDedupeOperation(operationName(target))) {
         return false;
       }
-      const normalized = this.normalize(target);
+      const normalized = this.normalize(target, validationOptions);
       key = normalized.key;
       fingerprint = normalized.fingerprint;
     }
@@ -719,8 +859,11 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     return true;
   }
 
-  public abandon(target: DedupeOperation | DedupeReservation): boolean {
-    return this.release(target);
+  public abandon(
+    target: DedupeOperation | DedupeReservation,
+    validationOptions?: DedupeValidationOptions,
+  ): boolean {
+    return this.release(target, validationOptions);
   }
 
   /** Remove records whose deadline plus grace period has elapsed. */
@@ -759,12 +902,15 @@ export class RuntimeScopedDedupeStore<Outcome = unknown, TaskReference = unknown
     this.close();
   }
 
-  private normalize(operation: DedupeOperation): NormalizedOperation {
+  private normalize(
+    operation: DedupeOperation,
+    validationOptions?: DedupeValidationOptions,
+  ): NormalizedOperation {
     const nowMs = this.now();
     if (!Number.isFinite(nowMs)) {
       throw new RangeError('deduplication clock must return a finite number');
     }
-    return normalizedOperation(operation, nowMs, this.retentionGraceMs);
+    return normalizedOperation(operation, nowMs, this.retentionGraceMs, validationOptions);
   }
 
   private newDecision(normalized: NormalizedOperation): DedupeDecision<Outcome, TaskReference> {

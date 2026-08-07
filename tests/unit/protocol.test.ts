@@ -53,6 +53,10 @@ const ROOM_ID = deriveRoomId('explicit', 'protocol-conformance-room');
 const NOW = '2026-08-07T09:59:00.000Z';
 const CREATED_AT = '2026-08-07T10:00:00.000Z';
 const REQUEST_EXPIRES_AT = '2026-08-07T10:10:00.000Z';
+const REPLY_VALIDATION_OPTIONS = {
+  now: NOW,
+  expectedRequestExpiresAt: REQUEST_EXPIRES_AT,
+} as const;
 const CONTROL_EXPIRES_AT = '2026-08-07T10:00:30.000Z';
 
 type TestRecord = Record<string, unknown>;
@@ -351,7 +355,7 @@ describe('protocol envelope foundations', () => {
       { ...asRecord(validCancel), requestId: CANCEL_OPERATION_ID },
     ],
   ] as const)('rejects %s as malformed before admission', (_label, candidate) => {
-    expectFailure(validateEnvelope(candidate, { now: NOW }), 'malformed');
+    expectFailure(validateEnvelope(candidate, REPLY_VALIDATION_OPTIONS), 'malformed');
   });
 
   it.each([
@@ -363,7 +367,10 @@ describe('protocol envelope foundations', () => {
     ['task.cancel', validCancel],
   ] as const)('rejects a non-UUID operationId for %s before admission', (_operation, envelope) => {
     expectFailure(
-      validateEnvelope({ ...asRecord(envelope), operationId: 'not-a-uuid' }, { now: NOW }),
+      validateEnvelope(
+        { ...asRecord(envelope), operationId: 'not-a-uuid' },
+        REPLY_VALIDATION_OPTIONS,
+      ),
       'malformed',
     );
   });
@@ -375,7 +382,7 @@ describe('protocol envelope foundations', () => {
   ] as const)(
     'accepts a distinct operationId for %s target correlation',
     (_operation, envelope) => {
-      expect(validateEnvelope(envelope, { now: NOW }).ok).toBe(true);
+      expect(validateEnvelope(envelope, REPLY_VALIDATION_OPTIONS).ok).toBe(true);
     },
   );
 
@@ -471,6 +478,23 @@ describe('protocol envelope foundations', () => {
           expiresAt: '2026-08-07T10:20:00.000Z',
         },
         { now: NOW },
+      ),
+      'malformed',
+    );
+  });
+  it('requires original request deadline context and bounds reply expiry', () => {
+    expectFailure(validateEnvelope(validReply, { now: NOW }), 'malformed');
+    expect(validateEnvelope(validReply, REPLY_VALIDATION_OPTIONS).ok).toBe(true);
+    expect(
+      validateEnvelope(
+        { ...asRecord(validReply), expiresAt: '2026-08-07T10:09:59.999Z' },
+        REPLY_VALIDATION_OPTIONS,
+      ).ok,
+    ).toBe(true);
+    expectFailure(
+      validateEnvelope(
+        { ...asRecord(validReply), expiresAt: '2026-08-07T10:10:00.001Z' },
+        REPLY_VALIDATION_OPTIONS,
       ),
       'malformed',
     );
@@ -609,7 +633,9 @@ describe('typed content and schema validation', () => {
       { outcome: 'expired', error: createProtocolError('expired', 'expired fixture') },
     ],
   ] as const)('accepts a valid %s reply outcome at envelope admission', (_label, payload) => {
-    expect(validateEnvelope({ ...asRecord(validReply), payload }, { now: NOW }).ok).toBe(true);
+    expect(
+      validateEnvelope({ ...asRecord(validReply), payload }, REPLY_VALIDATION_OPTIONS).ok,
+    ).toBe(true);
   });
   it.each([
     ['notify missing content', { ...asRecord(validNotify), payload: {} }, 'invalid_content'],
@@ -702,7 +728,7 @@ describe('typed content and schema validation', () => {
       'malformed',
     ],
   ] as const)('rejects %s at envelope admission', (_label, envelope, code) => {
-    expectFailure(validateEnvelope(envelope, { now: NOW }), code);
+    expectFailure(validateEnvelope(envelope, REPLY_VALIDATION_OPTIONS), code);
   });
 
   it('enforces the schema-size limit and leaves format as annotation-only', () => {
@@ -1490,8 +1516,8 @@ describe('canonical request fingerprints', () => {
       ],
     ] as const;
     for (const [label, original, candidate] of candidates) {
-      expect(canonicalRequestFingerprint(candidate, { now: NOW }), label).not.toBe(
-        canonicalRequestFingerprint(original, { now: NOW }),
+      expect(canonicalRequestFingerprint(candidate, REPLY_VALIDATION_OPTIONS), label).not.toBe(
+        canonicalRequestFingerprint(original, REPLY_VALIDATION_OPTIONS),
       );
     }
   });

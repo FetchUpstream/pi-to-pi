@@ -27,6 +27,10 @@ import {
 // Fingerprint validation uses the default wall clock; keep the fixture live without
 // mutating process-wide timers, while every store below uses an injected clock.
 const BASE_NOW_MS = Date.now();
+const REPLY_REQUEST_EXPIRES_AT_MS = BASE_NOW_MS + DEFAULT_REQUEST_TTL_MS;
+const REPLY_VALIDATION_OPTIONS = {
+  expectedRequestExpiresAt: REPLY_REQUEST_EXPIRES_AT_MS,
+} as const;
 const ROOM_ID = `r1-${'a'.repeat(32)}`;
 const OTHER_ROOM_ID = `r1-${'b'.repeat(32)}`;
 const REQUEST_OPERATION_ID = '11111111-1111-4111-8111-111111111111';
@@ -652,11 +656,13 @@ describe('runtime-scoped deduplication', () => {
       return { delivered: true, outcome: 'completed' };
     };
 
-    const first = store.execute(reply, deliver);
-    const retry = store.execute(reply, deliver);
+    const first = store.execute(reply, deliver, undefined, REPLY_VALIDATION_OPTIONS);
+    const retry = store.execute(reply, deliver, undefined, REPLY_VALIDATION_OPTIONS);
     const conflictingTarget = store.execute(
       makeReply({ requestId: REPLY_CONFLICT_REQUEST_ID }),
       deliver,
+      undefined,
+      REPLY_VALIDATION_OPTIONS,
     );
 
     expect(first.kind).toBe('stored');
@@ -666,10 +672,38 @@ describe('runtime-scoped deduplication', () => {
     expect(conflictingTarget.error?.code).toBe('duplicate');
     expect(terminalTransitions).toBe(1);
     expect(taskState).toBe('completed');
-    expect(store.getRecord(reply)?.result).toEqual({ delivered: true, outcome: 'completed' });
+    expect(store.getRecord(reply, REPLY_VALIDATION_OPTIONS)?.result).toEqual({
+      delivered: true,
+      outcome: 'completed',
+    });
     store.dispose();
   });
 
+  it('requires original reply deadline context and rejects later reply deadlines', () => {
+    const clock = new ManualClock(BASE_NOW_MS);
+    const store = createStore(clock);
+    const equalDeadlineReply = makeReply({ expiresAtMs: REPLY_REQUEST_EXPIRES_AT_MS });
+    const earlierDeadlineReply = makeReply({ expiresAtMs: REPLY_REQUEST_EXPIRES_AT_MS - 1 });
+    const laterDeadlineReply = makeReply({ expiresAtMs: REPLY_REQUEST_EXPIRES_AT_MS + 1 });
+
+    expect(() => fingerprintOperation(equalDeadlineReply)).toThrow(
+      'protocol envelope is malformed',
+    );
+    const canonical = canonicalizeOperation(equalDeadlineReply, REPLY_VALIDATION_OPTIONS);
+    const fingerprint = fingerprintOperation(equalDeadlineReply, REPLY_VALIDATION_OPTIONS);
+    const outOfBandContextReply = {
+      ...equalDeadlineReply,
+      expectedRequestExpiresAt: REPLY_REQUEST_EXPIRES_AT_MS,
+    } as unknown as ProtocolEnvelope;
+    expect(canonicalizeOperation(outOfBandContextReply)).toBe(canonical);
+    expect(fingerprintOperation(outOfBandContextReply)).toBe(fingerprint);
+    expect(store.inspect(equalDeadlineReply, REPLY_VALIDATION_OPTIONS).kind).toBe('new');
+    expect(store.inspect(earlierDeadlineReply, REPLY_VALIDATION_OPTIONS).kind).toBe('new');
+    expect(() => store.inspect(laterDeadlineReply, REPLY_VALIDATION_OPTIONS)).toThrow(
+      'protocol envelope is malformed',
+    );
+    store.dispose();
+  });
   it('returns pending for a deterministic reentrant retry and mutates state once', () => {
     type AdmissionOutcome = { readonly state: 'accepted' };
     const clock = new ManualClock(BASE_NOW_MS);
