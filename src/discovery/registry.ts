@@ -262,16 +262,17 @@ export function createAuthenticatedOperation<Envelope extends ProtocolEnvelope>(
   envelope: Envelope,
   bindingMetadata?: BindingMetadata,
 ): AuthenticatedOperation<Envelope> {
-  const envelopeSnapshot = cloneFrozenSnapshot(envelope);
-  const validatedEnvelope = validateAuthenticatedEnvelope(envelopeSnapshot);
+  const validationView = createCanonicalEnvelopeValidationView(envelope);
+  const validatedEnvelope = validateAuthenticatedEnvelope(validationView);
   if (bindingMetadata !== undefined && !isRecord(bindingMetadata)) {
     throw new AgentCardRegistryError('malformed', 'binding metadata must be an object');
   }
+  const envelopeSnapshot = cloneFrozenSnapshot(validatedEnvelope);
   const metadataSnapshot =
     bindingMetadata === undefined ? undefined : cloneFrozenSnapshot(bindingMetadata);
   const wrapper = Object.freeze({
     [AUTHENTICATED_OPERATION_BRAND]: true as const,
-    envelope: validatedEnvelope,
+    envelope: envelopeSnapshot as Envelope,
     ...(metadataSnapshot === undefined ? {} : { bindingMetadata: metadataSnapshot }),
   });
   trustedAuthenticatedOperations.add(wrapper);
@@ -382,6 +383,198 @@ interface AuthenticatedSnapshotBudget {
 
 function authenticatedSnapshotError(message: string): never {
   throw new AgentCardRegistryError('malformed', message);
+}
+interface CanonicalEnvelopeValidationBudget {
+  nodes: number;
+  keys: number;
+  bytes: number;
+}
+
+const MAX_CANONICAL_ENVELOPE_VALIDATION_DEPTH = 32;
+const MAX_CANONICAL_ENVELOPE_VALIDATION_NODES = 4_096;
+const MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS = 256;
+const MAX_CANONICAL_ENVELOPE_VALIDATION_BYTES = DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes;
+const INVALID_CANONICAL_ENVELOPE_VALUE = Symbol('invalid-canonical-envelope-value');
+
+function canonicalEnvelopeValidationError(message: string): never {
+  throw new AgentCardRegistryError('malformed', message);
+}
+
+function safeCanonicalDescriptor(value: object, key: string): PropertyDescriptor | undefined {
+  try {
+    return Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    canonicalEnvelopeValidationError('authenticated envelope cannot be inspected safely');
+  }
+}
+
+function safeCanonicalKeys(value: object): string[] {
+  try {
+    return Object.keys(value);
+  } catch {
+    canonicalEnvelopeValidationError('authenticated envelope cannot be inspected safely');
+  }
+}
+
+function safeCanonicalPrototype(value: object): object | null {
+  try {
+    return Object.getPrototypeOf(value);
+  } catch {
+    canonicalEnvelopeValidationError('authenticated envelope cannot be inspected safely');
+  }
+}
+
+function safeCanonicalIsArray(value: object): boolean {
+  try {
+    return Array.isArray(value);
+  } catch {
+    canonicalEnvelopeValidationError('authenticated envelope cannot be inspected safely');
+  }
+}
+
+function addCanonicalEnvelopeValidationBytes(
+  budget: CanonicalEnvelopeValidationBudget,
+  bytes: number,
+): void {
+  if (
+    !Number.isSafeInteger(bytes) ||
+    bytes < 0 ||
+    budget.bytes > MAX_CANONICAL_ENVELOPE_VALIDATION_BYTES - bytes
+  ) {
+    canonicalEnvelopeValidationError('authenticated envelope exceeds its validation budget');
+  }
+  budget.bytes += bytes;
+}
+
+function createCanonicalEnvelopeValidationView(
+  value: unknown,
+  budget: CanonicalEnvelopeValidationBudget = { nodes: 0, keys: 0, bytes: 0 },
+  depth = 0,
+  active = new Set<object>(),
+): unknown {
+  if (depth > MAX_CANONICAL_ENVELOPE_VALIDATION_DEPTH) {
+    canonicalEnvelopeValidationError('authenticated envelope exceeds its depth budget');
+  }
+  budget.nodes += 1;
+  if (budget.nodes > MAX_CANONICAL_ENVELOPE_VALIDATION_NODES) {
+    canonicalEnvelopeValidationError('authenticated envelope exceeds its node budget');
+  }
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    addCanonicalEnvelopeValidationBytes(budget, Buffer.byteLength(value, 'utf8') + 2);
+    return value;
+  }
+  if (typeof value === 'number') {
+    addCanonicalEnvelopeValidationBytes(budget, 16);
+    return value;
+  }
+  if (typeof value === 'boolean') {
+    addCanonicalEnvelopeValidationBytes(budget, value ? 4 : 5);
+    return value;
+  }
+  if (typeof value !== 'object') {
+    return value;
+  }
+  if (active.has(value)) {
+    canonicalEnvelopeValidationError('authenticated envelope cannot contain cycles');
+  }
+  if (safeCanonicalIsArray(value)) {
+    const lengthDescriptor = safeCanonicalDescriptor(value, 'length');
+    const length =
+      lengthDescriptor !== undefined && 'value' in lengthDescriptor
+        ? lengthDescriptor.value
+        : undefined;
+    if (
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS
+    ) {
+      canonicalEnvelopeValidationError('authenticated envelope array exceeds its key budget');
+    }
+    active.add(value);
+    try {
+      const copy = new Array(length);
+      addCanonicalEnvelopeValidationBytes(budget, 2);
+      for (let index = 0; index < length; index += 1) {
+        budget.keys += 1;
+        if (budget.keys > MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS) {
+          canonicalEnvelopeValidationError('authenticated envelope exceeds its key budget');
+        }
+        const descriptor = safeCanonicalDescriptor(value, String(index));
+        if (descriptor === undefined) {
+          continue;
+        }
+        if (!('value' in descriptor) || !descriptor.enumerable) {
+          canonicalEnvelopeValidationError(
+            'authenticated envelope cannot contain accessors or hidden data',
+          );
+        }
+        copy[index] = createCanonicalEnvelopeValidationView(
+          descriptor.value,
+          budget,
+          depth + 1,
+          active,
+        );
+      }
+      const keys = safeCanonicalKeys(value);
+      if (keys.length > MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS) {
+        canonicalEnvelopeValidationError('authenticated envelope exceeds its key budget');
+      }
+      for (const key of keys) {
+        const numericKey = Number(key);
+        if (
+          !Number.isSafeInteger(numericKey) ||
+          numericKey < 0 ||
+          String(numericKey) !== key ||
+          numericKey >= length
+        ) {
+          canonicalEnvelopeValidationError(
+            'authenticated envelope arrays cannot contain extra fields',
+          );
+        }
+      }
+      return copy;
+    } finally {
+      active.delete(value);
+    }
+  }
+  const prototype = safeCanonicalPrototype(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return INVALID_CANONICAL_ENVELOPE_VALUE;
+  }
+  active.add(value);
+  try {
+    const keys = safeCanonicalKeys(value);
+    if (keys.length > MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS) {
+      canonicalEnvelopeValidationError('authenticated envelope exceeds its key budget');
+    }
+    const copy = Object.create(null) as Record<string, unknown>;
+    addCanonicalEnvelopeValidationBytes(budget, 2);
+    for (const key of keys) {
+      budget.keys += 1;
+      if (budget.keys > MAX_CANONICAL_ENVELOPE_VALIDATION_KEYS) {
+        canonicalEnvelopeValidationError('authenticated envelope exceeds its key budget');
+      }
+      const descriptor = safeCanonicalDescriptor(value, key);
+      if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
+        canonicalEnvelopeValidationError(
+          'authenticated envelope cannot contain accessors or hidden data',
+        );
+      }
+      addCanonicalEnvelopeValidationBytes(budget, Buffer.byteLength(key, 'utf8') + 3);
+      copy[key] = createCanonicalEnvelopeValidationView(
+        descriptor.value,
+        budget,
+        depth + 1,
+        active,
+      );
+    }
+    return copy;
+  } finally {
+    active.delete(value);
+  }
 }
 
 function addSnapshotBytes(budget: AuthenticatedSnapshotBudget, bytes: number): void {
@@ -1067,7 +1260,15 @@ interface PublicationField {
 }
 
 function publicationField(value: Record<string, unknown>, key: string): PublicationField {
-  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'Agent Card publication cannot be inspected safely',
+    );
+  }
   if (descriptor === undefined) {
     return { present: false, value: undefined };
   }
@@ -1528,14 +1729,12 @@ export class AgentCardRegistry {
     }
 
     const source = publication ?? publicationWithoutLeaseFields(existing.record);
-    const parsed =
-      options.endpoint !== undefined
-        ? 'card' in (source as object)
-          ? { ...extractPublication(source as AgentCardPublication), endpoint: options.endpoint }
-          : { card: source as AgentCard, roomId: this.roomId, endpoint: options.endpoint }
-        : 'card' in (source as object)
-          ? extractPublication(source as AgentCardPublication)
-          : extractPublication(source as AgentCard);
+    const sourceParts = extractPublication(source);
+    const endpointOverride = publicationField(options as Record<string, unknown>, 'endpoint')
+      .value as RoutingEndpoint | undefined;
+    const parsed = this.validatePublication(
+      endpointOverride === undefined ? sourceParts : { ...sourceParts, endpoint: endpointOverride },
+    );
     if (parsed.card.runtimeId !== runtimeId || parsed.card.sessionId !== existing.owner.sessionId) {
       throw new AgentCardRegistryAuthorizationError();
     }
@@ -1712,7 +1911,12 @@ export class AgentCardRegistry {
     const leaseHolder: { value?: SerializedLease } = {};
     if (typeof source !== 'function') {
       const parts = extractPublication(source);
-      owner = canonicalIdentity(parts.card.sessionId, parts.card.runtimeId, 'lease owner');
+      const validatedParts = this.validatePublication(parts);
+      owner = canonicalIdentity(
+        validatedParts.card.sessionId,
+        validatedParts.card.runtimeId,
+        'lease owner',
+      );
       this.assertLocalOwner(owner);
     }
     const resolveSource = async (): Promise<AgentCardPublication | AgentCard> =>
@@ -1749,13 +1953,11 @@ export class AgentCardRegistry {
       const committedGenerationAtStart = registrationGeneration;
       const publication = await resolveSource();
       assertLeaseActive();
-      const parts =
-        isRecord(publication) && Object.hasOwn(publication, 'card')
-          ? extractPublication(publication as AgentCardPublication)
-          : extractPublication(publication as AgentCard);
+      const parts = extractPublication(publication);
+      const validatedParts = this.validatePublication(parts);
       const publicationOwner = canonicalIdentity(
-        parts.card.sessionId,
-        parts.card.runtimeId,
+        validatedParts.card.sessionId,
+        validatedParts.card.runtimeId,
         'lease owner',
       );
       if (owner === undefined) {
@@ -1764,8 +1966,8 @@ export class AgentCardRegistry {
       } else if (!runtimeIdentitiesEqual(owner, publicationOwner)) {
         throw new AgentCardRegistryAuthorizationError('lease source changed its runtime identity');
       }
-      const sourceEndpoint = parts.endpoint;
-      const effectiveParts = applyEndpointOverride(parts);
+      const sourceEndpoint = validatedParts.endpoint;
+      const effectiveParts = applyEndpointOverride(validatedParts);
       assertLeaseActive();
 
       const current = this.records.get(owner.runtimeId);

@@ -128,11 +128,6 @@ export const MAX_LEASE_TIMER_DELAY_MS = 2_147_483_647;
 
 const MAX_ENDPOINT_KEYS = 4;
 const MAX_ENDPOINT_BYTES = 64 * 1024;
-const MAX_SNAPSHOT_DEPTH = 32;
-const MAX_SNAPSHOT_NODES = 4_096;
-const MAX_SNAPSHOT_ENTRIES = 256;
-const MAX_SNAPSHOT_STRING_LENGTH = 2_048;
-
 function duration(value: number | undefined, fallback: number, label: string): number {
   const result = value ?? fallback;
   if (!Number.isSafeInteger(result) || result <= 0) {
@@ -209,94 +204,343 @@ function isRenewalResult(value: unknown): value is LeaseRenewalResult {
   );
 }
 
+const MAX_SNAPSHOT_DEPTH = 32;
+const MAX_SNAPSHOT_NODES = 4_096;
+const MAX_SNAPSHOT_ENTRIES = 256;
+const MAX_SNAPSHOT_STRING_LENGTH = 2_048;
+const MAX_SNAPSHOT_KEY_LENGTH = 256;
+const MAX_SNAPSHOT_KEY_BYTES = 8 * 1024;
+const MAX_SNAPSHOT_BYTES = 64 * 1024;
+const SNAPSHOT_TRUNCATED = '[truncated]';
+const SNAPSHOT_ACCESSOR = '[accessor]';
+const SNAPSHOT_UNREADABLE = '[unreadable]';
+const SNAPSHOT_MISSING = '[missing]';
+const SNAPSHOT_UNSUPPORTED = '[unsupported]';
+const SNAPSHOT_UNREADABLE_SENTINEL = Symbol('unreadable-snapshot-value');
+
 interface SnapshotBudget {
   nodes: number;
-  keys: number;
+  entries: number;
+  keyBytes: number;
+  bytes: number;
+  truncated: boolean;
 }
 
-/** Clone lease diagnostics into bounded, JSON-like immutable data. */
+interface SnapshotDescriptorResult {
+  readonly descriptor: PropertyDescriptor | undefined;
+  readonly unreadable: boolean;
+}
+
+function addSnapshotBytes(budget: SnapshotBudget, bytes: number): boolean {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || budget.bytes > MAX_SNAPSHOT_BYTES - bytes) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.bytes += bytes;
+  return true;
+}
+
+function snapshotMarker(budget: SnapshotBudget, marker: string): string {
+  addSnapshotBytes(budget, Buffer.byteLength(marker, 'utf8'));
+  return marker;
+}
+
+function snapshotString(
+  value: string,
+  budget: SnapshotBudget,
+  maxLength = MAX_SNAPSHOT_STRING_LENGTH,
+): string {
+  const bounded = value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
+  if (!addSnapshotBytes(budget, Buffer.byteLength(bounded, 'utf8') + 2)) {
+    return SNAPSHOT_TRUNCATED;
+  }
+  return bounded;
+}
+
+function snapshotKey(value: string, budget: SnapshotBudget): string | undefined {
+  if (value.length > MAX_SNAPSHOT_KEY_LENGTH) {
+    budget.truncated = true;
+    return undefined;
+  }
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (bytes > MAX_SNAPSHOT_KEY_BYTES || budget.keyBytes > MAX_SNAPSHOT_KEY_BYTES - bytes) {
+    budget.truncated = true;
+    return undefined;
+  }
+  budget.keyBytes += bytes;
+  if (!addSnapshotBytes(budget, bytes + 3)) {
+    return undefined;
+  }
+  return value;
+}
+
+function diagnosticDescriptor(value: object, key: string): SnapshotDescriptorResult {
+  try {
+    return { descriptor: Object.getOwnPropertyDescriptor(value, key), unreadable: false };
+  } catch {
+    return { descriptor: undefined, unreadable: true };
+  }
+}
+
+function diagnosticPrototype(value: object): object | null | typeof SNAPSHOT_UNREADABLE_SENTINEL {
+  try {
+    return Object.getPrototypeOf(value);
+  } catch {
+    return SNAPSHOT_UNREADABLE_SENTINEL;
+  }
+}
+
+function diagnosticIsArray(value: object): boolean | typeof SNAPSHOT_UNREADABLE_SENTINEL {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return SNAPSHOT_UNREADABLE_SENTINEL;
+  }
+}
+
+function diagnosticIsError(value: object): boolean {
+  try {
+    return value instanceof Error;
+  } catch {
+    return false;
+  }
+}
+
+function diagnosticIsDate(value: object): boolean {
+  try {
+    return value instanceof Date;
+  } catch {
+    return false;
+  }
+}
+
+function diagnosticErrorField(
+  value: object,
+  key: 'name' | 'message',
+): { readonly kind: 'value' | 'accessor' | 'missing' | 'unreadable'; readonly value?: unknown } {
+  let current: object | null = value;
+  const seen = new Set<object>();
+  for (let depth = 0; current !== null && depth < 8; depth += 1) {
+    if (seen.has(current)) {
+      return { kind: 'unreadable' };
+    }
+    seen.add(current);
+    const result = diagnosticDescriptor(current, key);
+    if (result.unreadable) {
+      return { kind: 'unreadable' };
+    }
+    if (result.descriptor !== undefined) {
+      return 'value' in result.descriptor
+        ? { kind: 'value', value: result.descriptor.value }
+        : { kind: 'accessor' };
+    }
+    const prototype = diagnosticPrototype(current);
+    if (prototype === SNAPSHOT_UNREADABLE_SENTINEL) {
+      return { kind: 'unreadable' };
+    }
+    current = prototype;
+  }
+  return { kind: 'missing' };
+}
+
+function diagnosticEntryAvailable(budget: SnapshotBudget): boolean {
+  if (budget.entries >= MAX_SNAPSHOT_ENTRIES) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.entries += 1;
+  return true;
+}
+
 function sanitizeSnapshotValue(
   value: unknown,
   depth = 0,
   seen = new Set<object>(),
-  budget: SnapshotBudget = { nodes: 0, keys: 0 },
+  budget: SnapshotBudget = { nodes: 0, entries: 0, keyBytes: 0, bytes: 0, truncated: false },
 ): unknown {
+  if (depth >= MAX_SNAPSHOT_DEPTH) {
+    budget.truncated = true;
+    return snapshotMarker(budget, SNAPSHOT_TRUNCATED);
+  }
+  budget.nodes += 1;
+  if (budget.nodes > MAX_SNAPSHOT_NODES) {
+    budget.truncated = true;
+    return snapshotMarker(budget, SNAPSHOT_TRUNCATED);
+  }
   if (value === null || value === undefined) {
+    addSnapshotBytes(budget, value === null ? 4 : 1);
     return value;
   }
   if (typeof value === 'string') {
-    return value.length > MAX_SNAPSHOT_STRING_LENGTH
-      ? `${value.slice(0, MAX_SNAPSHOT_STRING_LENGTH)}…`
-      : value;
+    return snapshotString(value, budget);
   }
   if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : String(value);
+    if (!Number.isFinite(value)) {
+      return snapshotString(String(value), budget);
+    }
+    addSnapshotBytes(budget, 16);
+    return value;
   }
   if (typeof value === 'boolean') {
+    addSnapshotBytes(budget, value ? 4 : 5);
     return value;
   }
   if (typeof value === 'bigint') {
-    return value.toString();
+    try {
+      return snapshotString(value.toString(), budget);
+    } catch {
+      return snapshotMarker(budget, SNAPSHOT_UNREADABLE);
+    }
   }
   if (typeof value === 'function' || typeof value === 'symbol') {
-    return `[unsupported ${typeof value}]`;
+    return snapshotMarker(budget, SNAPSHOT_UNSUPPORTED);
   }
-  if (depth >= MAX_SNAPSHOT_DEPTH || budget.nodes >= MAX_SNAPSHOT_NODES) {
-    return '[truncated]';
+  if (typeof value !== 'object') {
+    return snapshotMarker(budget, SNAPSHOT_UNSUPPORTED);
   }
   if (seen.has(value)) {
-    return '[circular]';
+    return snapshotMarker(budget, '[circular]');
   }
-  budget.nodes += 1;
   seen.add(value);
   try {
-    if (value instanceof Error) {
-      return Object.freeze({
-        name: sanitizeSnapshotValue(value.name, depth + 1, seen, budget),
-        message: sanitizeSnapshotValue(value.message, depth + 1, seen, budget),
-      });
+    if (diagnosticIsError(value)) {
+      const name = diagnosticErrorField(value, 'name');
+      const message = diagnosticErrorField(value, 'message');
+      const copy = {
+        name: sanitizeSnapshotValue(
+          name.kind === 'value'
+            ? name.value
+            : name.kind === 'accessor'
+              ? SNAPSHOT_ACCESSOR
+              : name.kind === 'missing'
+                ? SNAPSHOT_MISSING
+                : SNAPSHOT_UNREADABLE,
+          depth + 1,
+          seen,
+          budget,
+        ),
+        message: sanitizeSnapshotValue(
+          message.kind === 'value'
+            ? message.value
+            : message.kind === 'accessor'
+              ? SNAPSHOT_ACCESSOR
+              : message.kind === 'missing'
+                ? SNAPSHOT_MISSING
+                : SNAPSHOT_UNREADABLE,
+          depth + 1,
+          seen,
+          budget,
+        ),
+      };
+      addSnapshotBytes(budget, 8);
+      return Object.freeze(copy);
     }
-    if (value instanceof Date) {
-      return Number.isFinite(value.getTime()) ? value.toISOString() : '[invalid date]';
+    if (diagnosticIsDate(value)) {
+      try {
+        const milliseconds = Date.prototype.getTime.call(value);
+        return Number.isFinite(milliseconds)
+          ? snapshotString(Date.prototype.toISOString.call(value), budget)
+          : snapshotMarker(budget, '[invalid date]');
+      } catch {
+        return snapshotMarker(budget, SNAPSHOT_UNREADABLE);
+      }
     }
-    if (Array.isArray(value)) {
-      const copy = value
-        .slice(0, MAX_SNAPSHOT_ENTRIES)
-        .map((entry) => sanitizeSnapshotValue(entry, depth + 1, seen, budget));
-      if (value.length > MAX_SNAPSHOT_ENTRIES) {
-        copy.push('[truncated]');
+    const arrayState = diagnosticIsArray(value);
+    if (arrayState === SNAPSHOT_UNREADABLE_SENTINEL) {
+      return snapshotMarker(budget, SNAPSHOT_UNREADABLE);
+    }
+    if (arrayState) {
+      const lengthResult = diagnosticDescriptor(value, 'length');
+      const length =
+        lengthResult.descriptor !== undefined && 'value' in lengthResult.descriptor
+          ? lengthResult.descriptor.value
+          : undefined;
+      if (
+        lengthResult.unreadable ||
+        typeof length !== 'number' ||
+        !Number.isSafeInteger(length) ||
+        length < 0
+      ) {
+        return snapshotMarker(budget, SNAPSHOT_UNREADABLE);
+      }
+      const entryCount = Math.min(length, MAX_SNAPSHOT_ENTRIES);
+      const copy: unknown[] = [];
+      addSnapshotBytes(budget, 2);
+      for (let index = 0; index < entryCount; index += 1) {
+        if (!diagnosticEntryAvailable(budget)) {
+          break;
+        }
+        const entryResult = diagnosticDescriptor(value, String(index));
+        let child: unknown;
+        if (entryResult.unreadable) {
+          child = snapshotMarker(budget, SNAPSHOT_UNREADABLE);
+        } else if (entryResult.descriptor === undefined) {
+          child = snapshotMarker(budget, SNAPSHOT_MISSING);
+        } else if (!('value' in entryResult.descriptor)) {
+          child = snapshotMarker(budget, SNAPSHOT_ACCESSOR);
+        } else {
+          child = sanitizeSnapshotValue(entryResult.descriptor.value, depth + 1, seen, budget);
+        }
+        copy.push(child);
+      }
+      if (length > entryCount || budget.truncated) {
+        copy.push(snapshotMarker(budget, SNAPSHOT_TRUNCATED));
       }
       return Object.freeze(copy);
     }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      return `[${Object.prototype.toString.call(value)}]`;
+    const prototype = diagnosticPrototype(value);
+    if (
+      prototype === SNAPSHOT_UNREADABLE_SENTINEL ||
+      (prototype !== Object.prototype && prototype !== null)
+    ) {
+      return snapshotMarker(budget, SNAPSHOT_UNSUPPORTED);
     }
     const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    addSnapshotBytes(budget, 2);
     let inspectedKeys = 0;
     let truncated = false;
-    for (const key in value) {
-      inspectedKeys += 1;
-      if (inspectedKeys > MAX_SNAPSHOT_ENTRIES) {
-        truncated = true;
-        break;
+    try {
+      for (const key in value) {
+        inspectedKeys += 1;
+        if (inspectedKeys > MAX_SNAPSHOT_ENTRIES) {
+          truncated = true;
+          break;
+        }
+        const descriptorResult = diagnosticDescriptor(value, key);
+        if (descriptorResult.unreadable) {
+          truncated = true;
+          break;
+        }
+        if (descriptorResult.descriptor === undefined) {
+          continue;
+        }
+        if (!descriptorResult.descriptor.enumerable) {
+          truncated = true;
+          break;
+        }
+        if (!diagnosticEntryAvailable(budget)) {
+          truncated = true;
+          break;
+        }
+        const safeKey = snapshotKey(key, budget);
+        if (safeKey === undefined) {
+          truncated = true;
+          break;
+        }
+        const child =
+          'value' in descriptorResult.descriptor
+            ? sanitizeSnapshotValue(descriptorResult.descriptor.value, depth + 1, seen, budget)
+            : snapshotMarker(budget, SNAPSHOT_ACCESSOR);
+        copy[safeKey] = child;
+        if (budget.truncated) {
+          truncated = true;
+          break;
+        }
       }
-      if (!Object.prototype.hasOwnProperty.call(value, key)) {
-        continue;
-      }
-      if (budget.keys >= MAX_SNAPSHOT_ENTRIES) {
-        truncated = true;
-        break;
-      }
-      budget.keys += 1;
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (descriptor === undefined || !('value' in descriptor)) {
-        copy[key] = '[accessor]';
-        continue;
-      }
-      copy[key] = sanitizeSnapshotValue(descriptor.value, depth + 1, seen, budget);
+    } catch {
+      truncated = true;
     }
-    if (truncated) {
+    if (truncated || budget.truncated) {
       copy['[truncated]'] = true;
     }
     return Object.freeze(copy);
@@ -325,6 +569,9 @@ export class SerializedLease {
   private readonly now: LeaseClock;
   private inFlightRenewal: Promise<void> | undefined;
   private timer: LeaseTimer | undefined;
+  private expiryTimer: LeaseTimer | undefined;
+  private expiryTimerDeadline: number | null = null;
+  private renewalExpiryReject: ((error: unknown) => void) | undefined;
   private state: LeaseState = 'idle';
   private startPromise: Promise<void> | undefined;
   private currentEndpoint: RoutingEndpoint | undefined;
@@ -397,6 +644,25 @@ export class SerializedLease {
       }
       return this.inFlightRenewal;
     }
+    try {
+      const now = clockValue(this.now);
+      if (this.expiresAt === null) {
+        this.expiresAt = now + this.ttlMs;
+        this.armExpiryTimer(this.expiresAt);
+      } else if (now >= this.expiresAt) {
+        this.markExpired();
+        return Promise.reject(new LeaseExpiredError());
+      } else {
+        this.armExpiryTimer(this.expiresAt);
+      }
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    let rejectOnExpiry: (error: unknown) => void = () => undefined;
+    const expiry = new Promise<never>((_resolve, reject) => {
+      rejectOnExpiry = reject;
+    });
+    this.renewalExpiryReject = rejectOnExpiry;
     const operation = Promise.resolve().then(async () => {
       if (this.state === 'stopped') {
         throw new LeaseStoppedError();
@@ -409,17 +675,12 @@ export class SerializedLease {
         this.markExpired();
         throw new LeaseExpiredError();
       }
-      // Reserve a local deadline before invoking an owner callback.  This
-      // provisional deadline is replaced after a successful renewal and lets
-      // the timer expire a lease even when the first callback never settles.
-      this.expiresAt ??= now + this.ttlMs;
-
-      const result = await this.renewal();
-
+      const renewalResult = Promise.resolve().then(() => this.renewal());
+      const result = await Promise.race([renewalResult, expiry]);
       // A callback may have been in flight while the lease was explicitly
       // stopped/expired.  Such a callback is stale and must not mutate or
       // resurrect this lease (including the first renewal with no deadline).
-      const stateAfterCallback = this.lifecycle as LeaseState;
+      const stateAfterCallback = this.lifecycle;
       if (stateAfterCallback === 'stopped') {
         throw new LeaseStoppedError();
       }
@@ -434,7 +695,6 @@ export class SerializedLease {
         this.markExpired();
         throw new LeaseExpiredError();
       }
-
       let nextIdentity: LeaseOwnerIdentity | undefined;
       let nextEndpoint: RoutingEndpoint | undefined;
       if (isRenewalResult(result)) {
@@ -449,7 +709,7 @@ export class SerializedLease {
           nextEndpoint = cloneEndpoint(result.endpoint, effectiveRuntimeId);
         }
       }
-      const stateBeforeCommit = this.lifecycle as LeaseState;
+      const stateBeforeCommit = this.lifecycle;
       if (stateBeforeCommit === 'stopped') {
         throw new LeaseStoppedError();
       }
@@ -459,7 +719,6 @@ export class SerializedLease {
       if (this.lifecycleGeneration !== lifecycleGeneration) {
         throw new LeaseStoppedError();
       }
-
       // The owner is immutable after the first accepted identity, and the
       // callback generation must still be current immediately before commit.
       if (this.ownerIdentity !== undefined && ownerAtStart !== undefined) {
@@ -487,17 +746,20 @@ export class SerializedLease {
       this.lastRenewedAt = renewedAt;
       this.expiresAt = renewedAt + this.ttlMs;
       this.state = 'active';
+      this.armExpiryTimer(this.expiresAt);
     });
     this.inFlightRenewal = operation;
     void operation.then(
       () => {
         if (this.inFlightRenewal === operation) {
           this.inFlightRenewal = undefined;
+          this.renewalExpiryReject = undefined;
         }
       },
       (error: unknown) => {
         if (this.inFlightRenewal === operation) {
           this.inFlightRenewal = undefined;
+          this.renewalExpiryReject = undefined;
         }
         this.lastError = error;
         try {
@@ -529,6 +791,9 @@ export class SerializedLease {
     // invoked.  A hung callback must not leave this lease immortal.
     this.expiresAt ??= startedAt + this.ttlMs;
     this.state = 'active';
+    if (this.expiresAt !== null) {
+      this.armExpiryTimer(this.expiresAt);
+    }
     this.timer = this.scheduler.setInterval(
       () => {
         if (this.state !== 'active') {
@@ -565,14 +830,16 @@ export class SerializedLease {
   public stop(): Promise<void> {
     if (this.state !== 'stopped') {
       const wasExpired = this.state === 'expired';
-      this.state = 'stopped';
       if (!wasExpired) {
+        this.state = 'stopped';
+        this.rejectInFlight(new LeaseStoppedError());
         this.invalidateLifecycle();
       }
       if (this.timer !== undefined) {
         this.scheduler.clearInterval(this.timer);
         this.timer = undefined;
       }
+      this.clearExpiryTimer();
     }
     return Promise.resolve();
   }
@@ -702,16 +969,89 @@ export class SerializedLease {
     return this.stop();
   }
 
+  private armExpiryTimer(deadline: number): void {
+    this.clearExpiryTimer();
+    if (this.state === 'stopped' || this.state === 'expired') {
+      return;
+    }
+    if (!Number.isFinite(deadline)) {
+      throw new LeaseConfigurationError('lease expiry must be finite');
+    }
+    this.expiryTimerDeadline = deadline;
+    const handler = (): void => {
+      if (this.expiryTimerDeadline !== deadline) {
+        return;
+      }
+      const activeTimer = this.expiryTimer;
+      this.expiryTimer = undefined;
+      this.expiryTimerDeadline = null;
+      if (activeTimer !== undefined) {
+        this.scheduler.clearInterval(activeTimer);
+      }
+      try {
+        if (clockValue(this.now) >= deadline) {
+          this.markExpired();
+        } else {
+          this.armExpiryTimer(deadline);
+        }
+      } catch (error: unknown) {
+        this.lastError = error;
+        try {
+          this.onError?.(error);
+        } catch (handlerError: unknown) {
+          this.lastError = handlerError;
+        }
+      }
+    };
+    let timer: LeaseTimer;
+    try {
+      timer = this.scheduler.setInterval(
+        handler,
+        Math.max(1, Math.min(MAX_LEASE_TIMER_DELAY_MS, deadline - clockValue(this.now))),
+      );
+    } catch (error: unknown) {
+      this.expiryTimerDeadline = null;
+      throw error;
+    }
+    if (
+      this.lifecycle === 'stopped' ||
+      this.lifecycle === 'expired' ||
+      this.expiryTimerDeadline !== deadline
+    ) {
+      this.scheduler.clearInterval(timer);
+      return;
+    }
+    this.expiryTimer = timer;
+    const unrefTimer = timer as LeaseTimer & { unref?: () => void };
+    unrefTimer.unref?.();
+  }
+
+  private clearExpiryTimer(): void {
+    if (this.expiryTimer !== undefined) {
+      this.scheduler.clearInterval(this.expiryTimer);
+      this.expiryTimer = undefined;
+    }
+    this.expiryTimerDeadline = null;
+  }
+
+  private rejectInFlight(error: unknown): void {
+    const reject = this.renewalExpiryReject;
+    this.renewalExpiryReject = undefined;
+    reject?.(error);
+  }
+
   private markExpired(): void {
     if (this.state === 'stopped' || this.state === 'expired') {
       return;
     }
     this.state = 'expired';
+    this.rejectInFlight(new LeaseExpiredError());
     this.invalidateLifecycle();
     if (this.timer !== undefined) {
       this.scheduler.clearInterval(this.timer);
       this.timer = undefined;
     }
+    this.clearExpiryTimer();
   }
 
   private invalidateLifecycle(): void {
