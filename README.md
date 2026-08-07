@@ -7,6 +7,12 @@ This repository contains the package and implementation foundation for the proje
 configuration, room, peer naming, lookup, registry, and lease modules are implemented; end-to-end
 discovery wiring, peer messaging, transport, and orchestration are not implemented yet.
 
+## Protocol reference
+
+The authoritative v1 protocol contract is [`openspec/specs/pi-to-pi-v1-protocol/spec.md`](openspec/specs/pi-to-pi-v1-protocol/spec.md). Implementation issues must derive protocol types, validation, routing, task state, and conformance tests from that specification rather than restating a competing contract.
+
+This specification-only change does not implement the protocol engine, Pi lifecycle/tools integration, or concrete transport. The v1 boundary intentionally provides no offline delivery, runtime task handoff, streaming, attachments, or broker.
+
 ## Install
 
 The package can be installed as a Pi package from this repository:
@@ -25,7 +31,7 @@ and orchestration are not implemented yet.
 The identity, configuration, room, naming, lookup, registry, and lease rules below describe the implemented
 foundation and its module contracts. `--p2p-name` and `--p2p-project` are registered and resolved
 through Pi's lifecycle, while registry publication and lease renewal are also wired into that lifecycle.
-Peer transport, Agent Cards, request routing, and Pi-facing tools remain outside this release, as does
+Peer transport, protocol operations, request routing, and Pi-facing tools remain outside this release, as does
 end-to-end message delivery.
 
 ### Session and runtime identity
