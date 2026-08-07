@@ -328,7 +328,11 @@ function retainedDeadline(
   graceMs: number,
 ): number {
   const grace = validateRetentionGrace(graceMs, DEDUPE_RETENTION_GRACE_MS);
-  const deadline = deadlineMs(value, nowMs);
+  const deadline =
+    value === undefined ? nowMs + MAX_OPERATION_DEADLINE_HORIZON_MS : deadlineMs(value, nowMs);
+  if (!Number.isSafeInteger(deadline)) {
+    throw new RangeError('operation retention deadline must be a safe timestamp');
+  }
   const retainedUntil = deadline + grace;
   if (!Number.isSafeInteger(retainedUntil)) {
     throw new RangeError('operation retention deadline must be a safe timestamp');
@@ -688,6 +692,8 @@ export class RuntimePersistence {
   private readonly unreachableResults: Map<string, UnreachableRecord>;
   private readonly shutdownHooks = new Set<Promise<unknown>>();
   private replacementOptions: RuntimeReloadOptions | undefined;
+  private previousRuntimeShutdownPromise: Promise<RuntimeShutdownReport> | undefined;
+  private previousRuntimeShutdownFailure: unknown;
   public constructor(options: RuntimePersistenceOptions = {}) {
     this.now = options.now ?? (() => Date.now());
     this.setTimeout = options.setTimeout ?? defaultSetTimeout;
@@ -812,6 +818,14 @@ export class RuntimePersistence {
   public get closed(): boolean {
     return this.lifecycleState === 'closed';
   }
+  /** Shutdown result for the old runtime that this boundary replaced. */
+  public get previousRuntimeShutdown(): Promise<RuntimeShutdownReport> | undefined {
+    return this.previousRuntimeShutdownPromise;
+  }
+  /** Rejection captured from a failed old-runtime shutdown, if any. */
+  public get previousRuntimeShutdownError(): unknown {
+    return this.previousRuntimeShutdownFailure;
+  }
   public get operationRetentionGraceMs(): number {
     return this.retentionGraceMs;
   }
@@ -860,10 +874,6 @@ export class RuntimePersistence {
     const normalizedSender = requireText(senderRuntimeId ?? this.runtimeId, 'senderRuntimeId');
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
     const nowMs = finiteNow(this.now());
-    const requestedRetainedUntil =
-      expiresAt === undefined
-        ? undefined
-        : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
     this.prune(nowMs);
     const previousUnreachable = this.unreachableResults.get(key);
     if (previousUnreachable !== undefined) {
@@ -894,6 +904,10 @@ export class RuntimePersistence {
       }
       return previous.value;
     }
+    const requestedRetainedUntil =
+      expiresAt === undefined
+        ? undefined
+        : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
     if (this.acceptedOperations.size >= MAX_OPERATION_GUARD_ENTRIES) {
       throw new RuntimePersistenceError(
         'busy',
@@ -1039,52 +1053,52 @@ export class RuntimePersistence {
     const normalizedMessage = requireText(message, 'message');
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperationId);
     const nowMs = finiteNow(this.now());
-    const requestedRetainedUntil =
-      expiresAt === undefined
-        ? undefined
-        : retainedDeadline(expiresAt, nowMs, this.retentionGraceMs);
     this.prune(nowMs);
     const accepted = this.acceptedOperations.get(key);
-    if (
-      accepted !== undefined &&
-      (accepted.stale || accepted.value.recipientRuntimeId !== normalizedRecipient)
-    ) {
+    const previous = this.unreachableResults.get(key);
+    const acceptedRecipient = accepted?.value.recipientRuntimeId;
+    const effectiveRecipient = normalizedRecipient ?? acceptedRecipient;
+    if (previous !== undefined) {
+      if (previous.recipientRuntimeId !== effectiveRecipient) {
+        throw new RuntimePersistenceError(
+          'identity_conflict',
+          'an unreachable result belongs to a different destination',
+          { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+        );
+      }
+      // Terminal delivery is immutable: a retry with the same destination
+      // replays the first result even when its message or deadline differs.
+      return previous.value;
+    }
+    if (accepted !== undefined && acceptedRecipient !== effectiveRecipient) {
       throw new RuntimePersistenceError(
         'identity_conflict',
         'unreachable result does not belong to the accepted destination',
         { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
       );
     }
-
-    const previous = this.unreachableResults.get(key);
-    if (previous !== undefined) {
-      const sameRecipient = previous.recipientRuntimeId === normalizedRecipient;
-      if (sameRecipient && previous.message === normalizedMessage) {
-        return previous.value;
-      }
-      throw new RuntimePersistenceError(
-        'identity_conflict',
-        'an unreachable result cannot be overwritten with a conflicting destination or result',
-        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
-      );
-    }
+    // Once an accepted operation exists, its retained deadline is authoritative
+    // and may be used even when the caller's original deadline has elapsed.
+    const requestedRetainedUntil =
+      accepted === undefined && expiresAt !== undefined
+        ? retainedDeadline(expiresAt, nowMs, this.retentionGraceMs)
+        : undefined;
     if (this.unreachableResults.size >= MAX_OPERATION_GUARD_ENTRIES) {
       throw new RuntimePersistenceError(
         'busy',
         'unreachable-result guard capacity is temporarily exhausted',
-        { operationId: normalizedOperationId, recipientRuntimeId: normalizedRecipient },
+        { operationId: normalizedOperationId, recipientRuntimeId: effectiveRecipient },
       );
     }
-
     const error = createProtocolError('unreachable', normalizedMessage, {
       details:
-        normalizedRecipient === undefined ? undefined : { recipientRuntimeId: normalizedRecipient },
+        effectiveRecipient === undefined ? undefined : { recipientRuntimeId: effectiveRecipient },
     });
     const result: RuntimeUnreachableResult = Object.freeze({
       status: 'unreachable',
       operationId: normalizedOperationId,
       error: error as ProtocolError & { readonly code: 'unreachable' },
-      ...(normalizedRecipient === undefined ? {} : { recipientRuntimeId: normalizedRecipient }),
+      ...(effectiveRecipient === undefined ? {} : { recipientRuntimeId: effectiveRecipient }),
       senderRuntimeId: normalizedSender,
       generation: normalizedSender,
     });
@@ -1096,7 +1110,7 @@ export class RuntimePersistence {
       value: result,
       senderRuntimeId: normalizedSender,
       generation: normalizedSender,
-      recipientRuntimeId: normalizedRecipient,
+      recipientRuntimeId: effectiveRecipient,
       message: normalizedMessage,
       retainedUntil,
     };
@@ -1328,6 +1342,7 @@ export class RuntimePersistence {
       runtimeIdentityHistory: this.runtimeIdentityHistory,
       operationGuardState: this.operationGuardState,
     });
+    const previousRuntimeRetainedUntil = this.runtimeIdentityHistory.issued.get(this.runtimeId);
     this.runtimeIdentityHistory.issued.set(
       this.runtimeId,
       nowMs + this.runtimeIdentityHistory.retentionMs,
@@ -1337,12 +1352,20 @@ export class RuntimePersistence {
     this.replacementOptions = options;
     try {
       const shutdownPromise = this.shutdown(options.shutdown);
-      // A synchronous reload cannot await this promise, but it must observe a
-      // rejection so replacement does not create an unhandled shutdown failure.
-      shutdownPromise.catch(() => undefined);
+      replacement.previousRuntimeShutdownPromise = shutdownPromise;
+      // Observe the rejection without erasing it: callers can await the exposed
+      // lifecycle result, while the replacement records the failure explicitly.
+      void shutdownPromise.catch((error: unknown) => {
+        replacement.previousRuntimeShutdownFailure = error;
+      });
     } catch (error) {
       this.replacementRuntime = undefined;
       this.replacementOptions = undefined;
+      this.runtimeIdentityHistory.issued.delete(replacement.runtimeId);
+      this.runtimeIdentityHistory.issued.set(
+        this.runtimeId,
+        previousRuntimeRetainedUntil ?? Infinity,
+      );
       throw error;
     }
     return replacement;
@@ -1426,11 +1449,14 @@ export class RuntimePersistence {
     this.unreachableResults.delete(operationId);
   }
 
-  private trackShutdownHook<T>(promise: Promise<T>): Promise<T> | undefined {
+  private trackShutdownHook<T>(factory: () => T | PromiseLike<T>): Promise<T> | undefined {
+    // Check capacity before creating a promise so an over-capacity hook can
+    // never invoke user code or create an unobserved late settlement.
     if (this.shutdownHooks.size >= MAX_SHUTDOWN_HOOKS) {
       return undefined;
     }
-    const tracked = promise.finally(() => this.shutdownHooks.delete(tracked));
+    const invocation = Promise.resolve().then(() => factory()) as Promise<T>;
+    const tracked = invocation.finally(() => this.shutdownHooks.delete(tracked));
     this.shutdownHooks.add(tracked);
     return tracked;
   }
@@ -1445,16 +1471,14 @@ export class RuntimePersistence {
       if (hook === undefined) {
         return Promise.resolve<RuntimeShutdownDelivery>({ status: 'skipped' });
       }
-      const invocation = Promise.resolve()
-        .then(() => hook(task))
-        .then((value) => normalizeShutdownDelivery(value));
-      return (
-        this.trackShutdownHook(invocation) ??
-        Promise.resolve<RuntimeShutdownDelivery>({
+      const tracked = this.trackShutdownHook(() => hook(task));
+      if (tracked === undefined) {
+        return Promise.resolve<RuntimeShutdownDelivery>({
           status: 'unreachable',
           error: new Error('runtime shutdown hook capacity is exhausted'),
-        })
-      );
+        });
+      }
+      return tracked.then((value) => normalizeShutdownDelivery(value));
     });
     const outcomes = await settlePromisesWithin(
       hookPromises,

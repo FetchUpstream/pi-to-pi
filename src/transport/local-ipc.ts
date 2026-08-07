@@ -163,6 +163,7 @@ const SHARED_RUNTIME_IDENTITY_HISTORY: RuntimeIdentityHistory = {
   issued: new Map<string, number>(),
   retentionMs: DEFAULT_RUNTIME_ID_RETENTION_MS,
 };
+const runtimeIdentityOwners = new WeakMap<RuntimeIdentityHistory, Map<string, object>>();
 function defaultSetTimeout(callback: () => void, delayMs: number): unknown {
   return globalThis.setTimeout(callback, delayMs);
 }
@@ -223,7 +224,7 @@ function validateRuntimeIdRetention(
   return value;
 }
 
-function operationDeadline(value: unknown, nowMs: number): number {
+function operationDeadline(value: unknown, nowMs: number, allowElapsed = false): number {
   if (value === undefined) {
     const defaultDeadline = nowMs + DEFAULT_REQUEST_TTL_MS;
     if (!Number.isSafeInteger(defaultDeadline)) {
@@ -251,7 +252,7 @@ function operationDeadline(value: unknown, nowMs: number): number {
       'operation deadline must be a finite safe timestamp',
     );
   }
-  if (parsed <= nowMs) {
+  if (parsed <= nowMs && !allowElapsed) {
     throw new LocalIpcBindingError('invalid_target', 'operation deadline is already elapsed');
   }
   if (parsed > nowMs + MAX_REQUEST_TTL_MS) {
@@ -264,8 +265,16 @@ function operationDeadline(value: unknown, nowMs: number): number {
 }
 
 function retentionDeadline(value: unknown, nowMs: number, graceMs: number): number {
-  const retainedUntil =
-    operationDeadline(value, nowMs) + validateRetention(graceMs, 'retentionGraceMs');
+  const grace = validateRetention(graceMs, 'retentionGraceMs');
+  const deadline =
+    value === undefined ? nowMs + MAX_REQUEST_TTL_MS : operationDeadline(value, nowMs);
+  if (!Number.isSafeInteger(deadline)) {
+    throw new LocalIpcBindingError(
+      'invalid_target',
+      'operation retention deadline must be a safe timestamp',
+    );
+  }
+  const retainedUntil = deadline + grace;
   if (!Number.isSafeInteger(retainedUntil)) {
     throw new LocalIpcBindingError(
       'invalid_target',
@@ -356,10 +365,6 @@ function targetKey(target: LocalIpcRuntimeTarget): string {
   return `${target.runtimeId}\u0000${target.endpoint}`;
 }
 
-function targetCopy(target: LocalIpcRuntimeTarget): LocalIpcRuntimeTarget {
-  return Object.freeze({ runtimeId: target.runtimeId, endpoint: target.endpoint });
-}
-
 function operationIdOf(value: unknown): string | undefined {
   if (typeof value !== 'object' || value === null || !('operationId' in value)) {
     return undefined;
@@ -387,18 +392,11 @@ function senderRuntimeIdOf(value: unknown): string | undefined {
 function sourceForRuntime(
   registry: LocalIpcRegistry,
   runtimeId: string | undefined,
-  fallback: LocalIpcRuntimeTarget,
-): LocalIpcRuntimeTarget {
+): LocalIpcRuntimeTarget | undefined {
   if (runtimeId === undefined) {
-    return targetCopy(fallback);
+    return undefined;
   }
-  return (
-    registry.targetForRuntime(runtimeId) ??
-    Object.freeze({
-      runtimeId,
-      endpoint: fallback.endpoint,
-    })
-  );
+  return registry.targetForRuntime(runtimeId);
 }
 
 function failure<Endpoint>(
@@ -522,6 +520,7 @@ export class LocalIpcRegistry {
   public register<Envelope extends TransportEnvelope, Response extends TransportOperationResponse>(
     target: TransportRuntimeTarget<LocalIpcEndpoint>,
     hooks: LocalIpcInboundHooks<Envelope, Response>,
+    bindingRuntimeId?: string,
   ): LocalIpcRegistryRecord {
     this.prune();
     const normalizedTarget = validateTarget(target);
@@ -534,10 +533,21 @@ export class LocalIpcRegistry {
       );
     }
     const issuedUntil = this.runtimeIdentityHistory.issued.get(normalizedTarget.runtimeId);
+    const explicitCurrentRuntimeId =
+      bindingRuntimeId === undefined
+        ? undefined
+        : validateIdentifier(bindingRuntimeId, 'current runtimeId');
+    const currentRuntimeId = explicitCurrentRuntimeId ?? this.currentRuntimeId;
     const currentIdentityMayBind =
-      issuedUntil === Infinity &&
-      (this.currentRuntimeId === normalizedTarget.runtimeId ||
-        this.runtimes.get(normalizedTarget.runtimeId) === undefined);
+      issuedUntil === Infinity && currentRuntimeId === normalizedTarget.runtimeId;
+    const owners = runtimeIdentityOwners.get(this.runtimeIdentityHistory);
+    const existingOwner = owners?.get(normalizedTarget.runtimeId);
+    if (existingOwner !== undefined && existingOwner !== this) {
+      throw new LocalIpcBindingError(
+        'duplicate',
+        'runtime identity is already owned by another local IPC registry',
+      );
+    }
     if (
       this.runtimeIdentityHistory.issued.size >= MAX_RUNTIME_ID_HISTORY_ENTRIES &&
       issuedUntil === undefined
@@ -569,6 +579,11 @@ export class LocalIpcRegistry {
     this.records.set(key, record);
     this.runtimes.set(normalizedTarget.runtimeId, record);
     this.runtimeIdentityHistory.issued.set(normalizedTarget.runtimeId, Infinity);
+    const identityOwners = owners ?? new Map<string, object>();
+    if (owners === undefined) {
+      runtimeIdentityOwners.set(this.runtimeIdentityHistory, identityOwners);
+    }
+    identityOwners.set(normalizedTarget.runtimeId, this);
     this.issuedRuntimeIds.set(normalizedTarget.runtimeId, {
       retired: false,
       retainedUntil: Infinity,
@@ -634,12 +649,12 @@ export class LocalIpcRegistry {
     operationId: string,
     recipientRuntimeId: string,
     expiresAt?: unknown,
+    allowStaleAccepted = false,
   ): RouteReservation | null {
     const normalizedSender = validateIdentifier(senderRuntimeId, 'sender runtimeId');
     const normalizedOperation = validateIdentifier(operationId, 'operationId');
     const normalizedRecipient = validateIdentifier(recipientRuntimeId, 'recipient runtimeId');
     const nowMs = finiteClock(this.now());
-    const retainedUntil = retentionDeadline(expiresAt, nowMs, this.retentionGraceMs);
     this.prune(nowMs);
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperation);
     const sharedUnreachable = this.operationGuardState.unreachableResults.get(key);
@@ -655,17 +670,15 @@ export class LocalIpcRegistry {
       };
     }
     const sharedAccepted = this.operationGuardState.acceptedOperations.get(key);
-    if (sharedAccepted !== undefined) {
-      if (
-        sharedAccepted.stale ||
-        sharedAccepted.senderRuntimeId !== normalizedSender ||
-        sharedAccepted.value.recipientRuntimeId !== normalizedRecipient
-      ) {
-        sharedAccepted.stale = true;
-        return null;
-      }
-    }
     const previous = this.operationDestinations.get(key);
+    if (
+      sharedAccepted !== undefined &&
+      (sharedAccepted.senderRuntimeId !== normalizedSender ||
+        sharedAccepted.value.recipientRuntimeId !== normalizedRecipient)
+    ) {
+      sharedAccepted.stale = true;
+      return null;
+    }
     if (previous !== undefined) {
       if (
         previous.senderRuntimeId !== normalizedSender ||
@@ -685,8 +698,16 @@ export class LocalIpcRegistry {
       if (previous.state === 'delivered') {
         return { key, created: false, terminal: 'delivered' };
       }
+      if (sharedAccepted?.stale && !allowStaleAccepted) {
+        return null;
+      }
       return { key, created: false, terminal: 'pending' };
     }
+    if (sharedAccepted?.stale && !allowStaleAccepted) {
+      return null;
+    }
+    const retainedUntil =
+      sharedAccepted?.retainedUntil ?? retentionDeadline(expiresAt, nowMs, this.retentionGraceMs);
     if (this.operationDestinations.size >= MAX_OPERATION_DESTINATIONS) {
       return null;
     }
@@ -695,7 +716,7 @@ export class LocalIpcRegistry {
       operationId: normalizedOperation,
       recipientRuntimeId: normalizedRecipient,
       generation: normalizedSender,
-      retainedUntil: sharedAccepted?.retainedUntil ?? retainedUntil,
+      retainedUntil,
       state: 'pending',
     };
     this.operationDestinations.set(key, record);
@@ -737,6 +758,7 @@ export class LocalIpcRegistry {
       operationId,
       recipientRuntimeId,
       expiresAt,
+      true,
     );
     if (reservation === null) {
       throw new LocalIpcBindingError(
@@ -757,10 +779,7 @@ export class LocalIpcRegistry {
     const key = runtimeOperationGuardKey(normalizedSender, normalizedOperation);
     const sharedPrevious = this.operationGuardState.unreachableResults.get(key);
     if (sharedPrevious !== undefined) {
-      if (
-        sharedPrevious.recipientRuntimeId !== normalizedRecipient ||
-        sharedPrevious.message !== normalizedMessage
-      ) {
+      if (sharedPrevious.recipientRuntimeId !== normalizedRecipient) {
         throw new LocalIpcBindingError(
           'identity_conflict',
           'unreachable result is immutable for this operation destination',
@@ -773,12 +792,6 @@ export class LocalIpcRegistry {
       return record?.state ?? 'delivered';
     }
     if (record.state === 'unreachable') {
-      if (record.unreachableMessage !== normalizedMessage) {
-        throw new LocalIpcBindingError(
-          'identity_conflict',
-          'unreachable result is immutable for this operation destination',
-        );
-      }
       return 'unreachable';
     }
     record.state = 'unreachable';
@@ -904,7 +917,10 @@ export class LocalIpcRegistry {
   ): Promise<boolean> {
     const boundedTimeout = timeoutValue(timeoutMs);
     if (this.records.get(record.key) !== record) {
-      await this.drainRecord(record, boundedTimeout);
+      const drainErrors = await this.drainRecord(record, boundedTimeout);
+      if (drainErrors.length > 0) {
+        throw new AggregateError(drainErrors, 'local IPC binding unregister failed');
+      }
       return false;
     }
     this.deactivate(record);
@@ -913,6 +929,10 @@ export class LocalIpcRegistry {
       this.runtimes.delete(record.target.runtimeId);
     }
     this.retireRuntimeId(record.target.runtimeId);
+    const owners = runtimeIdentityOwners.get(this.runtimeIdentityHistory);
+    if (owners?.get(record.target.runtimeId) === this) {
+      owners.delete(record.target.runtimeId);
+    }
     const peers = [...this.records.values()].filter((peer) => this.isCurrent(peer));
     const hookPromises: Promise<unknown>[] = [];
     if (notice !== undefined) {
@@ -921,25 +941,27 @@ export class LocalIpcRegistry {
         if (onShutdown === undefined || !this.hasHookCapacity(peer)) {
           continue;
         }
-        const invocation = Promise.resolve().then(() => {
+        const tracked = this.trackRecord(peer, () => {
           // Recheck the exact generation immediately before invoking a snapshot peer.
           if (!this.isCurrent(peer, peer.target)) {
             throw new LocalIpcDeliveryStale();
           }
           return onShutdown(notice);
         });
-        const tracked = this.trackRecord(peer, invocation);
         if (tracked !== undefined) {
           hookPromises.push(tracked);
         }
       }
     }
-    await drainPromisesWithin(
+    const drainErrors = await drainPromisesWithin(
       [...record.inFlight, ...hookPromises],
       boundedTimeout,
       this.setTimeout,
       this.clearTimeout,
     );
+    if (drainErrors.length > 0) {
+      throw new AggregateError(drainErrors, 'local IPC binding unregister failed');
+    }
     return true;
   }
 
@@ -953,18 +975,19 @@ export class LocalIpcRegistry {
   }
   private trackRecord<T>(
     record: LocalIpcRegistryRecord,
-    promise: Promise<T>,
+    factory: () => T | PromiseLike<T>,
   ): Promise<T> | undefined {
     if (!this.hasHookCapacity(record)) {
       return undefined;
     }
-    const tracked = promise.finally(() => record.inFlight.delete(tracked));
+    const invocation = Promise.resolve().then(() => factory()) as Promise<T>;
+    const tracked = invocation.finally(() => record.inFlight.delete(tracked));
     record.inFlight.add(tracked);
     return tracked;
   }
 
-  private async drainRecord(record: LocalIpcRegistryRecord, timeoutMs: number): Promise<void> {
-    await drainPromisesWithin([...record.inFlight], timeoutMs, this.setTimeout, this.clearTimeout);
+  private drainRecord(record: LocalIpcRegistryRecord, timeoutMs: number): Promise<unknown[]> {
+    return drainPromisesWithin([...record.inFlight], timeoutMs, this.setTimeout, this.clearTimeout);
   }
 
   private scheduleSharedAcceptedOperation(
@@ -1159,21 +1182,29 @@ async function drainPromisesWithin(
   timeoutMs: number,
   setTimeoutFn: LocalIpcSetTimeout,
   clearTimeoutFn: LocalIpcClearTimeout,
-): Promise<void> {
+): Promise<unknown[]> {
   if (promises.length === 0) {
-    return;
+    return [];
   }
   let timer: unknown;
+  let settledOutcomes: PromiseSettledResult<unknown>[] | undefined;
+  const allSettled = Promise.allSettled(promises).then((outcomes) => {
+    settledOutcomes = outcomes;
+    return outcomes;
+  });
   const timeout = new Promise<void>((resolve) => {
     timer = setTimeoutFn(resolve, timeoutMs);
   });
   try {
-    await Promise.race([Promise.allSettled(promises), timeout]);
+    await Promise.race([allSettled, timeout]);
   } finally {
     if (timer !== undefined) {
       clearTimeoutFn(timer);
     }
   }
+  return (settledOutcomes ?? [])
+    .filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
+    .map((outcome) => outcome.reason);
 }
 
 const DEFAULT_LOCAL_IPC_REGISTRY = new LocalIpcRegistry();
@@ -1412,6 +1443,15 @@ export class LocalIpcTransport<
       );
     }
     if (persistence !== undefined) {
+      if (
+        registry.currentRuntimeId !== undefined &&
+        registry.currentRuntimeId !== persistence.runtimeId
+      ) {
+        throw new LocalIpcBindingError(
+          'identity_conflict',
+          'local IPC registry current runtime must match persistence owner',
+        );
+      }
       if (registry.operationGuardState !== persistence.operationGuardState) {
         throw new LocalIpcBindingError(
           'identity_conflict',
@@ -1467,7 +1507,17 @@ export class LocalIpcTransport<
     if (this.closedState) {
       throw new LocalIpcBindingError('closed', 'local IPC transport is closed');
     }
-    const record = this.registry.register(target, hooks);
+    const normalizedTarget = validateTarget(target);
+    if (
+      this.persistence !== undefined &&
+      normalizedTarget.runtimeId !== this.persistence.runtimeId
+    ) {
+      throw new LocalIpcBindingError(
+        'identity_conflict',
+        'persistence-backed local IPC must bind to its owning runtime identity',
+      );
+    }
+    const record = this.registry.register(normalizedTarget, hooks, this.persistence?.runtimeId);
     const binding = new LocalIpcBinding(this, record);
     this.bindings.add(binding);
     return binding;
@@ -1577,13 +1627,28 @@ export class LocalIpcTransport<
 
   private async finishClose(): Promise<void> {
     const bindings = [...this.bindings];
-    await Promise.allSettled(bindings.map((binding) => binding.close()));
-    await drainPromisesWithin(
-      [...this.inFlight],
-      this.deliveryTimeoutMs,
-      this.setTimeout,
-      this.clearTimeout,
-    );
+    const errors: unknown[] = [];
+    const bindingOutcomes = await Promise.allSettled(bindings.map((binding) => binding.close()));
+    for (const outcome of bindingOutcomes) {
+      if (outcome.status === 'rejected') {
+        errors.push(outcome.reason);
+      }
+    }
+    try {
+      errors.push(
+        ...(await drainPromisesWithin(
+          [...this.inFlight],
+          this.deliveryTimeoutMs,
+          this.setTimeout,
+          this.clearTimeout,
+        )),
+      );
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'local IPC close failed');
+    }
   }
 
   private async deliverEnvelope(
@@ -1615,15 +1680,26 @@ export class LocalIpcTransport<
     if (this.closedState) {
       return failure('closed', 'local IPC transport is closed', target, operationId);
     }
-
     let normalizedTarget: LocalIpcRuntimeTarget;
     try {
       normalizedTarget = validateTarget(target);
     } catch (error) {
       return failure('invalid_target', 'local IPC target is invalid', target, operationId, error);
     }
+    if (this.persistence !== undefined && senderRuntimeId !== this.persistence.runtimeId) {
+      return failure(
+        'invalid_target',
+        'persistence-backed local IPC sender must match its owning runtime identity',
+        normalizedTarget,
+        operationId,
+      );
+    }
+    let operationExpiresAtMs: number;
     try {
-      operationDeadline(envelope.expiresAt, finiteClock(this.now()));
+      // Parse the original absolute deadline without rejecting an elapsed
+      // value until an existing operation guard has had a chance to replay or
+      // terminalize its immutable result.
+      operationExpiresAtMs = operationDeadline(envelope.expiresAt, finiteClock(this.now()), true);
     } catch (error) {
       return failure(
         'invalid_target',
@@ -1633,7 +1709,6 @@ export class LocalIpcTransport<
         error,
       );
     }
-
     const terminalFailure = (
       message: string,
       cause?: unknown,
@@ -1663,7 +1738,6 @@ export class LocalIpcTransport<
         senderRuntimeId,
       );
     };
-
     if (this.persistence !== undefined) {
       try {
         const cached = this.persistence.getUnreachable(operationId, senderRuntimeId);
@@ -1701,25 +1775,10 @@ export class LocalIpcTransport<
         );
       }
     }
-
-    const record = this.registry.resolve(normalizedTarget);
-    if (record === undefined) {
-      return terminalFailure('local IPC runtime endpoint is not currently reachable');
-    }
-    if (!this.registry.isCurrent(record, normalizedTarget)) {
-      return terminalFailure('local IPC runtime endpoint was replaced before delivery');
-    }
-    if (!this.registry.hasHookCapacity(record)) {
-      return failure(
-        'unreachable',
-        'local IPC delivery hook capacity is temporarily exhausted',
-        normalizedTarget,
-        operationId,
-      );
-    }
-
     let reservation: RouteReservation | null;
     try {
+      // Reserve before checking the endpoint or deadline so a matching
+      // accepted/destination guard can use its retainedUntil after expiry.
       reservation = this.reserveOperation(
         senderRuntimeId,
         operationId,
@@ -1747,7 +1806,7 @@ export class LocalIpcTransport<
     }
     if (reservation === null) {
       return this.unreachableFailure(
-        'operationId belongs to an earlier runtime endpoint; create a new operationId',
+        'operationId is bound to a different destination',
         normalizedTarget,
         operationId,
         envelope.expiresAt,
@@ -1771,7 +1830,9 @@ export class LocalIpcTransport<
         senderRuntimeId,
       );
     }
-
+    if (operationExpiresAtMs <= finiteClock(this.now())) {
+      return terminalFailure('local IPC operation deadline elapsed before delivery');
+    }
     if (this.persistence !== undefined) {
       try {
         this.persistence.recordAcceptedOperation(
@@ -1800,45 +1861,60 @@ export class LocalIpcTransport<
         );
       }
     }
-
-    const source = sourceForRuntime(this.registry, senderRuntimeId, normalizedTarget);
-    const fence = { active: true };
+    const record = this.registry.resolve(normalizedTarget);
+    if (record === undefined) {
+      return terminalFailure('local IPC runtime endpoint is not currently reachable');
+    }
+    if (!this.registry.isCurrent(record, normalizedTarget)) {
+      return terminalFailure('local IPC runtime endpoint was replaced before delivery');
+    }
+    if (!this.registry.hasHookCapacity(record)) {
+      return failure(
+        'unreachable',
+        'local IPC delivery hook capacity is temporarily exhausted',
+        normalizedTarget,
+        operationId,
+      );
+    }
+    const source = sourceForRuntime(this.registry, senderRuntimeId);
+    if (source === undefined) {
+      return terminalFailure('local IPC sender runtime binding is not currently reachable');
+    }
+    const fence = { active: true, expiresAt: operationExpiresAtMs };
     const delivery: TransportInboundEnvelope<Envelope, Response, LocalIpcEndpoint> = {
       envelope,
       source,
       reply: (response) => {
-        let responseOperationId: string | undefined;
-        try {
-          responseOperationId = operationIdOf(response);
-        } catch {
-          responseOperationId = undefined;
-        }
         if (
           !fence.active ||
           this.closedState ||
-          !this.registry.isCurrent(record, normalizedTarget)
+          !this.registry.isCurrent(record, normalizedTarget) ||
+          fence.expiresAt <= finiteClock(this.now())
         ) {
+          fence.active = false;
           return Promise.resolve(
-            failure(
-              'unreachable',
-              'inbound response path belongs to a stale runtime generation',
-              normalizedTarget,
-              responseOperationId,
+            terminalFailure(
+              'inbound response path expired or belongs to a stale runtime generation',
             ),
           );
         }
-        return this.sendResponse(source, response);
+        return this.deliverResponse(source, response, fence.expiresAt);
       },
     };
-
-    if (!this.registry.isCurrent(record, normalizedTarget)) {
+    if (
+      !this.registry.isCurrent(record, normalizedTarget) ||
+      fence.expiresAt <= finiteClock(this.now())
+    ) {
       fence.active = false;
-      return terminalFailure('local IPC runtime endpoint was replaced before hook invocation');
+      return terminalFailure('local IPC delivery expired before hook invocation');
     }
-
     try {
-      const underlyingHook = Promise.resolve().then(() => {
-        if (!fence.active || !this.registry.isCurrent(record, normalizedTarget)) {
+      const trackedHook = this.trackRecord(record, () => {
+        if (
+          !fence.active ||
+          !this.registry.isCurrent(record, normalizedTarget) ||
+          fence.expiresAt <= finiteClock(this.now())
+        ) {
           throw new LocalIpcDeliveryStale();
         }
         return (
@@ -1847,7 +1923,6 @@ export class LocalIpcTransport<
           ) => void | PromiseLike<void>
         )(delivery);
       });
-      const trackedHook = this.trackRecord(record, underlyingHook);
       if (trackedHook === undefined) {
         fence.active = false;
         return failure(
@@ -1857,15 +1932,24 @@ export class LocalIpcTransport<
           operationId,
         );
       }
+      const remainingMs = fence.expiresAt - finiteClock(this.now());
+      if (remainingMs <= 0) {
+        fence.active = false;
+        return terminalFailure('local IPC delivery deadline elapsed before hook completion');
+      }
       await waitForHook(
         () => trackedHook,
-        this.deliveryTimeoutMs,
+        Math.max(1, Math.min(this.deliveryTimeoutMs, remainingMs)),
         this.setTimeout,
         this.clearTimeout,
       );
-      if (!fence.active || !this.registry.isCurrent(record, normalizedTarget)) {
+      if (
+        !fence.active ||
+        !this.registry.isCurrent(record, normalizedTarget) ||
+        fence.expiresAt <= finiteClock(this.now())
+      ) {
         fence.active = false;
-        return terminalFailure('local IPC runtime endpoint closed during delivery');
+        return terminalFailure('local IPC delivery expired or closed before finalization');
       }
       const terminal = this.registry.markOperationDelivered(
         senderRuntimeId,
@@ -1912,6 +1996,7 @@ export class LocalIpcTransport<
   private async deliverResponse(
     target: TransportRuntimeTarget<LocalIpcEndpoint>,
     response: Response,
+    deliveryDeadlineMs?: number,
   ): Promise<TransportDeliveryResult<LocalIpcEndpoint>> {
     let operationId: string | undefined;
     try {
@@ -1936,14 +2021,21 @@ export class LocalIpcTransport<
     if (this.closedState) {
       return failure('closed', 'local IPC transport is closed', target, operationId);
     }
-
     let normalizedTarget: LocalIpcRuntimeTarget;
     try {
       normalizedTarget = validateTarget(target);
     } catch (error) {
       return failure('invalid_target', 'local IPC target is invalid', target, operationId, error);
     }
-    const localSource = this.firstBoundTarget() ?? normalizedTarget;
+    const localSource = this.localSourceForResponse();
+    if (localSource === undefined) {
+      return failure(
+        'ambiguous',
+        'local IPC response requires one open binding for the owning runtime',
+        normalizedTarget,
+        operationId,
+      );
+    }
     const senderRuntimeId = localSource.runtimeId;
     const terminalFailure = (
       message: string,
@@ -1954,6 +2046,7 @@ export class LocalIpcTransport<
         operationId,
         normalizedTarget,
         message,
+        deliveryDeadlineMs,
       );
       if (terminal === 'delivered') {
         return delivered(operationId);
@@ -1968,12 +2061,11 @@ export class LocalIpcTransport<
         immutableMessage,
         normalizedTarget,
         operationId,
-        undefined,
+        deliveryDeadlineMs,
         cause,
         senderRuntimeId,
       );
     };
-
     if (this.persistence !== undefined) {
       try {
         const cached = this.persistence.getUnreachable(operationId, senderRuntimeId);
@@ -2005,32 +2097,20 @@ export class LocalIpcTransport<
           'operationId belongs to an earlier runtime endpoint; create a new operationId',
           normalizedTarget,
           operationId,
-          undefined,
+          deliveryDeadlineMs,
           error,
           senderRuntimeId,
         );
       }
     }
-
-    const record = this.registry.resolve(normalizedTarget);
-    if (record === undefined) {
-      return terminalFailure('local IPC runtime endpoint is not currently reachable');
-    }
-    if (!this.registry.isCurrent(record, normalizedTarget)) {
-      return terminalFailure('local IPC runtime endpoint was replaced before response delivery');
-    }
-    if (!this.registry.hasHookCapacity(record)) {
-      return failure(
-        'unreachable',
-        'local IPC delivery hook capacity is temporarily exhausted',
-        normalizedTarget,
-        operationId,
-      );
-    }
-
     let reservation: RouteReservation | null;
     try {
-      reservation = this.reserveOperation(senderRuntimeId, operationId, normalizedTarget.runtimeId);
+      reservation = this.reserveOperation(
+        senderRuntimeId,
+        operationId,
+        normalizedTarget.runtimeId,
+        deliveryDeadlineMs,
+      );
     } catch (error) {
       if (error instanceof LocalIpcBindingError) {
         return failure(
@@ -2045,17 +2125,17 @@ export class LocalIpcTransport<
         'operationId belongs to an earlier runtime endpoint; create a new operationId',
         normalizedTarget,
         operationId,
-        undefined,
+        deliveryDeadlineMs,
         error,
         senderRuntimeId,
       );
     }
     if (reservation === null) {
       return this.unreachableFailure(
-        'operationId belongs to an earlier runtime endpoint; create a new operationId',
+        'operationId is bound to a different destination',
         normalizedTarget,
         operationId,
-        undefined,
+        deliveryDeadlineMs,
         new LocalIpcBindingError(
           'identity_conflict',
           'operationId is bound to a different destination',
@@ -2068,21 +2148,23 @@ export class LocalIpcTransport<
     }
     if (reservation.terminal === 'unreachable') {
       return this.unreachableFailure(
-        reservation.unreachableMessage ?? 'local IPC delivery was previously unreachable',
+        reservation.unreachableMessage ?? 'local IPC response was previously unreachable',
         normalizedTarget,
         operationId,
-        undefined,
+        deliveryDeadlineMs,
         undefined,
         senderRuntimeId,
       );
     }
-
+    if (deliveryDeadlineMs !== undefined && deliveryDeadlineMs <= finiteClock(this.now())) {
+      return terminalFailure('local IPC response deadline elapsed before delivery');
+    }
     if (this.persistence !== undefined) {
       try {
         this.persistence.recordAcceptedOperation(
           operationId,
           normalizedTarget.runtimeId,
-          undefined,
+          deliveryDeadlineMs,
           senderRuntimeId,
         );
       } catch (error) {
@@ -2099,27 +2181,46 @@ export class LocalIpcTransport<
           'operationId belongs to an earlier runtime endpoint; create a new operationId',
           normalizedTarget,
           operationId,
-          undefined,
+          deliveryDeadlineMs,
           error,
           senderRuntimeId,
         );
       }
     }
-
-    const fence = { active: true };
+    const record = this.registry.resolve(normalizedTarget);
+    if (record === undefined) {
+      return terminalFailure('local IPC runtime endpoint is not currently reachable');
+    }
+    if (!this.registry.isCurrent(record, normalizedTarget)) {
+      return terminalFailure('local IPC runtime endpoint was replaced before response delivery');
+    }
+    if (!this.registry.hasHookCapacity(record)) {
+      return failure(
+        'unreachable',
+        'local IPC delivery hook capacity is temporarily exhausted',
+        normalizedTarget,
+        operationId,
+      );
+    }
+    const fence = { active: true, expiresAt: deliveryDeadlineMs };
     const delivery: TransportInboundResponse<Response, LocalIpcEndpoint> = {
       response,
       source: localSource,
     };
-    if (!this.registry.isCurrent(record, normalizedTarget)) {
+    if (
+      !this.registry.isCurrent(record, normalizedTarget) ||
+      (fence.expiresAt !== undefined && fence.expiresAt <= finiteClock(this.now()))
+    ) {
       fence.active = false;
-      return terminalFailure(
-        'local IPC runtime endpoint was replaced before response hook invocation',
-      );
+      return terminalFailure('local IPC response expired before hook invocation');
     }
     try {
-      const underlyingHook = Promise.resolve().then(() => {
-        if (!fence.active || !this.registry.isCurrent(record, normalizedTarget)) {
+      const trackedHook = this.trackRecord(record, () => {
+        if (
+          !fence.active ||
+          !this.registry.isCurrent(record, normalizedTarget) ||
+          (fence.expiresAt !== undefined && fence.expiresAt <= finiteClock(this.now()))
+        ) {
           throw new LocalIpcDeliveryStale();
         }
         return (
@@ -2128,7 +2229,6 @@ export class LocalIpcTransport<
           ) => void | PromiseLike<void>
         )(delivery);
       });
-      const trackedHook = this.trackRecord(record, underlyingHook);
       if (trackedHook === undefined) {
         fence.active = false;
         return failure(
@@ -2138,15 +2238,27 @@ export class LocalIpcTransport<
           operationId,
         );
       }
+      const remainingMs =
+        fence.expiresAt === undefined
+          ? this.deliveryTimeoutMs
+          : fence.expiresAt - finiteClock(this.now());
+      if (remainingMs <= 0) {
+        fence.active = false;
+        return terminalFailure('local IPC response deadline elapsed before hook completion');
+      }
       await waitForHook(
         () => trackedHook,
-        this.deliveryTimeoutMs,
+        Math.max(1, Math.min(this.deliveryTimeoutMs, remainingMs)),
         this.setTimeout,
         this.clearTimeout,
       );
-      if (!fence.active || !this.registry.isCurrent(record, normalizedTarget)) {
+      if (
+        !fence.active ||
+        !this.registry.isCurrent(record, normalizedTarget) ||
+        (fence.expiresAt !== undefined && fence.expiresAt <= finiteClock(this.now()))
+      ) {
         fence.active = false;
-        return terminalFailure('local IPC runtime endpoint closed during response delivery');
+        return terminalFailure('local IPC response expired or closed before finalization');
       }
       const terminal = this.registry.markOperationDelivered(
         senderRuntimeId,
@@ -2170,6 +2282,7 @@ export class LocalIpcTransport<
         operationId,
         normalizedTarget,
         'local IPC response hook could not be established',
+        deliveryDeadlineMs,
       );
       if (terminal === 'delivered') {
         return delivered(operationId);
@@ -2182,20 +2295,21 @@ export class LocalIpcTransport<
         ) ?? 'local IPC response hook could not be established',
         normalizedTarget,
         operationId,
-        undefined,
+        deliveryDeadlineMs,
         error,
         senderRuntimeId,
       );
     }
   }
 
-  private firstBoundTarget(): LocalIpcRuntimeTarget | undefined {
-    for (const binding of this.bindings) {
-      if (binding.isOpen) {
-        return binding.target;
-      }
-    }
-    return undefined;
+  private localSourceForResponse(): LocalIpcRuntimeTarget | undefined {
+    const ownerRuntimeId = this.persistence?.runtimeId;
+    const openBindings = [...this.bindings].filter(
+      (binding) =>
+        binding.isOpen &&
+        (ownerRuntimeId === undefined || binding.target.runtimeId === ownerRuntimeId),
+    );
+    return openBindings.length === 1 ? openBindings[0].target : undefined;
   }
   private reserveOperation(
     senderRuntimeId: string,
@@ -2237,12 +2351,13 @@ export class LocalIpcTransport<
 
   private trackRecord<T>(
     record: LocalIpcRegistryRecord,
-    promise: Promise<T>,
+    factory: () => T | PromiseLike<T>,
   ): Promise<T> | undefined {
     if (!this.registry.hasHookCapacity(record)) {
       return undefined;
     }
-    const tracked = promise.finally(() => record.inFlight.delete(tracked));
+    const invocation = Promise.resolve().then(() => factory()) as Promise<T>;
+    const tracked = invocation.finally(() => record.inFlight.delete(tracked));
     record.inFlight.add(tracked);
     return tracked;
   }
