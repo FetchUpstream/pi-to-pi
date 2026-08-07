@@ -1511,7 +1511,9 @@ export class RuntimeRegistry {
   public readonly runtimeId: RuntimeId;
   public readonly sessionId: SessionId;
   public readonly roomId: RoomId;
-  public readonly networkName: RegistryNetworkName;
+  public get networkName(): RegistryNetworkName {
+    return this.currentNetworkName;
+  }
   public readonly endpoint: string;
   public readonly ttlMs: number;
   public readonly renewalIntervalMs: number;
@@ -1519,7 +1521,8 @@ export class RuntimeRegistry {
 
   private readonly pathOptions: RegistryPathOptions;
   private readonly clock: RegistryClock;
-  private readonly cleanupOptions: RuntimeRecordCleanupOptions;
+  private currentNetworkName: RegistryNetworkName;
+  private cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
   private pendingRenewal: Promise<void> = Promise.resolve();
   private shutdownRequested = false;
@@ -1535,7 +1538,7 @@ export class RuntimeRegistry {
       throw new RuntimeRegistryError('networkName is required');
     }
     try {
-      this.networkName = canonicalNetworkName(networkName, this.runtimeId);
+      this.currentNetworkName = canonicalNetworkName(networkName, this.runtimeId);
     } catch (error) {
       if (error instanceof RuntimeRegistryError) {
         throw error;
@@ -1622,6 +1625,38 @@ export class RuntimeRegistry {
 
   public publish(): Promise<void> {
     return this.renew();
+  }
+
+  /** Update the published name while retaining this runtime's exact ownership. */
+  public async updateNetworkName(networkName: RegistryNetworkName | string): Promise<void> {
+    let canonical: RegistryNetworkName;
+    try {
+      canonical = canonicalNetworkName(networkName, this.runtimeId);
+    } catch {
+      throw new RuntimeRegistryError(
+        'networkName must be a canonical base or published network name',
+      );
+    }
+
+    const previousNetworkName = this.networkName;
+    const previousCleanupOptions = this.cleanupOptions;
+    this.currentNetworkName = canonical;
+    this.cleanupOptions = {
+      ...previousCleanupOptions,
+      expectedNetworkName: canonical,
+    };
+    try {
+      await this.renew();
+    } catch (error) {
+      this.currentNetworkName = previousNetworkName;
+      this.cleanupOptions = previousCleanupOptions;
+      throw error;
+    }
+  }
+
+  /** Alias for lifecycle callers that describe the operation as a rename. */
+  public renameNetworkName(networkName: RegistryNetworkName | string): Promise<void> {
+    return this.updateNetworkName(networkName);
   }
 
   /** Start the initial publication and the approximately ten-second timer. */

@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -8,6 +12,8 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 
 import registerPiToPi, { createPiToPiLifecycle } from '../../src/index.js';
+import { type LeaseScheduler } from '../../src/discovery/lease.js';
+import { listRuntimeRecords } from '../../src/discovery/registry.js';
 
 function createFlags(options: { name?: string; project?: string } = {}) {
   return vi.fn<ExtensionAPI['getFlag']>((name) => {
@@ -53,6 +59,28 @@ function shutdownEvent(
   };
 }
 
+let registryRoot: string;
+
+beforeEach(async () => {
+  registryRoot = await mkdtemp(join(tmpdir(), 'pi-to-pi-lifecycle-'));
+});
+
+afterEach(async () => {
+  await rm(registryRoot, { recursive: true, force: true });
+});
+
+function createLifecycle(flags: { name?: string; project?: string } = {}) {
+  return createPiToPiLifecycle(
+    { getFlag: createFlags(flags) },
+    {
+      registryOptions: {
+        rootDirectory: registryRoot,
+        renewalIntervalMs: 60_000,
+      },
+    },
+  );
+}
+
 const replacementScenarios: ReadonlyArray<{
   readonly reason: Exclude<SessionStartEvent['reason'], 'startup'>;
   readonly replacementSessionId: string;
@@ -83,7 +111,7 @@ const replacementScenarios: ReadonlyArray<{
   },
 ];
 
-describe('Pi-to-Pi extension bootstrap', () => {
+describe('Pi-to-Pi extension lifecycle integration', () => {
   it('registers namespaced flags and native session lifecycle hooks during extension load', () => {
     const on = vi.fn<ExtensionAPI['on']>();
     const registerFlag = vi.fn<ExtensionAPI['registerFlag']>();
@@ -108,16 +136,60 @@ describe('Pi-to-Pi extension bootstrap', () => {
     expect(on).toHaveBeenNthCalledWith(3, 'session_shutdown', expect.any(Function));
   });
 
-  it('reads native session metadata and starts a runtime only at session_start', () => {
+  it('does not allocate registry resources until session_start', async () => {
+    const timer = { unref: vi.fn() } as unknown as ReturnType<typeof setInterval>;
+    const scheduler: LeaseScheduler = {
+      setInterval: vi.fn(() => timer),
+      clearInterval: vi.fn(),
+    };
+    const lifecycle = createPiToPiLifecycle(
+      { getFlag: createFlags({ project: 'Lifecycle Room' }) },
+      {
+        registryOptions: {
+          rootDirectory: registryRoot,
+          scheduler,
+        },
+      },
+    );
+
+    expect(scheduler.setInterval).not.toHaveBeenCalled();
+    expect(lifecycle.current()).toBeUndefined();
+
+    await lifecycle.onSessionStart(
+      startEvent('startup'),
+      createContext('native-session-id', 'Planner'),
+    );
+
+    expect(scheduler.setInterval).toHaveBeenCalledTimes(1);
+    expect(lifecycle.current()?.registry.current()).toEqual(
+      expect.objectContaining({
+        sessionId: 'native-session-id',
+        roomId: lifecycle.current()?.room.roomId,
+        networkName: lifecycle.current()?.publishedName.networkName,
+        endpoint: lifecycle.current()?.endpoint,
+      }),
+    );
+    await lifecycle.onSessionShutdown(
+      shutdownEvent('quit'),
+      createContext('native-session-id', 'Planner'),
+    );
+  });
+
+  it('reads native session metadata and starts a runtime only at session_start', async () => {
     const on = vi.fn<ExtensionAPI['on']>();
     const registerFlag = vi.fn<ExtensionAPI['registerFlag']>();
     const getFlag = vi.fn<ExtensionAPI['getFlag']>().mockReturnValue(undefined);
-    registerPiToPi({ on, registerFlag, getFlag } as unknown as ExtensionAPI);
+    registerPiToPi({ on, registerFlag, getFlag } as unknown as ExtensionAPI, {
+      registryOptions: { rootDirectory: registryRoot },
+    });
 
     const startHandler = on.mock.calls[0]?.[1] as unknown as
-      ((event: SessionStartEvent, context: ExtensionContext) => void) | undefined;
+      ((event: SessionStartEvent, context: ExtensionContext) => Promise<void>) | undefined;
+    const shutdownHandler = on.mock.calls[2]?.[1] as unknown as
+      ((event: SessionShutdownEvent, context: ExtensionContext) => Promise<void>) | undefined;
     expect(startHandler).toEqual(expect.any(Function));
-    if (startHandler === undefined) return;
+    expect(shutdownHandler).toEqual(expect.any(Function));
+    if (startHandler === undefined || shutdownHandler === undefined) return;
 
     const getSessionId = vi.fn(() => 'native-session-id');
     const getSessionName = vi.fn(() => 'Planner');
@@ -126,30 +198,28 @@ describe('Pi-to-Pi extension bootstrap', () => {
       sessionManager: { getSessionId, getSessionName },
     } as unknown as ExtensionContext;
 
-    expect(() => startHandler(startEvent('startup'), context)).not.toThrow();
-
+    await expect(startHandler(startEvent('startup'), context)).resolves.toBeUndefined();
     expect(getSessionId).toHaveBeenCalledTimes(1);
     expect(getSessionName).toHaveBeenCalledTimes(1);
+    await shutdownHandler(shutdownEvent('quit'), context);
   });
 
   for (const scenario of replacementScenarios) {
-    it(`handles native ${scenario.reason} session replacement metadata`, () => {
-      const lifecycle = createPiToPiLifecycle({
-        getFlag: createFlags({ project: 'Lifecycle Room' }),
-      });
+    it(`handles native ${scenario.reason} session replacement metadata`, async () => {
+      const lifecycle = createLifecycle({ project: 'Lifecycle Room' });
       const currentContext = createContext('session-reload', 'Planner');
 
-      lifecycle.onSessionStart(startEvent('startup'), currentContext);
+      await lifecycle.onSessionStart(startEvent('startup'), currentContext);
       const previousRuntime = lifecycle.current();
       expect(previousRuntime).toBeDefined();
 
-      lifecycle.onSessionShutdown(
+      await lifecycle.onSessionShutdown(
         shutdownEvent(scenario.reason, scenario.targetSessionFile),
         currentContext,
       );
       expect(lifecycle.current()).toBeUndefined();
 
-      lifecycle.onSessionStart(
+      await lifecycle.onSessionStart(
         startEvent(scenario.reason, scenario.previousSessionFile),
         createContext(scenario.replacementSessionId, 'Planner'),
       );
@@ -164,55 +234,71 @@ describe('Pi-to-Pi extension bootstrap', () => {
       expect(replacementRuntime?.config.name).toBe('planner');
       expect(replacementRuntime?.config.projectOverride).toBe('lifecycle-room');
       expect(replacementRuntime?.room.roomId).toBe(previousRuntime?.room.roomId);
+      await lifecycle.onSessionShutdown(
+        shutdownEvent('quit'),
+        createContext(scenario.replacementSessionId, 'Planner'),
+      );
     });
   }
 
-  it('updates only the native name while preserving project, identity, and room state', () => {
-    const lifecycle = createPiToPiLifecycle({
-      getFlag: createFlags({ project: 'Project Label' }),
-    });
+  it('updates only the native name while preserving identity, room, endpoint, and registry ownership', async () => {
+    const lifecycle = createLifecycle({ project: 'Project Label' });
     const context = createContext('native-session-id', 'Planner');
 
-    lifecycle.onSessionStart(startEvent('startup'), context);
+    await lifecycle.onSessionStart(startEvent('startup'), context);
     const before = lifecycle.current();
     expect(before).toBeDefined();
-    expect(before?.config.name).toBe('planner');
-    expect(before?.config.nameSource).toBe('session-name');
+    const beforeRecord = before?.registry.current();
+    expect(beforeRecord).toBeDefined();
 
     const renamedEvent: SessionInfoChangedEvent = {
       type: 'session_info_changed',
       name: 'New Planner',
     };
-    lifecycle.onSessionInfoChanged(renamedEvent, context);
+    await lifecycle.onSessionInfoChanged(renamedEvent, context);
     const afterRename = lifecycle.current();
+    const afterRecord = afterRename?.registry.current();
 
     expect(afterRename?.config.name).toBe('new-planner');
     expect(afterRename?.config.nameSource).toBe('session-name');
     expect(afterRename?.config.projectOverride).toBe('project-label');
     expect(afterRename?.identity).toBe(before?.identity);
-    expect(afterRename?.identity.sessionId).toBe('native-session-id');
-    expect(afterRename?.identity.runtimeId).toBe(before?.identity.runtimeId);
     expect(afterRename?.room).toBe(before?.room);
+    expect(afterRename?.endpoint).toBe(before?.endpoint);
+    expect(afterRename?.registry).toBe(before?.registry);
+    expect(afterRename?.publishedName.suffix).toBe(before?.publishedName.suffix);
+    expect(afterRecord?.runtimeId).toBe(beforeRecord?.runtimeId);
+    expect(afterRecord?.sessionId).toBe(beforeRecord?.sessionId);
+    expect(afterRecord?.roomId).toBe(beforeRecord?.roomId);
+    expect(afterRecord?.endpoint).toBe(beforeRecord?.endpoint);
+    expect(afterRecord?.networkName).toBe(afterRename?.publishedName.networkName);
+    expect(afterRecord?.networkName).not.toBe(beforeRecord?.networkName);
 
-    lifecycle.onSessionInfoChanged({ type: 'session_info_changed', name: undefined }, context);
-    const afterClear = lifecycle.current();
-    expect(afterClear?.config.name).toBe('agent');
-    expect(afterClear?.config.projectOverride).toBe('project-label');
-    expect(afterClear?.identity).toBe(before?.identity);
-    expect(afterClear?.room).toBe(before?.room);
+    await lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: undefined },
+      context,
+    );
+    expect(lifecycle.current()?.config.name).toBe('agent');
+    expect(lifecycle.current()?.identity).toBe(before?.identity);
+    expect(lifecycle.current()?.room).toBe(before?.room);
+    expect(lifecycle.current()?.endpoint).toBe(before?.endpoint);
+
+    await lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
+    expect(await listRuntimeRecords(before!.room.roomId, { rootDirectory: registryRoot })).toEqual(
+      [],
+    );
   });
 
-  it('keeps an explicit P2P name and project when native session metadata changes', () => {
-    const lifecycle = createPiToPiLifecycle({
-      getFlag: createFlags({ name: 'Explicit Name', project: 'Project Label' }),
-    });
+  it('keeps an explicit P2P name and project when native session metadata changes', async () => {
+    const lifecycle = createLifecycle({ name: 'Explicit Name', project: 'Project Label' });
     const context = createContext('native-session-id', 'Native Name');
 
-    lifecycle.onSessionStart(startEvent('startup'), context);
+    await lifecycle.onSessionStart(startEvent('startup'), context);
     const before = lifecycle.current();
-    expect(before).toBeDefined();
-
-    lifecycle.onSessionInfoChanged({ type: 'session_info_changed', name: 'Changed' }, context);
+    await lifecycle.onSessionInfoChanged(
+      { type: 'session_info_changed', name: 'Changed' },
+      context,
+    );
     const afterRename = lifecycle.current();
 
     expect(afterRename?.config.name).toBe('explicit-name');
@@ -220,39 +306,50 @@ describe('Pi-to-Pi extension bootstrap', () => {
     expect(afterRename?.config.projectOverride).toBe('project-label');
     expect(afterRename?.identity).toBe(before?.identity);
     expect(afterRename?.room).toBe(before?.room);
+    expect(afterRename?.endpoint).toBe(before?.endpoint);
+    expect(afterRename?.registry.current()?.networkName).toBe(
+      before?.registry.current()?.networkName,
+    );
+    await lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
   });
 
-  it('makes repeated native shutdown cleanup idempotent for the current runtime', () => {
-    const lifecycle = createPiToPiLifecycle({ getFlag: createFlags() });
+  it('makes repeated native shutdown cleanup idempotent for the current runtime', async () => {
+    const lifecycle = createLifecycle();
     const context = createContext('native-session-id', undefined);
 
-    lifecycle.onSessionStart(startEvent('startup'), context);
+    await lifecycle.onSessionStart(startEvent('startup'), context);
     expect(lifecycle.current()?.identity.sessionId).toBe('native-session-id');
     expect(lifecycle.current()?.identity.runtimeId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
     );
 
-    expect(() => {
-      lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
-      lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
-      lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
-    }).not.toThrow();
+    await expect(
+      lifecycle.onSessionShutdown(shutdownEvent('quit'), context),
+    ).resolves.toBeUndefined();
+    await expect(
+      lifecycle.onSessionShutdown(shutdownEvent('quit'), context),
+    ).resolves.toBeUndefined();
+    await expect(
+      lifecycle.onSessionShutdown(shutdownEvent('quit'), context),
+    ).resolves.toBeUndefined();
     expect(lifecycle.current()).toBeUndefined();
   });
 
-  it('gives a replacement extension process a fresh runtime without affecting the old process state', () => {
+  it('gives a replacement extension process a fresh runtime without affecting old-process cleanup', async () => {
     const flags = { project: 'Lifecycle Room' };
-    const previousProcess = createPiToPiLifecycle({ getFlag: createFlags(flags) });
+    const previousProcess = createLifecycle(flags);
     const context = createContext('stable-session-id', 'Planner');
 
-    previousProcess.onSessionStart(startEvent('startup'), context);
+    await previousProcess.onSessionStart(startEvent('startup'), context);
     const previousRuntime = previousProcess.current();
     expect(previousRuntime).toBeDefined();
-    previousProcess.onSessionShutdown(shutdownEvent('reload', '/sessions/reloaded.jsonl'), context);
-    expect(previousProcess.current()).toBeUndefined();
+    await previousProcess.onSessionShutdown(
+      shutdownEvent('reload', '/sessions/reloaded.jsonl'),
+      context,
+    );
 
-    const replacementProcess = createPiToPiLifecycle({ getFlag: createFlags(flags) });
-    replacementProcess.onSessionStart(
+    const replacementProcess = createLifecycle(flags);
+    await replacementProcess.onSessionStart(
       startEvent('reload', '/sessions/active.jsonl'),
       createContext('stable-session-id', 'Planner'),
     );
@@ -263,26 +360,22 @@ describe('Pi-to-Pi extension bootstrap', () => {
     expect(replacementRuntime?.identity.runtimeId).not.toBe(previousRuntime?.identity.runtimeId);
     expect(replacementRuntime?.room.roomId).toBe(previousRuntime?.room.roomId);
 
-    expect(() => {
-      previousProcess.onSessionShutdown(shutdownEvent('reload'), context);
-      previousProcess.onSessionShutdown(shutdownEvent('reload'), context);
-    }).not.toThrow();
+    await previousProcess.onSessionShutdown(shutdownEvent('reload'), context);
+    await previousProcess.onSessionShutdown(shutdownEvent('reload'), context);
     expect(replacementProcess.current()).toBe(replacementRuntime);
 
-    replacementProcess.onSessionShutdown(shutdownEvent('quit'), context);
-    replacementProcess.onSessionShutdown(shutdownEvent('quit'), context);
+    await replacementProcess.onSessionShutdown(shutdownEvent('quit'), context);
     expect(replacementProcess.current()).toBeUndefined();
   });
 
-  it('resolves an explicit project room before the Pi working directory', () => {
-    const lifecycle = createPiToPiLifecycle({
-      getFlag: createFlags({ project: 'Project Label' }),
-    });
+  it('resolves an explicit project room before the Pi working directory', async () => {
+    const lifecycle = createLifecycle({ project: 'Project Label' });
     const context = createContext('native-session-id', 'Native Name', '/path/that/does/not/exist');
 
-    lifecycle.onSessionStart(startEvent('startup'), context);
+    await lifecycle.onSessionStart(startEvent('startup'), context);
 
     expect(lifecycle.current()?.room.source).toBe('explicit');
     expect(lifecycle.current()?.room.value).toBe('project-label');
+    await lifecycle.onSessionShutdown(shutdownEvent('quit'), context);
   });
 });
