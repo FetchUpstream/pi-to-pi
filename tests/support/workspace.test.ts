@@ -54,21 +54,29 @@ describe('test workspace support', () => {
   it('preserves callback and cleanup failures together', async () => {
     const callbackFailure = new Error('callback failed');
     const cleanupFailure = new Error('child termination failed');
+    let workspaceRootPath: string | undefined;
 
     const result = withTestWorkspace(async (workspace) => {
+      workspaceRootPath = workspace.rootPath;
       workspace.registerBeforeCleanup(() => {
         throw cleanupFailure;
       });
       throw callbackFailure;
     });
 
-    await expect(result).rejects.toSatisfy((error: unknown) => {
-      return (
-        error instanceof AggregateError &&
-        error.errors[0] === callbackFailure &&
-        error.errors[1] === cleanupFailure
-      );
-    });
+    try {
+      await expect(result).rejects.toSatisfy((error: unknown) => {
+        return (
+          error instanceof AggregateError &&
+          error.errors[0] === callbackFailure &&
+          error.errors[1] === cleanupFailure
+        );
+      });
+    } finally {
+      if (workspaceRootPath !== undefined) {
+        await removeTestWorkspace(workspaceRootPath);
+      }
+    }
   });
   it('keeps the workspace when an owner cleanup hook fails', async () => {
     const workspace = await createTestWorkspace();
