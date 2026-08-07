@@ -50,6 +50,8 @@ export interface PrivateFilesystemOptions {
   readonly uid?: number;
   /** Override the platform ACL operation in tests or an embedding host. */
   readonly windowsAcl?: WindowsAclProtector;
+  /** Absolute wall-clock deadline for bounded lock/cleanup operations. */
+  readonly deadlineMs?: number;
 }
 
 export interface RuntimeTreeOptions extends PrivateFilesystemOptions {
@@ -94,6 +96,37 @@ const tempFilePattern =
 const CARD_LOCK_RETRY_DELAY_MS = 10;
 const CARD_LOCK_STALE_AFTER_MS = 2 * 60_000;
 const writeLocks = new Map<string, Promise<unknown>>();
+const DEADLINE_EXCEEDED = Symbol('deadline exceeded');
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+type DeadlineResult<T> = T | typeof DEADLINE_EXCEEDED;
+
+function deadlineExpired(deadlineMs: number | undefined): boolean {
+  return deadlineMs !== undefined && (!Number.isFinite(deadlineMs) || Date.now() >= deadlineMs);
+}
+
+async function awaitBeforeDeadline<T>(
+  pending: Promise<T>,
+  deadlineMs: number | undefined,
+): Promise<DeadlineResult<T>> {
+  if (deadlineMs === undefined) {
+    return pending;
+  }
+  if (deadlineExpired(deadlineMs)) {
+    return DEADLINE_EXCEEDED;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<typeof DEADLINE_EXCEEDED>((resolve) => {
+    const delay = Math.min(Math.max(0, deadlineMs - Date.now()), MAX_TIMER_DELAY_MS);
+    timer = setTimeout(() => resolve(DEADLINE_EXCEEDED), delay);
+  });
+  try {
+    return await Promise.race([pending, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
 
 function errorCode(error: unknown): string | undefined {
   return typeof error === 'object' && error !== null && 'code' in error
@@ -432,12 +465,17 @@ async function openUniqueTemporaryCard(
   throw new PrivateFilesystemError('Unable to allocate a unique temporary card file');
 }
 
-async function withWriteLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+async function withWriteLock<T>(
+  key: string,
+  operation: () => Promise<T>,
+  deadlineMs?: number,
+): Promise<T | undefined> {
   const previous = writeLocks.get(key) ?? Promise.resolve();
   const current = previous.then(operation, operation);
   writeLocks.set(key, current);
   try {
-    return await current;
+    const result = await awaitBeforeDeadline(current, deadlineMs);
+    return result === DEADLINE_EXCEEDED ? undefined : result;
   } finally {
     if (writeLocks.get(key) === current) {
       writeLocks.delete(key);
@@ -517,65 +555,98 @@ function sameFileSnapshot(left: FileStatSnapshot, right: FileStatSnapshot): bool
   );
 }
 
-function waitForCardLock(): Promise<void> {
+function waitForCardLock(deadlineMs: number | undefined): Promise<boolean> {
+  if (deadlineExpired(deadlineMs)) {
+    return Promise.resolve(false);
+  }
+  const delay =
+    deadlineMs === undefined
+      ? CARD_LOCK_RETRY_DELAY_MS
+      : Math.min(CARD_LOCK_RETRY_DELAY_MS, Math.max(0, deadlineMs - Date.now()));
   return new Promise((resolve) => {
-    setTimeout(resolve, CARD_LOCK_RETRY_DELAY_MS);
+    setTimeout(() => resolve(!deadlineExpired(deadlineMs)), delay);
   });
 }
 
-async function reclaimStaleCardLock(lockPath: string): Promise<void> {
+type CardLockReclaimResult = 'retry' | 'wait' | 'stop';
+
+async function reclaimStaleCardLock(
+  lockPath: string,
+  deadlineMs: number | undefined,
+): Promise<CardLockReclaimResult> {
   let firstStats;
   try {
-    firstStats = await lstat(lockPath);
+    const result = await awaitBeforeDeadline(lstat(lockPath), deadlineMs);
+    if (result === DEADLINE_EXCEEDED) {
+      return 'stop';
+    }
+    firstStats = result;
   } catch (error) {
     if (isMissing(error)) {
-      return;
+      return 'retry';
     }
     throw error;
   }
   if (!firstStats.isFile() || firstStats.isSymbolicLink()) {
-    return;
+    return 'stop';
   }
   if (Date.now() - firstStats.mtimeMs < CARD_LOCK_STALE_AFTER_MS) {
-    return;
+    return 'wait';
   }
 
   let owner: CardLockOwner | undefined;
   try {
-    owner = parseCardLockOwner(await readFile(lockPath, 'utf8'));
+    const result = await awaitBeforeDeadline(readFile(lockPath, 'utf8'), deadlineMs);
+    if (result === DEADLINE_EXCEEDED) {
+      return 'stop';
+    }
+    owner = parseCardLockOwner(result);
   } catch (error) {
     if (!isMissing(error)) {
       throw error;
     }
+    return 'retry';
   }
   if (owner && processIsAlive(owner.pid)) {
-    return;
+    return 'wait';
   }
 
   let secondStats;
   try {
-    secondStats = await lstat(lockPath);
+    const result = await awaitBeforeDeadline(lstat(lockPath), deadlineMs);
+    if (result === DEADLINE_EXCEEDED) {
+      return 'stop';
+    }
+    secondStats = result;
   } catch (error) {
     if (isMissing(error)) {
-      return;
+      return 'retry';
     }
     throw error;
   }
+  if (!secondStats.isFile() || secondStats.isSymbolicLink()) {
+    return 'stop';
+  }
   if (!sameFileSnapshot(fileSnapshot(firstStats), fileSnapshot(secondStats))) {
-    return;
+    return 'wait';
+  }
+  if (deadlineExpired(deadlineMs)) {
+    return 'stop';
   }
   await unlink(lockPath).catch((error: unknown) => {
     if (!isMissing(error)) {
       throw error;
     }
   });
+  return 'retry';
 }
 
 async function acquireCardWriteLock(
   cardPath: string,
   options: PrivateFilesystemOptions,
-): Promise<() => Promise<void>> {
+): Promise<(() => Promise<void>) | undefined> {
   const lockPath = `${cardPath}.lock`;
+  const deadlineMs = options.deadlineMs;
   const owner: CardLockOwner = {
     pid: process.pid,
     token: randomBytes(16).toString('hex'),
@@ -584,17 +655,42 @@ async function acquireCardWriteLock(
   const serializedOwner = JSON.stringify(owner);
 
   while (true) {
+    if (deadlineExpired(deadlineMs)) {
+      return undefined;
+    }
     let created = false;
     let handle: FileHandle | undefined;
     try {
       handle = await open(lockPath, 'wx', PRIVATE_FILE_MODE);
       created = true;
+      if (deadlineExpired(deadlineMs)) {
+        await handle.close();
+        handle = undefined;
+        await unlink(lockPath).catch(() => undefined);
+        return undefined;
+      }
       await handle.writeFile(serializedOwner, 'utf8');
+      if (deadlineExpired(deadlineMs)) {
+        await handle.close();
+        handle = undefined;
+        await unlink(lockPath).catch(() => undefined);
+        return undefined;
+      }
       await handle.sync();
+      if (deadlineExpired(deadlineMs)) {
+        await handle.close();
+        handle = undefined;
+        await unlink(lockPath).catch(() => undefined);
+        return undefined;
+      }
       await handle.close();
       handle = undefined;
+      if (deadlineExpired(deadlineMs)) {
+        await unlink(lockPath).catch(() => undefined);
+        return undefined;
+      }
       await protectWindowsTarget(lockPath, 'file', options);
-      return async () => {
+      const release = async (): Promise<void> => {
         let source: string;
         try {
           source = await readFile(lockPath, 'utf8');
@@ -613,6 +709,11 @@ async function acquireCardWriteLock(
           }
         });
       };
+      if (deadlineExpired(deadlineMs)) {
+        await release();
+        return undefined;
+      }
+      return release;
     } catch (error) {
       if (handle) {
         await handle.close().catch(() => undefined);
@@ -623,8 +724,16 @@ async function acquireCardWriteLock(
       if (errorCode(error) !== 'EEXIST') {
         throw error;
       }
-      await reclaimStaleCardLock(lockPath);
-      await waitForCardLock();
+      const reclaimResult = await reclaimStaleCardLock(lockPath, deadlineMs);
+      if (reclaimResult === 'stop' || deadlineExpired(deadlineMs)) {
+        return undefined;
+      }
+      if (reclaimResult === 'retry') {
+        continue;
+      }
+      if (!(await waitForCardLock(deadlineMs))) {
+        return undefined;
+      }
     }
   }
 }
@@ -636,14 +745,30 @@ export function withAgentCardWriteLock<T>(
   options: PrivateFilesystemOptions = {},
 ): Promise<T> {
   const target = absolutePath(cardPath, 'card path');
-  return withWriteLock(target, async () => {
-    const release = await acquireCardWriteLock(target, options);
-    try {
-      return await operation();
-    } finally {
-      await release();
-    }
-  });
+  return withWriteLock(
+    target,
+    async () => {
+      if (deadlineExpired(options.deadlineMs)) {
+        return undefined as T;
+      }
+      const release = await acquireCardWriteLock(target, options);
+      if (!release) {
+        if (options.deadlineMs !== undefined) {
+          return undefined as T;
+        }
+        throw new PrivateFilesystemError(`Unable to acquire a safe card lock: ${target}`);
+      }
+      try {
+        if (deadlineExpired(options.deadlineMs)) {
+          return undefined as T;
+        }
+        return await operation();
+      } finally {
+        await release();
+      }
+    },
+    options.deadlineMs,
+  ) as Promise<T>;
 }
 
 /**
@@ -748,36 +873,57 @@ export async function compareAndDeleteFile(
   options: PrivateFilesystemOptions = {},
 ): Promise<boolean> {
   const target = absolutePath(filePath, 'card path');
-  return withAgentCardWriteLock(
-    target,
-    async () => {
-      let stats;
-      try {
-        stats = await lstat(target);
-      } catch (error) {
-        if (isMissing(error)) {
+  let result: boolean | undefined;
+  try {
+    result = await withAgentCardWriteLock(
+      target,
+      async () => {
+        if (deadlineExpired(options.deadlineMs)) {
           return false;
         }
-        throw error;
-      }
-      if (!stats.isFile() || stats.isSymbolicLink()) {
-        return false;
-      }
-      if (!sameFileSnapshot(fileSnapshot(stats), expected)) {
-        return false;
-      }
-      try {
-        await unlink(target);
-        return true;
-      } catch (error) {
-        if (isMissing(error)) {
+        let stats;
+        try {
+          stats = await lstat(target);
+        } catch (error) {
+          if (isMissing(error)) {
+            return false;
+          }
+          throw error;
+        }
+        if (deadlineExpired(options.deadlineMs)) {
           return false;
         }
-        throw error;
-      }
-    },
-    options,
-  );
+        if (!stats.isFile() || stats.isSymbolicLink()) {
+          return false;
+        }
+        if (!sameFileSnapshot(fileSnapshot(stats), expected)) {
+          return false;
+        }
+        if (deadlineExpired(options.deadlineMs)) {
+          return false;
+        }
+        try {
+          await unlink(target);
+          return true;
+        } catch (error) {
+          if (isMissing(error)) {
+            return false;
+          }
+          throw error;
+        }
+      },
+      options,
+    );
+  } catch (error) {
+    if (
+      error instanceof PrivateFilesystemError &&
+      error.message.startsWith('Unable to acquire a safe card lock:')
+    ) {
+      return false;
+    }
+    throw error;
+  }
+  return result === true;
 }
 
 /** Short alias for registry publication code. */
@@ -825,6 +971,11 @@ export async function cleanupAbandonedTemporaryFiles(
     'maxDurationMs',
   );
   const cleanupStartedAt = Date.now();
+  const deadlineMs =
+    options.deadlineMs ?? Math.min(Number.MAX_SAFE_INTEGER, cleanupStartedAt + maxDurationMs);
+  if (deadlineExpired(deadlineMs)) {
+    return 0;
+  }
   const runtimeIdentity =
     options.runtimeInstanceId === undefined
       ? undefined
@@ -838,7 +989,11 @@ export async function cleanupAbandonedTemporaryFiles(
 
   let directoryStats;
   try {
-    directoryStats = await lstat(directory);
+    const result = await awaitBeforeDeadline(lstat(directory), deadlineMs);
+    if (result === DEADLINE_EXCEEDED) {
+      return 0;
+    }
+    directoryStats = result;
   } catch (error) {
     if (isMissing(error)) {
       return 0;
@@ -859,30 +1014,40 @@ export async function cleanupAbandonedTemporaryFiles(
     }
   }
 
-  let directoryHandle;
-  try {
-    directoryHandle = await opendir(directory);
-  } catch (error) {
-    if (isMissing(error)) {
-      return 0;
-    }
-    throw error;
-  }
-  const names: string[] = [];
-  try {
-    for await (const entry of directoryHandle) {
-      if (names.length >= maxEntries || Date.now() - cleanupStartedAt >= maxDurationMs) {
-        break;
+  const namesResult = await awaitBeforeDeadline(
+    (async (): Promise<string[]> => {
+      let directoryHandle;
+      try {
+        directoryHandle = await opendir(directory);
+      } catch (error) {
+        if (isMissing(error)) {
+          return [];
+        }
+        throw error;
       }
-      names.push(entry.name);
-    }
-  } finally {
-    await directoryHandle.close().catch(() => undefined);
+      const names: string[] = [];
+      try {
+        for await (const entry of directoryHandle) {
+          if (names.length >= maxEntries || deadlineExpired(deadlineMs)) {
+            break;
+          }
+          names.push(entry.name);
+        }
+      } finally {
+        await directoryHandle.close().catch(() => undefined);
+      }
+      return names;
+    })(),
+    deadlineMs,
+  );
+  if (namesResult === DEADLINE_EXCEEDED) {
+    return 0;
   }
+  const names = namesResult;
   let removed = 0;
   let inspected = 0;
   for (const name of names) {
-    if (inspected >= maxEntries || Date.now() - cleanupStartedAt >= maxDurationMs) {
+    if (inspected >= maxEntries || deadlineExpired(deadlineMs)) {
       break;
     }
     inspected += 1;
@@ -897,12 +1062,19 @@ export async function cleanupAbandonedTemporaryFiles(
 
     let first;
     try {
-      first = await lstat(path);
+      const result = await awaitBeforeDeadline(lstat(path), deadlineMs);
+      if (result === DEADLINE_EXCEEDED) {
+        break;
+      }
+      first = result;
     } catch (error) {
       if (isMissing(error)) {
         continue;
       }
       throw error;
+    }
+    if (deadlineExpired(deadlineMs)) {
+      break;
     }
     if (
       !first.isFile() ||
@@ -917,7 +1089,11 @@ export async function cleanupAbandonedTemporaryFiles(
     // renewed this temp path cannot be removed based on stale metadata.
     let second;
     try {
-      second = await lstat(path);
+      const result = await awaitBeforeDeadline(lstat(path), deadlineMs);
+      if (result === DEADLINE_EXCEEDED) {
+        break;
+      }
+      second = result;
     } catch (error) {
       if (isMissing(error)) {
         continue;
@@ -934,9 +1110,14 @@ export async function cleanupAbandonedTemporaryFiles(
     ) {
       continue;
     }
-
+    if (deadlineExpired(deadlineMs)) {
+      break;
+    }
     try {
-      await unlink(path);
+      const result = await awaitBeforeDeadline(unlink(path), deadlineMs);
+      if (result === DEADLINE_EXCEEDED) {
+        return removed;
+      }
       removed += 1;
     } catch (error) {
       if (!isMissing(error)) {
