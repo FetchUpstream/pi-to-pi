@@ -219,7 +219,9 @@ export function raceWithAbort<T>(
     return Promise.resolve(operation);
   }
 
-  throwIfAborted(signal);
+  if (signal.aborted) {
+    return Promise.reject(abortErrorFromReason(signal.reason));
+  }
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const removeAbortListener = onAbort(signal, (error) => {
@@ -417,44 +419,6 @@ export function waitForChildExit(
   });
 }
 
-/** Wait for a forced child to close; a live child never produces a result. */
-function waitForChildClose(child: ChildProcess): Promise<ChildExit> {
-  const closed = childCloseStates.get(child);
-  if (closed !== undefined) {
-    return Promise.resolve(closed);
-  }
-  const exited = childExitState(child);
-  if (exited !== undefined) {
-    return Promise.resolve(exited);
-  }
-
-  return new Promise<ChildExit>((resolve, reject) => {
-    let settled = false;
-    let onClose: (code: number | null, signal: NodeJS.Signals | null) => void = () => undefined;
-    let onError: (error: Error) => void = () => undefined;
-    const dispose = (): void => {
-      child.removeListener('close', onClose);
-      child.removeListener('error', onError);
-    };
-    const settle = (callback: () => void): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      dispose();
-      callback();
-    };
-    onClose = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
-      const result = { code, signal: closeSignal };
-      childCloseStates.set(child, result);
-      settle(() => resolve(result));
-    };
-    onError = (error: Error): void => settle(() => reject(error));
-    child.once('close', onClose);
-    child.once('error', onError);
-  });
-}
-
 export interface ChildCleanupOptions {
   readonly deadline?: Deadline;
   readonly timeoutMs?: number;
@@ -478,8 +442,8 @@ function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
 
 /**
  * Terminate a child and escalate once the first absolute deadline expires.
- * The initial and escalation waits are finite; after a force timeout it waits
- * for child close so cleanup never returns while the child remains alive.
+ * The initial, escalation, and post-kill close waits are finite. If the child
+ * still has not closed after the final bounded attempt, its best-known state is returned.
  */
 export async function cleanupChildProcess(
   child: ChildProcess,
@@ -490,11 +454,6 @@ export async function cleanupChildProcess(
     createPhaseDeadline('child-cleanup', options.timeoutMs ?? DEFAULT_CHILD_CLEANUP_TIMEOUT_MS);
   const forceWaitMs = options.forceWaitMs ?? DEFAULT_FORCE_KILL_WAIT_MS;
   validateDuration(forceWaitMs);
-
-  const exited = childExitState(child);
-  if (exited !== undefined) {
-    return exited;
-  }
 
   killChild(child, options.terminateSignal ?? 'SIGTERM');
 
@@ -515,8 +474,21 @@ export async function cleanupChildProcess(
       throw error;
     }
     killChild(child, options.forceSignal ?? 'SIGKILL');
-    const finalExit = await waitForChildClose(child);
-    return { ...finalExit, timedOut: true };
+    const closeDeadline = createPhaseDeadline('child-close', forceWaitMs);
+    try {
+      const finalExit = await waitForChildExit(child, closeDeadline);
+      return { ...finalExit, timedOut: true };
+    } catch (closeError: unknown) {
+      if (!(closeError instanceof PhaseDeadlineExceededError)) {
+        throw closeError;
+      }
+      const observedExit = childCloseStates.get(child) ?? childExitState(child);
+      return {
+        code: observedExit?.code ?? child.exitCode,
+        signal: observedExit?.signal ?? child.signalCode,
+        timedOut: true,
+      };
+    }
   }
 }
 
@@ -643,6 +615,11 @@ export const captureDiagnostics = captureChildDiagnostics;
 export function diagnosticError(failure: unknown, diagnostics: ChildDiagnostics): Error {
   const cause = errorFromUnknown(failure);
   const sections = [`${cause.name}: ${cause.message}`];
+  if (diagnostics.exit !== undefined) {
+    sections.push(
+      `exit:\ncode: ${String(diagnostics.exit.code)}\nsignal: ${String(diagnostics.exit.signal)}`,
+    );
+  }
   if (diagnostics.stdout.length > 0) {
     sections.push(`stdout:\n${diagnostics.stdout}`);
   }

@@ -1,4 +1,6 @@
+import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -18,6 +20,22 @@ import {
 afterEach(() => {
   vi.useRealTimers();
 });
+class HangingChild extends EventEmitter {
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  stdin = { destroyed: false };
+  stdout = { destroyed: false };
+  stderr = { destroyed: false };
+  readonly signals: NodeJS.Signals[] = [];
+
+  kill(signal: NodeJS.Signals): boolean {
+    this.signals.push(signal);
+    if (signal === 'SIGKILL') {
+      this.signalCode = signal;
+    }
+    return true;
+  }
+}
 
 describe('local IPC spike test helpers', () => {
   it('represents phase deadlines as finite absolute timestamps', () => {
@@ -70,6 +88,19 @@ describe('local IPC spike test helpers', () => {
     await expect(pending).rejects.toBeInstanceOf(AbortError);
   });
 
+  it('returns a rejected promise for an already-aborted signal', async () => {
+    const controller = new AbortController();
+    controller.abort('already cancelled');
+
+    const pending = raceWithAbort(new Promise<never>(() => undefined), controller.signal);
+
+    expect(pending).toBeInstanceOf(Promise);
+    await expect(pending).rejects.toMatchObject({
+      name: 'AbortError',
+      code: 'ABORT_ERR',
+    });
+  });
+
   it('cleans up a child process with a bounded escalation wait', async () => {
     const child = spawn(
       process.execPath,
@@ -86,6 +117,45 @@ describe('local IPC spike test helpers', () => {
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   }, 5_000);
 
+  it('waits for close after exit before cleanup returns', async () => {
+    const child = new HangingChild();
+    child.exitCode = 3;
+    const pending = cleanupChildProcess(child as unknown as ChildProcess, {
+      timeoutMs: 100,
+      forceWaitMs: 10,
+    });
+
+    let settled = false;
+    pending.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    child.emit('close', 3, null);
+    await expect(pending).resolves.toEqual({ code: 3, signal: null });
+    expect(child.signals).toEqual([]);
+  });
+
+  it('bounds post-kill cleanup when close never arrives', async () => {
+    vi.useFakeTimers();
+    const child = new HangingChild();
+    const pending = cleanupChildProcess(child as unknown as ChildProcess, {
+      timeoutMs: 5,
+      forceWaitMs: 10,
+    });
+
+    await vi.advanceTimersByTimeAsync(5);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(pending).resolves.toMatchObject({
+      code: null,
+      signal: 'SIGKILL',
+      timedOut: true,
+    });
+    expect(child.signals).toEqual(['SIGTERM', 'SIGKILL']);
+  });
   it('captures bounded child diagnostics and renders a diagnostic error', async () => {
     const child = spawn(
       process.execPath,
@@ -108,5 +178,7 @@ describe('local IPC spike test helpers', () => {
     expect(error.message).toContain('child failed');
     expect(error.message).toContain('stdout:');
     expect(error.message).toContain('stderr:');
+    expect(error.message).toContain('code: 3');
+    expect(error.message).toContain('signal: null');
   });
 });
