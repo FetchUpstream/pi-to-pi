@@ -9,6 +9,11 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import type { SessionEntry, SessionManager } from '@earendil-works/pi-coding-agent';
 
+export type PiProbeSessionManager = Pick<
+  SessionManager,
+  'getSessionId' | 'getSessionFile' | 'getSessionName'
+>;
+
 export type PiProbeObservationType =
   | 'extension_factory'
   | 'session_start'
@@ -48,6 +53,8 @@ export interface PiProbe {
   readonly factoryLoads: number;
   readonly events: readonly PiProbeObservation[];
   readonly extension: InlineExtension;
+  readonly boundSessionManager: PiProbeSessionManager | undefined;
+  captureSessionManager(sessionManager: PiProbeSessionManager): void;
   recordSessionEvent(event: AgentSessionEvent, sessionManager: SessionManager): void;
   recordError(error: unknown): void;
   clear(): void;
@@ -91,7 +98,7 @@ class Probe implements PiProbe {
   private readonly recorded: PiProbeObservation[] = [];
   private sequence = 0;
   private _factoryLoads = 0;
-
+  private _boundSessionManager: PiProbeSessionManager | undefined;
   readonly extension: InlineExtension = {
     name: 'pi-p2p-test-probe',
     hidden: true,
@@ -108,6 +115,14 @@ class Probe implements PiProbe {
 
   get factoryLoads(): number {
     return this._factoryLoads;
+  }
+
+  get boundSessionManager(): PiProbeSessionManager | undefined {
+    return this._boundSessionManager;
+  }
+
+  captureSessionManager(sessionManager: PiProbeSessionManager): void {
+    this._boundSessionManager = sessionManager;
   }
 
   install(pi: ExtensionAPI): void {
@@ -214,6 +229,7 @@ class Probe implements PiProbe {
   }
 
   recordSessionEvent(event: AgentSessionEvent, sessionManager: SessionManager): void {
+    this.captureSessionManager(sessionManager);
     if (event.type === 'queue_update') {
       this.record({
         type: 'queue_update',
@@ -277,6 +293,7 @@ export function createInlineProbeExtension(probe: PiProbe): InlineExtension {
 
 export async function bindPiProbe(
   session: {
+    readonly sessionManager: SessionManager;
     bindExtensions(bindings: {
       mode?: 'tui' | 'rpc' | 'json' | 'print';
       onError?: (error: {
@@ -289,6 +306,7 @@ export async function bindPiProbe(
   },
   probe: PiProbe,
 ): Promise<void> {
+  probe.captureSessionManager(session.sessionManager);
   await session.bindExtensions({
     mode: 'print',
     onError: (error) => probe.recordError(error),

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { fauxAssistantMessage } from '@earendil-works/pi-ai';
+import { fauxAssistantMessage, type FauxResponseFactory } from '@earendil-works/pi-ai';
 import { SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { describe, expect, it } from 'vitest';
 
@@ -11,7 +11,7 @@ import {
   createPiProbe,
   defaultFauxResponse,
 } from '../fixtures/index.js';
-import type { PiProbe } from '../fixtures/pi-probe.js';
+import type { PiProbe, PiProbeSessionManager } from '../fixtures/pi-probe.js';
 
 interface ResourceObservation {
   kind: 'factory' | 'start' | 'shutdown';
@@ -22,6 +22,7 @@ interface ResourceObservation {
 interface ResourceTracker {
   readonly observations: ResourceObservation[];
   activeSessionIds(): string[];
+  activeSessionManagers(): PiProbeSessionManager[];
   clear(): void;
   forceCleanup(): void;
 }
@@ -32,28 +33,32 @@ function installResourceTracker(probe: PiProbe): ResourceTracker {
     throw new Error('The shared probe must expose an inline extension object');
   }
 
-  const active = new Map<string, ReturnType<typeof setInterval>>();
+  const active = new Map<PiProbeSessionManager, ReturnType<typeof setInterval>>();
   const observations: ResourceObservation[] = [];
-  const snapshot = (): string[] => [...active.keys()];
+  const snapshot = (): string[] =>
+    [...active.keys()].map((sessionManager) => sessionManager.getSessionId());
+  const activeSessionManagers = (): PiProbeSessionManager[] => [...active.keys()];
   const record = (observation: Omit<ResourceObservation, 'activeSessionIds'>): void => {
     observations.push({ ...observation, activeSessionIds: snapshot() });
   };
   const baseFactory = extension.factory;
   const installHandlers = (pi: Parameters<typeof baseFactory>[0]): void => {
     pi.on('session_start', (_event, ctx) => {
-      const sessionId = ctx.sessionManager.getSessionId();
+      const sessionManager = ctx.sessionManager;
+      const sessionId = sessionManager.getSessionId();
       const resource = setInterval(() => undefined, 1_000_000);
       resource.unref();
-      active.set(sessionId, resource);
+      active.set(sessionManager, resource);
       record({ kind: 'start', sessionId });
     });
 
     pi.on('session_shutdown', (_event, ctx) => {
-      const sessionId = ctx.sessionManager.getSessionId();
-      const resource = active.get(sessionId);
+      const sessionManager = ctx.sessionManager;
+      const sessionId = sessionManager.getSessionId();
+      const resource = active.get(sessionManager);
       if (resource) {
         clearInterval(resource);
-        active.delete(sessionId);
+        active.delete(sessionManager);
       }
       record({ kind: 'shutdown', sessionId });
     });
@@ -71,6 +76,7 @@ function installResourceTracker(probe: PiProbe): ResourceTracker {
   return {
     observations,
     activeSessionIds: snapshot,
+    activeSessionManagers,
     clear() {
       observations.length = 0;
     },
@@ -124,6 +130,29 @@ function expectReplacement(
   expect(start?.idle).toBe(true);
 }
 
+function expectResourceReplacement(
+  resources: ResourceTracker,
+  previousSessionManager: PiProbeSessionManager,
+  targetSessionManager: PiProbeSessionManager,
+): void {
+  expect(targetSessionManager).not.toBe(previousSessionManager);
+  expect(resources.observations).toEqual([
+    {
+      kind: 'shutdown',
+      sessionId: previousSessionManager.getSessionId(),
+      activeSessionIds: [],
+    },
+    { kind: 'factory', activeSessionIds: [] },
+    {
+      kind: 'start',
+      sessionId: targetSessionManager.getSessionId(),
+      activeSessionIds: [targetSessionManager.getSessionId()],
+    },
+  ]);
+  expect(resources.activeSessionManagers()).toEqual([targetSessionManager]);
+  expect(resources.activeSessionIds()).toEqual([targetSessionManager.getSessionId()]);
+}
+
 describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
   it('loads side-effect free and owns resources from session start through shutdown', async () => {
     const probe = createPiProbe();
@@ -134,12 +163,14 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
 
     try {
       expect(sessionFile).toBeDefined();
+      expect(probe.boundSessionManager).toBe(fixture.sessionManager);
       expect(observationTypes(probe)).toEqual(['extension_factory', 'session_start']);
       expect(resources.observations).toEqual([
         { kind: 'factory', activeSessionIds: [] },
         { kind: 'start', sessionId, activeSessionIds: [sessionId] },
       ]);
       expect(resources.activeSessionIds()).toEqual([sessionId]);
+      expect(resources.activeSessionManagers()).toEqual([fixture.sessionManager]);
 
       probe.clear();
       resources.clear();
@@ -164,6 +195,7 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
         { kind: 'start', sessionId, activeSessionIds: [sessionId] },
       ]);
       expect(resources.activeSessionIds()).toEqual([sessionId]);
+      expect(resources.activeSessionManagers()).toEqual([fixture.sessionManager]);
 
       probe.clear();
       await fixture.dispose();
@@ -172,6 +204,7 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       expect(probe.latest('session_shutdown')?.sessionId).toBe(sessionId);
       expect(probe.latest('session_shutdown')?.sessionFile).toBe(sessionFile);
       expect(resources.activeSessionIds()).toEqual([]);
+      expect(resources.activeSessionManagers()).toEqual([]);
       expect(resources.observations.at(-1)).toEqual({
         kind: 'shutdown',
         sessionId,
@@ -190,7 +223,8 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       defaultThinkingLevel: 'off',
     });
     const fixture = await createPersistedPiSessionFixture({ settingsManager });
-
+    const requestId = 'retry-request';
+    const requestStates = new Map<string, 'accepted' | 'completed'>([[requestId, 'accepted']]);
     try {
       fixture.probe.clear();
       fixture.faux.setResponses([
@@ -206,7 +240,7 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
           customType: 'p2p.retry-probe',
           content: 'request body',
           display: false,
-          details: { requestId: 'retry-request' },
+          details: { requestId },
         },
         { triggerTurn: true },
       );
@@ -240,23 +274,100 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       expect(firstEnd?.sequence).toBeLessThan(settled?.sequence ?? -1);
       expect(secondEnd?.sequence).toBeLessThan(settled?.sequence ?? -1);
 
-      let requestSettled = false;
       for (const observation of lifecycle) {
         if (observation.type === 'agent_end') {
-          expect(requestSettled).toBe(false);
+          expect(requestStates.get(requestId)).toBe('accepted');
         }
         if (observation.type === 'agent_settled') {
-          requestSettled = true;
+          expect(requestStates.get(requestId)).toBe('accepted');
+          requestStates.set(requestId, 'completed');
         }
       }
-      expect(requestSettled).toBe(true);
+      expect(requestStates.get(requestId)).toBe('completed');
     } finally {
       await fixture.dispose();
     }
   });
 
+  it('does not migrate actual queued messages into a replacement session', async () => {
+    const abortResponse: FauxResponseFactory = (_context, options) =>
+      new Promise((resolve) => {
+        const finish = () => resolve(fauxAssistantMessage('aborted', { stopReason: 'aborted' }));
+        if (options?.signal?.aborted) {
+          finish();
+        } else {
+          options?.signal?.addEventListener('abort', finish, { once: true });
+        }
+      });
+    const fixture = await createPersistedPiSessionFixture({ responses: [abortResponse] });
+    let prompt: Promise<void> | undefined;
+
+    try {
+      prompt = fixture.session.prompt('active prompt');
+      for (let attempt = 0; attempt < 100 && !fixture.session.isStreaming; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      expect(fixture.session.isStreaming).toBe(true);
+      await fixture.session.sendCustomMessage(
+        {
+          customType: 'p2p.queued-probe',
+          content: 'queued steering request',
+          display: false,
+          details: { requestId: 'queued-steer' },
+        },
+        { deliverAs: 'steer' },
+      );
+      await fixture.session.sendCustomMessage(
+        {
+          customType: 'p2p.queued-probe',
+          content: 'queued follow-up request',
+          display: false,
+          details: { requestId: 'queued-follow-up' },
+        },
+        { deliverAs: 'followUp' },
+      );
+      expect(fixture.session.agent.hasQueuedMessages()).toBe(true);
+      expect(fixture.probe.byType('custom_message_start')).toHaveLength(0);
+
+      const previousSessionManager = fixture.sessionManager;
+      const previousSessionFile = fixture.sessionFile;
+      await fixture.newSession();
+      const shutdown = fixture.probe.latest('session_shutdown');
+      const start = fixture.probe.latest('session_start');
+      expect(shutdown?.reason).toBe('new');
+      expect(start?.reason).toBe('new');
+      expect(start?.previousSessionFile).toBe(previousSessionFile);
+      expect(fixture.sessionManager).not.toBe(previousSessionManager);
+      expect(fixture.session.agent.hasQueuedMessages()).toBe(false);
+      const outgoingCustomEntries = previousSessionManager
+        .getEntries()
+        .filter((entry) => entry.type === 'custom_message');
+      expect(outgoingCustomEntries).toHaveLength(2);
+      expect(outgoingCustomEntries.map((entry) => entry.details)).toEqual([
+        { requestId: 'queued-steer' },
+        { requestId: 'queued-follow-up' },
+      ]);
+      expect(
+        fixture.session.state.messages.filter((message) => message.role === 'custom'),
+      ).toHaveLength(0);
+      expect(fixture.entries.filter((entry) => entry.type === 'custom_message')).toHaveLength(0);
+
+      const replacementSequence = start?.sequence ?? Number.MAX_SAFE_INTEGER;
+      expect(
+        fixture.probe
+          .byType('custom_message_start')
+          .filter((observation) => observation.sequence > replacementSequence),
+      ).toHaveLength(0);
+    } finally {
+      await prompt?.catch(() => undefined);
+      await fixture.dispose();
+    }
+  });
+
   it('orders reload and new/resume/fork/clone replacement with exact session fields', async () => {
-    const fixture = await createPersistedPiSessionFixture();
+    const probe = createPiProbe();
+    const resources = installResourceTracker(probe);
+    const fixture = await createPersistedPiSessionFixture({ probe });
 
     try {
       fixture.session.setSessionName('source session');
@@ -264,6 +375,9 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       await fixture.session.prompt('seed prompt');
       const sourceSessionId = fixture.sessionId;
       const sourceSessionFile = fixture.sessionFile;
+      const sourceSessionManager = fixture.sessionManager;
+      expect(probe.boundSessionManager).toBe(sourceSessionManager);
+      expect(resources.activeSessionManagers()).toEqual([sourceSessionManager]);
       const userEntry = fixture.entries.find(
         (entry) => entry.type === 'message' && entry.message.role === 'user',
       );
@@ -271,6 +385,7 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       expect(userEntry).toBeDefined();
 
       fixture.probe.clear();
+      resources.clear();
       await fixture.reloadSession();
       expect(observationTypes(fixture.probe)).toEqual([
         'session_shutdown',
@@ -289,11 +404,20 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       expect(fixture.probe.observations[2]?.previousSessionFile).toBeUndefined();
       expect(fixture.sessionId).toBe(sourceSessionId);
       expect(fixture.sessionFile).toBe(sourceSessionFile);
+      expect(probe.boundSessionManager).toBe(sourceSessionManager);
+      expect(resources.activeSessionManagers()).toEqual([sourceSessionManager]);
+      expect(resources.observations).toEqual([
+        { kind: 'shutdown', sessionId: sourceSessionId, activeSessionIds: [] },
+        { kind: 'factory', activeSessionIds: [] },
+        { kind: 'start', sessionId: sourceSessionId, activeSessionIds: [sourceSessionId] },
+      ]);
 
       fixture.probe.clear();
+      resources.clear();
       await fixture.newSession();
       const newSessionId = fixture.sessionId;
       const newSessionFile = fixture.sessionFile;
+      const newSessionManager = fixture.sessionManager;
       expect(newSessionFile).toBeDefined();
       expect(newSessionFile).not.toBe(sourceSessionFile);
       expect(newSessionId).not.toBe(sourceSessionId);
@@ -306,9 +430,13 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
         targetSessionFile: newSessionFile!,
         targetSessionName: undefined,
       });
+      expect(probe.boundSessionManager).toBe(newSessionManager);
+      expectResourceReplacement(resources, sourceSessionManager, newSessionManager);
 
       fixture.probe.clear();
+      resources.clear();
       await fixture.resumeSession(sourceSessionFile!);
+      const resumedSessionManager = fixture.sessionManager;
       expectReplacement(fixture.probe, {
         reason: 'resume',
         previousSessionId: newSessionId,
@@ -318,11 +446,15 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
         targetSessionFile: sourceSessionFile!,
         targetSessionName: 'source session',
       });
+      expect(probe.boundSessionManager).toBe(resumedSessionManager);
+      expectResourceReplacement(resources, newSessionManager, resumedSessionManager);
 
       fixture.probe.clear();
+      resources.clear();
       await fixture.forkSession(userEntry!.id, { position: 'before' });
       const forkSessionId = fixture.sessionId;
       const forkSessionFile = fixture.sessionFile;
+      const forkSessionManager = fixture.sessionManager;
       expect(forkSessionFile).toBeDefined();
       expect(forkSessionFile).not.toBe(sourceSessionFile);
       expect(forkSessionId).not.toBe(sourceSessionId);
@@ -335,8 +467,12 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
         targetSessionFile: forkSessionFile!,
         targetSessionName: 'source session',
       });
+      expect(probe.boundSessionManager).toBe(forkSessionManager);
+      expectResourceReplacement(resources, resumedSessionManager, forkSessionManager);
       fixture.probe.clear();
+      resources.clear();
       await fixture.resumeSession(sourceSessionFile!);
+      const sourceAgainSessionManager = fixture.sessionManager;
       expectReplacement(fixture.probe, {
         reason: 'resume',
         previousSessionId: forkSessionId,
@@ -346,12 +482,16 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
         targetSessionFile: sourceSessionFile!,
         targetSessionName: 'source session',
       });
+      expect(probe.boundSessionManager).toBe(sourceAgainSessionManager);
+      expectResourceReplacement(resources, forkSessionManager, sourceAgainSessionManager);
       const cloneEntry = fixture.entries.find((entry) => entry.type === 'message');
       expect(cloneEntry).toBeDefined();
       fixture.probe.clear();
+      resources.clear();
       await fixture.forkSession(cloneEntry!.id, { position: 'at' });
       const cloneSessionId = fixture.sessionId;
       const cloneSessionFile = fixture.sessionFile;
+      const cloneSessionManager = fixture.sessionManager;
       expect(cloneSessionFile).toBeDefined();
       expect(cloneSessionFile).not.toBe(sourceSessionFile);
       expect(cloneSessionId).not.toBe(sourceSessionId);
@@ -365,8 +505,11 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
         targetSessionFile: cloneSessionFile!,
         targetSessionName: 'source session',
       });
+      expect(probe.boundSessionManager).toBe(cloneSessionManager);
+      expectResourceReplacement(resources, sourceAgainSessionManager, cloneSessionManager);
     } finally {
       await fixture.dispose();
+      resources.forceCleanup();
     }
   });
 
@@ -393,6 +536,7 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       const startup = probe.latest('session_start');
       expect(startup?.sessionId).toBe(sessionManager.getSessionId());
       expect(startup?.sessionFile).toBe(sessionManager.getSessionFile());
+      expect(probe.boundSessionManager).toBe(sessionManager);
       expect(startup?.sessionName).toBe('bootstrapped name');
       expect(probe.byType('session_info_changed')).toHaveLength(0);
 
@@ -406,6 +550,15 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       expect(fixture.sessionManager.getSessionName()).toBe('renamed name');
 
       probe.clear();
+      fixture.session.setSessionName('');
+      expect(observationTypes(probe)).toEqual(['session_info_changed']);
+      const cleared = probe.latest('session_info_changed');
+      expect(cleared?.sessionId).toBe(sessionManager.getSessionId());
+      expect(cleared?.sessionFile).toBe(sessionManager.getSessionFile());
+      expect(cleared?.sessionName).toBeUndefined();
+      expect(fixture.sessionManager.getSessionName()).toBeUndefined();
+
+      probe.clear();
       await fixture.reloadSession();
       expect(observationTypes(probe)).toEqual([
         'session_shutdown',
@@ -414,7 +567,7 @@ describe('Pi session lifecycle contract (tasks 2.1-2.4)', () => {
       ]);
       expect(probe.latest('session_start')?.sessionId).toBe(sessionManager.getSessionId());
       expect(probe.latest('session_start')?.sessionFile).toBe(sessionManager.getSessionFile());
-      expect(probe.latest('session_start')?.sessionName).toBe('renamed name');
+      expect(probe.latest('session_start')?.sessionName).toBeUndefined();
       expect(probe.latest('session_start')?.reason).toBe('reload');
     } finally {
       await fixture.dispose().catch(() => undefined);
