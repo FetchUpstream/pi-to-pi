@@ -1,10 +1,10 @@
 ## 1. Protocol foundations
 
-- [ ] 1.1 Define v1 operation names, envelope types, UUIDv4 identifiers, timestamps, trace fields, typed content, and operation-response unions in `src/protocol/messages.ts`.
-- [ ] 1.2 Define task states, terminal outcomes, legal transitions, task snapshots, and cancellation state in `src/protocol/task-state.ts`.
-- [ ] 1.3 Define the stable error-code taxonomy, structured error payloads, retryability, and retry-delay metadata in `src/protocol/errors.ts`.
-- [ ] 1.4 Define Agent Card, operation capability, content capability, and v1 limit types in `src/protocol/agent-card.ts`.
-- [ ] 1.5 Add protocol defaults and configurable limits for 10-minute request TTL, one-hour request maximum, 30-second control operations, 1 MiB envelopes, 64 KiB schemas, and a 32-entry queue.
+- [x] 1.1 Define v1 operation names, envelope types, UUIDv4 identifiers, timestamps, trace fields, typed content, and operation-response unions in `src/protocol/messages.ts`.
+- [x] 1.2 Define task states, terminal outcomes, legal transitions, task snapshots, and cancellation state in `src/protocol/task-state.ts`.
+- [x] 1.3 Define the stable error-code taxonomy, structured error payloads, retryability, and retry-delay metadata in `src/protocol/errors.ts`.
+- [x] 1.4 Define Agent Card, operation capability, content capability, and v1 limit types in `src/protocol/agent-card.ts`.
+- [x] 1.5 Add protocol defaults and configurable limits for 10-minute request TTL, one-hour request maximum, 30-second control operations, 1 MiB envelopes, 64 KiB schemas, and a 32-entry queue.
 
 ## 2. Validation and fingerprints
 
@@ -15,8 +15,8 @@
 
 ## 3. Identity, room, and discovery contracts
 
-- [ ] 3.1 Implement session/runtime identity creation and lifecycle rules, including stable session IDs and per-runtime IDs, in `src/identity.ts`.
-- [ ] 3.2 Implement exact room identity derivation and comparison in `src/room.ts`.
+- [x] 3.1 Implement session/runtime identity creation and lifecycle rules, including stable session IDs and per-runtime IDs, in `src/identity.ts`.
+- [x] 3.2 Implement exact room identity derivation and comparison in `src/room.ts`.
 - [ ] 3.3 Extend discovery registry and lease contracts to advertise runtime identity, Agent Card capabilities, protocol versions, limits, and current routing endpoint.
 - [ ] 3.4 Implement binding-authenticated sender verification, recipient targeting, room checks, and safe `unauthorized`/`cross_room` behavior.
 
@@ -30,7 +30,7 @@
 
 ## 5. Operation routing
 
-- [ ] 5.1 Define the transport adapter contract for sending envelopes and operation responses without selecting or changing a framing protocol.
+- [x] 5.1 Define the transport adapter contract for sending envelopes and operation responses without selecting or changing a framing protocol.
 - [ ] 5.2 Implement the router admission pipeline in `src/router/router.ts`: authenticate, validate destination and room, enforce expiry and limits, check deduplication, admit/queue, and return correlated responses.
 - [ ] 5.3 Implement `peer.describe` with Agent Card, versions, operations, capabilities, and effective limits.
 - [ ] 5.4 Implement `message.request` admission and asynchronous task dispatch without inferring completion from Pi lifecycle events.
@@ -49,7 +49,7 @@
 ## 7. Conformance and integration tests
 
 - [ ] 7.1 Add unit tests for envelope, operation-specific ID, timestamp, trace, content, schema, version, limit, and error validation.
-- [ ] 7.2 Add task-store tests covering every legal transition, terminal immutability, expiry, queued cancellation, working cancellation, and completion/cancellation races.
+- [x] 7.2 Add task-store tests covering every legal transition, terminal immutability, expiry, queued cancellation, working cancellation, and completion/cancellation races.
 - [ ] 7.3 Add deduplication tests for identical retries, conflicting fingerprints, duplicate replies, busy retries, retention, and runtime restart boundaries.
 - [ ] 7.4 Add routing tests for peer discovery, request/reply correlation, notifications, status, cancellation, room isolation, authentication, and all core error codes.
 - [ ] 7.5 Add two-runtime integration tests using a fake transport for accepted, queued, completed, failed, rejected, cancelled, expired, oversized, and unreachable flows.
