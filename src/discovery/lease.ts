@@ -191,15 +191,15 @@ function cloneOwnerIdentity(value: LeaseOwnerIdentity): LeaseOwnerIdentity {
 }
 
 function cloneEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): RoutingEndpoint {
-  validateEndpoint(endpoint, runtimeId);
-  if (typeof endpoint === 'string') {
-    return endpoint;
+  const normalized = validateEndpoint(endpoint, runtimeId);
+  if (typeof normalized === 'string') {
+    return normalized;
   }
   return Object.freeze({
-    address: endpoint.address,
-    ...(endpoint.kind === undefined ? {} : { kind: endpoint.kind }),
-    ...(endpoint.transport === undefined ? {} : { transport: endpoint.transport }),
-    ...(endpoint.runtimeId === undefined ? {} : { runtimeId: endpoint.runtimeId }),
+    address: normalized.address,
+    ...(normalized.kind === undefined ? {} : { kind: normalized.kind }),
+    ...(normalized.transport === undefined ? {} : { transport: normalized.transport }),
+    ...(normalized.runtimeId === undefined ? {} : { runtimeId: normalized.runtimeId }),
   });
 }
 
@@ -211,6 +211,7 @@ function isRenewalResult(value: unknown): value is LeaseRenewalResult {
 
 interface SnapshotBudget {
   nodes: number;
+  keys: number;
 }
 
 /** Clone lease diagnostics into bounded, JSON-like immutable data. */
@@ -218,7 +219,7 @@ function sanitizeSnapshotValue(
   value: unknown,
   depth = 0,
   seen = new Set<object>(),
-  budget: SnapshotBudget = { nodes: 0 },
+  budget: SnapshotBudget = { nodes: 0, keys: 0 },
 ): unknown {
   if (value === null || value === undefined) {
     return value;
@@ -272,15 +273,30 @@ function sanitizeSnapshotValue(
       return `[${Object.prototype.toString.call(value)}]`;
     }
     const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    const keys = Object.keys(value);
-    for (const key of keys.slice(0, MAX_SNAPSHOT_ENTRIES)) {
+    let inspectedKeys = 0;
+    let truncated = false;
+    for (const key in value) {
+      inspectedKeys += 1;
+      if (inspectedKeys > MAX_SNAPSHOT_ENTRIES) {
+        truncated = true;
+        break;
+      }
+      if (!Object.prototype.hasOwnProperty.call(value, key)) {
+        continue;
+      }
+      if (budget.keys >= MAX_SNAPSHOT_ENTRIES) {
+        truncated = true;
+        break;
+      }
+      budget.keys += 1;
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (descriptor === undefined || !('value' in descriptor)) {
+        copy[key] = '[accessor]';
         continue;
       }
       copy[key] = sanitizeSnapshotValue(descriptor.value, depth + 1, seen, budget);
     }
-    if (keys.length > MAX_SNAPSHOT_ENTRIES) {
+    if (truncated) {
       copy['[truncated]'] = true;
     }
     return Object.freeze(copy);
@@ -362,7 +378,23 @@ export class SerializedLease {
 
   /** Start one owner renewal; overlapping calls share the in-flight attempt. */
   public renew(): Promise<void> {
+    if (this.state === 'stopped') {
+      return Promise.reject(new LeaseStoppedError());
+    }
+    if (this.state === 'expired') {
+      return Promise.reject(new LeaseExpiredError());
+    }
     if (this.inFlightRenewal !== undefined) {
+      if (this.expiresAt !== null) {
+        try {
+          if (clockValue(this.now) >= this.expiresAt) {
+            this.markExpired();
+            return Promise.reject(new LeaseExpiredError());
+          }
+        } catch (error: unknown) {
+          return Promise.reject(error);
+        }
+      }
       return this.inFlightRenewal;
     }
     const operation = Promise.resolve().then(async () => {
@@ -377,6 +409,10 @@ export class SerializedLease {
         this.markExpired();
         throw new LeaseExpiredError();
       }
+      // Reserve a local deadline before invoking an owner callback.  This
+      // provisional deadline is replaced after a successful renewal and lets
+      // the timer expire a lease even when the first callback never settles.
+      this.expiresAt ??= now + this.ttlMs;
 
       const result = await this.renewal();
 
@@ -488,15 +524,32 @@ export class SerializedLease {
       return this.startPromise;
     }
 
+    const startedAt = clockValue(this.now);
+    // Establish an independent local deadline before the initial callback is
+    // invoked.  A hung callback must not leave this lease immortal.
+    this.expiresAt ??= startedAt + this.ttlMs;
     this.state = 'active';
     this.timer = this.scheduler.setInterval(
       () => {
+        if (this.state !== 'active') {
+          return;
+        }
+        try {
+          if (this.expiresAt !== null && clockValue(this.now) >= this.expiresAt) {
+            this.markExpired();
+            return;
+          }
+        } catch (error: unknown) {
+          this.lastError = error;
+          this.onError?.(error);
+          return;
+        }
         void this.renew().catch((error: unknown) => {
           this.lastError = error;
           this.onError?.(error);
         });
       },
-      Math.min(this.renewalIntervalMs, MAX_LEASE_TIMER_DELAY_MS),
+      Math.min(this.renewalIntervalMs, this.ttlMs, MAX_LEASE_TIMER_DELAY_MS),
     );
     const timer = this.timer as LeaseTimer & { unref?: () => void };
     timer.unref?.();
@@ -680,7 +733,7 @@ function isIdentity(value: unknown): value is SessionRuntimeIdentity {
 
 const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
 
-function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): void {
+function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): RoutingEndpoint {
   if (typeof endpoint === 'string') {
     if (
       endpoint.trim().length === 0 ||
@@ -690,7 +743,7 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
     ) {
       throw new LeaseConfigurationError('routing endpoint must be bounded non-empty text');
     }
-    return;
+    return endpoint;
   }
   if (typeof endpoint !== 'object' || endpoint === null || Array.isArray(endpoint)) {
     throw new LeaseConfigurationError('routing endpoint must be an opaque string or descriptor');
@@ -699,13 +752,23 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
   if (prototype !== Object.prototype && prototype !== null) {
     throw new LeaseConfigurationError('routing endpoint descriptor must be a plain object');
   }
-  const keys = Reflect.ownKeys(endpoint);
-  if (keys.length > MAX_ENDPOINT_KEYS) {
-    throw new LeaseConfigurationError('routing endpoint descriptor has too many fields');
-  }
-  for (const key of keys) {
-    if (typeof key !== 'string') {
-      throw new LeaseConfigurationError('routing endpoint descriptor cannot contain symbols');
+  let keyCount = 0;
+  let inspectedKeys = 0;
+  for (const key in endpoint) {
+    inspectedKeys += 1;
+    if (inspectedKeys > MAX_ENDPOINT_KEYS) {
+      throw new LeaseConfigurationError('routing endpoint descriptor has too many fields');
+    }
+    if (!Object.prototype.hasOwnProperty.call(endpoint, key)) {
+      continue;
+    }
+    keyCount += 1;
+    if (keyCount > MAX_ENDPOINT_KEYS) {
+      throw new LeaseConfigurationError('routing endpoint descriptor has too many fields');
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
+      throw new LeaseConfigurationError('routing endpoint descriptor cannot contain accessors');
     }
     if (!['address', 'kind', 'transport', 'runtimeId'].includes(key)) {
       throw new LeaseConfigurationError(
@@ -714,12 +777,19 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
           : 'routing endpoint contains an unknown field',
       );
     }
-    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
-    if (descriptor === undefined || !('value' in descriptor)) {
-      throw new LeaseConfigurationError('routing endpoint descriptor cannot contain accessors');
-    }
   }
-  const ownValue = (key: string): unknown => Object.getOwnPropertyDescriptor(endpoint, key)?.value;
+  const ownValue = (key: string): unknown => {
+    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    if (descriptor === undefined) {
+      return undefined;
+    }
+    if (!('value' in descriptor) || !descriptor.enumerable) {
+      throw new LeaseConfigurationError(
+        'routing endpoint descriptor cannot contain accessors or hidden fields',
+      );
+    }
+    return descriptor.value;
+  };
   const address = ownValue('address');
   if (
     typeof address !== 'string' ||
@@ -764,20 +834,22 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
       throw new LeaseConfigurationError('routing endpoint is not owned by the lease runtime');
     }
   }
+  const normalized: RoutingEndpointDescriptor = {
+    address,
+    ...(kind === undefined ? {} : { kind }),
+    ...(transport === undefined ? {} : { transport }),
+    ...(endpointRuntimeId === undefined ? {} : { runtimeId: endpointRuntimeId }),
+  };
   let serialized: string | undefined;
   try {
-    serialized = JSON.stringify({
-      address,
-      ...(kind === undefined ? {} : { kind }),
-      ...(transport === undefined ? {} : { transport }),
-      ...(endpointRuntimeId === undefined ? {} : { runtimeId: endpointRuntimeId }),
-    });
+    serialized = JSON.stringify(normalized);
   } catch {
     throw new LeaseConfigurationError('routing endpoint is not JSON serializable');
   }
   if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > MAX_ENDPOINT_BYTES) {
     throw new LeaseConfigurationError('routing endpoint exceeds its size limit');
   }
+  return normalized;
 }
 /** Options for calculating or renewing a lease expiry. */
 export interface LeaseExpiryOptions {

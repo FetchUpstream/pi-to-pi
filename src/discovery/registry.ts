@@ -48,6 +48,7 @@ import {
   type LeaseScheduler,
   type LeaseSnapshot,
   type RoutingEndpoint,
+  type RoutingEndpointDescriptor,
   type SerializedLease,
   type SerializedLeaseOptions,
 } from './lease.js';
@@ -167,7 +168,7 @@ export type AgentCardSource =
   | (() => AgentCardPublication | AgentCard | PromiseLike<AgentCardPublication | AgentCard>);
 
 export type RegistryErrorCode =
-  'malformed' | 'expired' | 'cross_room' | 'duplicate' | 'unauthorized' | 'not_found';
+  'malformed' | 'expired' | 'cross_room' | 'duplicate' | 'unauthorized' | 'not_found' | 'busy';
 
 export class AgentCardRegistryError extends Error {
   public readonly code: RegistryErrorCode;
@@ -261,16 +262,16 @@ export function createAuthenticatedOperation<Envelope extends ProtocolEnvelope>(
   envelope: Envelope,
   bindingMetadata?: BindingMetadata,
 ): AuthenticatedOperation<Envelope> {
-  const validatedEnvelope = validateAuthenticatedEnvelope(envelope);
+  const envelopeSnapshot = cloneFrozenSnapshot(envelope);
+  const validatedEnvelope = validateAuthenticatedEnvelope(envelopeSnapshot);
   if (bindingMetadata !== undefined && !isRecord(bindingMetadata)) {
     throw new AgentCardRegistryError('malformed', 'binding metadata must be an object');
   }
-  const envelopeSnapshot = cloneFrozenSnapshot(validatedEnvelope);
   const metadataSnapshot =
     bindingMetadata === undefined ? undefined : cloneFrozenSnapshot(bindingMetadata);
   const wrapper = Object.freeze({
     [AUTHENTICATED_OPERATION_BRAND]: true as const,
-    envelope: envelopeSnapshot,
+    envelope: validatedEnvelope,
     ...(metadataSnapshot === undefined ? {} : { bindingMetadata: metadataSnapshot }),
   });
   trustedAuthenticatedOperations.add(wrapper);
@@ -368,59 +369,188 @@ function validateAuthenticatedEnvelope(value: unknown): ProtocolEnvelope {
   }
   return result.value;
 }
+const MAX_AUTHENTICATED_SNAPSHOT_DEPTH = 32;
+const MAX_AUTHENTICATED_SNAPSHOT_NODES = 4_096;
+const MAX_AUTHENTICATED_SNAPSHOT_KEYS = 256;
+const MAX_AUTHENTICATED_SNAPSHOT_BYTES = 64 * 1024;
 
-/** Clone and recursively freeze values crossing the authenticated binding boundary. */
-function cloneFrozenSnapshot<T>(value: T, seen = new Map<object, unknown>()): T {
-  if (value === null || typeof value !== 'object') {
-    if (typeof value === 'function') {
-      throw new AgentCardRegistryError(
-        'malformed',
-        'authenticated snapshot cannot contain functions',
-      );
+interface AuthenticatedSnapshotBudget {
+  nodes: number;
+  keys: number;
+  bytes: number;
+}
+
+function authenticatedSnapshotError(message: string): never {
+  throw new AgentCardRegistryError('malformed', message);
+}
+
+function addSnapshotBytes(budget: AuthenticatedSnapshotBudget, bytes: number): void {
+  if (
+    !Number.isSafeInteger(bytes) ||
+    bytes < 0 ||
+    budget.bytes > MAX_AUTHENTICATED_SNAPSHOT_BYTES - bytes
+  ) {
+    authenticatedSnapshotError('authenticated snapshot exceeds its byte budget');
+  }
+  budget.bytes += bytes;
+}
+
+function snapshotJsonBytes(value: unknown): number {
+  if (typeof value === 'string') {
+    if (Buffer.byteLength(value, 'utf8') > MAX_AUTHENTICATED_SNAPSHOT_BYTES) {
+      authenticatedSnapshotError('authenticated snapshot exceeds its byte budget');
     }
+  }
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    authenticatedSnapshotError('authenticated snapshot contains an unserializable value');
+  }
+  if (serialized === undefined) {
+    authenticatedSnapshotError('authenticated snapshot contains an unserializable value');
+  }
+  return Buffer.byteLength(serialized, 'utf8');
+}
+
+/** Clone and recursively freeze bounded canonical data at the binding boundary. */
+function cloneFrozenSnapshot<T>(
+  value: T,
+  budget: AuthenticatedSnapshotBudget = { nodes: 0, keys: 0, bytes: 0 },
+  depth = 0,
+  active = new Set<object>(),
+): T {
+  if (depth > MAX_AUTHENTICATED_SNAPSHOT_DEPTH) {
+    authenticatedSnapshotError('authenticated snapshot exceeds its depth budget');
+  }
+  budget.nodes += 1;
+  if (budget.nodes > MAX_AUTHENTICATED_SNAPSHOT_NODES) {
+    authenticatedSnapshotError('authenticated snapshot exceeds its node budget');
+  }
+  if (value === null) {
+    addSnapshotBytes(budget, 4);
     return value;
   }
-  const existing = seen.get(value);
-  if (existing !== undefined) {
-    return existing as T;
+  if (value === undefined) {
+    return value;
   }
-  if (Array.isArray(value)) {
-    if (Object.getOwnPropertySymbols(value).length > 0) {
-      throw new AgentCardRegistryError(
-        'malformed',
-        'authenticated snapshot cannot contain symbols',
-      );
+  if (typeof value === 'string') {
+    addSnapshotBytes(budget, snapshotJsonBytes(value));
+    return value;
+  }
+  if (typeof value === 'boolean') {
+    addSnapshotBytes(budget, value ? 4 : 5);
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      authenticatedSnapshotError('authenticated snapshot contains a non-finite number');
     }
-    const copy: unknown[] = [];
-    seen.set(value, copy);
-    for (const entry of value) {
-      copy.push(cloneFrozenSnapshot(entry, seen));
+    addSnapshotBytes(budget, snapshotJsonBytes(value));
+    return value;
+  }
+  if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint') {
+    authenticatedSnapshotError('authenticated snapshot contains an unsupported value');
+  }
+  if (typeof value !== 'object') {
+    authenticatedSnapshotError('authenticated snapshot contains an unsupported value');
+  }
+  if (active.has(value)) {
+    authenticatedSnapshotError('authenticated snapshot cannot contain cycles');
+  }
+  active.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+        authenticatedSnapshotError('authenticated snapshot array exceeds its key budget');
+      }
+      const copy: unknown[] = [];
+      addSnapshotBytes(budget, 2);
+      for (let index = 0; index < value.length; index += 1) {
+        budget.keys += 1;
+        if (budget.keys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+          authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
+        }
+        if (index > 0) {
+          addSnapshotBytes(budget, 1);
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined) {
+          addSnapshotBytes(budget, 4);
+          copy.push(null);
+          continue;
+        }
+        if (!('value' in descriptor) || !descriptor.enumerable) {
+          authenticatedSnapshotError(
+            'authenticated snapshot cannot contain accessors or hidden data',
+          );
+        }
+        const child = cloneFrozenSnapshot(descriptor.value, budget, depth + 1, active);
+        copy.push(child === undefined ? null : child);
+      }
+      let inspectedKeys = 0;
+      for (const key in value) {
+        inspectedKeys += 1;
+        if (inspectedKeys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+          authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
+        }
+        if (!Object.prototype.hasOwnProperty.call(value, key)) {
+          continue;
+        }
+        const numericKey = Number(key);
+        if (
+          !Number.isSafeInteger(numericKey) ||
+          numericKey < 0 ||
+          String(numericKey) !== key ||
+          numericKey >= value.length
+        ) {
+          authenticatedSnapshotError('authenticated snapshot arrays cannot contain extra fields');
+        }
+      }
+      addSnapshotBytes(budget, 1);
+      return Object.freeze(copy) as T;
     }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      authenticatedSnapshotError('authenticated snapshot must contain plain objects');
+    }
+    const copy = Object.create(null) as Record<string, unknown>;
+    addSnapshotBytes(budget, 1);
+    let first = true;
+    let inspectedKeys = 0;
+    for (const key in value) {
+      inspectedKeys += 1;
+      if (inspectedKeys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+        authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
+      }
+      if (!Object.prototype.hasOwnProperty.call(value, key)) {
+        continue;
+      }
+      budget.keys += 1;
+      if (budget.keys > MAX_AUTHENTICATED_SNAPSHOT_KEYS) {
+        authenticatedSnapshotError('authenticated snapshot exceeds its key budget');
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
+        authenticatedSnapshotError(
+          'authenticated snapshot cannot contain accessors or hidden data',
+        );
+      }
+      if (!first) {
+        addSnapshotBytes(budget, 1);
+      }
+      first = false;
+      addSnapshotBytes(budget, snapshotJsonBytes(key) + 1);
+      const child = cloneFrozenSnapshot(descriptor.value, budget, depth + 1, active);
+      if (child !== undefined) {
+        copy[key] = child;
+      }
+    }
+    addSnapshotBytes(budget, 1);
     return Object.freeze(copy) as T;
+  } finally {
+    active.delete(value);
   }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new AgentCardRegistryError(
-      'malformed',
-      'authenticated snapshot must contain plain objects',
-    );
-  }
-  if (Object.getOwnPropertySymbols(value).length > 0) {
-    throw new AgentCardRegistryError('malformed', 'authenticated snapshot cannot contain symbols');
-  }
-  const copy = Object.create(null) as Record<string, unknown>;
-  seen.set(value, copy);
-  for (const key of Object.getOwnPropertyNames(value)) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !('value' in descriptor)) {
-      throw new AgentCardRegistryError(
-        'malformed',
-        'authenticated snapshot cannot contain accessors',
-      );
-    }
-    copy[key] = cloneFrozenSnapshot(descriptor.value, seen);
-  }
-  return Object.freeze(copy) as T;
 }
 
 function nonEmptyText(value: unknown, label: string, maxLength = MAX_NAME_LENGTH): string {
@@ -564,26 +694,16 @@ function isoTimestamp(value: number): UtcTimestamp {
 }
 
 function cloneEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): RoutingEndpoint {
-  validateEndpoint(endpoint, runtimeId);
-  if (typeof endpoint === 'string') {
-    return endpoint;
+  const normalized = validateEndpoint(endpoint, runtimeId);
+  if (typeof normalized === 'string') {
+    return normalized;
   }
-  const copy: {
-    address: string;
-    kind?: string;
-    transport?: string;
-    runtimeId?: RuntimeId;
-  } = { address: endpoint.address };
-  if (endpoint.kind !== undefined) {
-    copy.kind = endpoint.kind;
-  }
-  if (endpoint.transport !== undefined) {
-    copy.transport = endpoint.transport;
-  }
-  if (endpoint.runtimeId !== undefined) {
-    copy.runtimeId = endpoint.runtimeId;
-  }
-  return Object.freeze(copy);
+  return Object.freeze({
+    address: normalized.address,
+    ...(normalized.kind === undefined ? {} : { kind: normalized.kind }),
+    ...(normalized.transport === undefined ? {} : { transport: normalized.transport }),
+    ...(normalized.runtimeId === undefined ? {} : { runtimeId: normalized.runtimeId }),
+  });
 }
 
 function endpointsEqual(left: RoutingEndpoint, right: RoutingEndpoint): boolean {
@@ -598,7 +718,7 @@ function endpointsEqual(left: RoutingEndpoint, right: RoutingEndpoint): boolean 
   );
 }
 
-function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): void {
+function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): RoutingEndpoint {
   if (typeof endpoint === 'string') {
     if (
       endpoint.trim().length === 0 ||
@@ -611,7 +731,7 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
         'routing endpoint must be bounded non-empty text',
       );
     }
-    return;
+    return endpoint;
   }
   if (!isRecord(endpoint)) {
     throw new AgentCardRegistryError('malformed', 'routing endpoint must be an opaque descriptor');
@@ -623,18 +743,31 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
       'routing endpoint descriptor must be a plain object',
     );
   }
-  const keys = Reflect.ownKeys(endpoint);
-  if (keys.length > MAX_ENDPOINT_KEYS) {
-    throw new AgentCardRegistryError(
-      'malformed',
-      'routing endpoint descriptor has too many fields',
-    );
-  }
-  for (const key of keys) {
-    if (typeof key !== 'string') {
+  let keyCount = 0;
+  let inspectedKeys = 0;
+  for (const key in endpoint) {
+    inspectedKeys += 1;
+    if (inspectedKeys > MAX_ENDPOINT_KEYS) {
       throw new AgentCardRegistryError(
         'malformed',
-        'routing endpoint descriptor cannot contain symbols',
+        'routing endpoint descriptor has too many fields',
+      );
+    }
+    if (!Object.prototype.hasOwnProperty.call(endpoint, key)) {
+      continue;
+    }
+    keyCount += 1;
+    if (keyCount > MAX_ENDPOINT_KEYS) {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'routing endpoint descriptor has too many fields',
+      );
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'routing endpoint descriptor cannot contain accessors',
       );
     }
     if (!['address', 'kind', 'transport', 'runtimeId'].includes(key)) {
@@ -645,15 +778,20 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
           : 'routing endpoint contains an unknown field',
       );
     }
+  }
+  const ownValue = (key: string): unknown => {
     const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
-    if (descriptor === undefined || !('value' in descriptor)) {
+    if (descriptor === undefined) {
+      return undefined;
+    }
+    if (!('value' in descriptor) || !descriptor.enumerable) {
       throw new AgentCardRegistryError(
         'malformed',
-        'routing endpoint descriptor cannot contain accessors',
+        'routing endpoint descriptor cannot contain accessors or hidden fields',
       );
     }
-  }
-  const ownValue = (key: string): unknown => Object.getOwnPropertyDescriptor(endpoint, key)?.value;
+    return descriptor.value;
+  };
   const address = ownValue('address');
   if (
     typeof address !== 'string' ||
@@ -699,11 +837,9 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
     throw new AgentCardRegistryError('malformed', 'routing endpoint kind and transport must agree');
   }
   const endpointRuntimeId = ownValue('runtimeId');
+  let canonicalEndpointRuntimeId: RuntimeId | undefined;
   if (endpointRuntimeId !== undefined) {
-    const canonicalEndpointRuntimeId = runtimeValue(
-      endpointRuntimeId,
-      'routing endpoint runtimeId',
-    );
+    canonicalEndpointRuntimeId = runtimeValue(endpointRuntimeId, 'routing endpoint runtimeId');
     if (runtimeId !== undefined && canonicalEndpointRuntimeId !== runtimeId) {
       throw new AgentCardRegistryError(
         'unauthorized',
@@ -711,20 +847,22 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
       );
     }
   }
+  const normalized: RoutingEndpointDescriptor = {
+    address,
+    ...(kind === undefined ? {} : { kind }),
+    ...(transport === undefined ? {} : { transport }),
+    ...(canonicalEndpointRuntimeId === undefined ? {} : { runtimeId: canonicalEndpointRuntimeId }),
+  };
   let serialized: string | undefined;
   try {
-    serialized = JSON.stringify({
-      address,
-      ...(kind === undefined ? {} : { kind }),
-      ...(transport === undefined ? {} : { transport }),
-      ...(endpointRuntimeId === undefined ? {} : { runtimeId: endpointRuntimeId }),
-    });
+    serialized = JSON.stringify(normalized);
   } catch {
     throw new AgentCardRegistryError('malformed', 'routing endpoint is not JSON serializable');
   }
   if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > MAX_ENDPOINT_BYTES) {
     throw new AgentCardRegistryError('malformed', 'routing endpoint exceeds its size limit');
   }
+  return normalized;
 }
 
 function unique<T>(values: readonly T[], label: string): void {
@@ -761,9 +899,11 @@ function validateCanonicalAgentCard(card: AgentCard): void {
 }
 
 function cloneCard(card: AgentCard, identity?: SessionRuntimeIdentity): AgentCard {
-  if (!isRecord(card)) {
+  const snapshot = cloneFrozenSnapshot(card);
+  if (!isRecord(snapshot)) {
     throw new AgentCardRegistryError('malformed', 'Agent Card must be an object');
   }
+  card = snapshot as AgentCard;
   validateCardArrayBudget(card);
   validateCanonicalAgentCard(card);
   const name = nonEmptyText(card.name, 'Agent Card name');
@@ -921,14 +1061,55 @@ function cloneLimits(value: ProtocolLimits): ProtocolLimits {
   return Object.freeze(limits);
 }
 
+interface PublicationField {
+  readonly present: boolean;
+  readonly value: unknown;
+}
+
+function publicationField(value: Record<string, unknown>, key: string): PublicationField {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined) {
+    return { present: false, value: undefined };
+  }
+  if (!('value' in descriptor)) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'Agent Card publication cannot contain accessors',
+    );
+  }
+  return { present: true, value: descriptor.enumerable ? descriptor.value : undefined };
+}
+function publicationOptionsSnapshot(options: Record<string, unknown>): Record<string, unknown> {
+  if (!isRecord(options)) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'Agent Card publication options must be an object',
+    );
+  }
+  const snapshot: Record<string, unknown> = {};
+  for (const key of ['roomId', 'leaseExpiresAt', 'leaseTtlMs']) {
+    const field = publicationField(options, key);
+    if (field.present && field.value !== undefined) {
+      snapshot[key] = field.value;
+    }
+  }
+  return snapshot;
+}
+
 function extractPublication(input: AgentCardPublication | AgentCard): PublicationParts {
   if (!isRecord(input)) {
     throw new AgentCardRegistryError('malformed', 'Agent Card publication must be an object');
   }
   const raw = input as Record<string, unknown>;
-  const nestedCard = isRecord(raw.card) ? raw.card : undefined;
+  const rawCard = publicationField(raw, 'card');
+  const nestedCard = isRecord(rawCard.value) ? rawCard.value : undefined;
   const card = (nestedCard ?? raw) as unknown as AgentCard;
-  const roomAliases = [raw.roomId, nestedCard?.roomId].filter(
+  const rawRoom = publicationField(raw, 'roomId');
+  const nestedRoom =
+    nestedCard === undefined
+      ? { present: false, value: undefined }
+      : publicationField(nestedCard, 'roomId');
+  const roomAliases = [rawRoom.value, nestedRoom.value].filter(
     (value): value is RoomId => value !== undefined,
   );
   const roomValues = roomAliases.map((value) => roomValue(value, 'roomId'));
@@ -936,13 +1117,22 @@ function extractPublication(input: AgentCardPublication | AgentCard): Publicatio
     throw new AgentCardRegistryError('malformed', 'room aliases must agree');
   }
   const roomId = roomValues[0];
-  const endpoint = (raw.endpoint ?? nestedCard?.endpoint) as RoutingEndpoint | undefined;
+  const rawEndpoint = publicationField(raw, 'endpoint');
+  const nestedEndpoint =
+    nestedCard === undefined
+      ? { present: false, value: undefined }
+      : publicationField(nestedCard, 'endpoint');
+  const endpoint = (rawEndpoint.value ?? nestedEndpoint.value) as RoutingEndpoint | undefined;
   if (endpoint === undefined) {
     throw new AgentCardRegistryError('malformed', 'current routing endpoint is required');
   }
-  const leaseExpiresAt = Object.hasOwn(raw, 'leaseExpiresAt')
-    ? raw.leaseExpiresAt
-    : nestedCard?.leaseExpiresAt;
+  const rawExpiry = publicationField(raw, 'leaseExpiresAt');
+  const nestedExpiry =
+    nestedCard === undefined
+      ? { present: false, value: undefined }
+      : publicationField(nestedCard, 'leaseExpiresAt');
+  const leaseExpiresAt = (rawExpiry.present ? rawExpiry.value : nestedExpiry.value) as
+    string | number | Date | undefined;
   if (
     leaseExpiresAt !== undefined &&
     typeof leaseExpiresAt !== 'string' &&
@@ -951,7 +1141,12 @@ function extractPublication(input: AgentCardPublication | AgentCard): Publicatio
   ) {
     throw new AgentCardRegistryError('malformed', 'leaseExpiresAt must be a timestamp');
   }
-  const leaseTtlMs = Object.hasOwn(raw, 'leaseTtlMs') ? raw.leaseTtlMs : nestedCard?.leaseTtlMs;
+  const rawTtl = publicationField(raw, 'leaseTtlMs');
+  const nestedTtl =
+    nestedCard === undefined
+      ? { present: false, value: undefined }
+      : publicationField(nestedCard, 'leaseTtlMs');
+  const leaseTtlMs = rawTtl.present ? rawTtl.value : nestedTtl.value;
   if (leaseTtlMs !== undefined && typeof leaseTtlMs !== 'number') {
     throw new AgentCardRegistryError('malformed', 'leaseTtlMs must be a number');
   }
@@ -1278,7 +1473,11 @@ export class AgentCardRegistry {
     const publication =
       endpoint === undefined
         ? extractPublication(publicationOrCard)
-        : extractPublication({ ...options, card: publicationOrCard as AgentCard, endpoint });
+        : extractPublication({
+            ...publicationOptionsSnapshot(options),
+            card: publicationOrCard as AgentCard,
+            endpoint,
+          });
     return this.registerParts(this.validatePublication(publication));
   }
 
@@ -1475,13 +1674,15 @@ export class AgentCardRegistry {
     for (const [runtimeId, record] of this.records) {
       if (now >= record.expiresAtMs + 2 * ttlMs) {
         // Re-read the current map entry immediately before deletion.  A
-        // synchronous renew/register cannot race this line, and an async
-        // adapter must perform its own ownership check before calling here.
         const current = this.records.get(runtimeId);
         if (current === record && now >= current.expiresAtMs + 2 * ttlMs) {
-          this.retireRecord(current, now);
-          this.records.delete(runtimeId);
-          removed += 1;
+          if (this.retireRecord(current, now)) {
+            const currentBeforeDelete = this.records.get(runtimeId);
+            if (currentBeforeDelete === record) {
+              this.records.delete(runtimeId);
+              removed += 1;
+            }
+          }
         }
       }
     }
@@ -1808,11 +2009,21 @@ export class AgentCardRegistry {
       'leaseRenewalIntervalMs',
     );
     validateLeaseTiming(ttlMs, renewalIntervalMs);
-    const expiresAtMs =
-      overrides.expiresAtMs ??
-      (parts.leaseExpiresAt === undefined
-        ? now + ttlMs
-        : parseExpiry(parts.leaseExpiresAt, 'leaseExpiresAt'));
+    const freshDeadline = now + ttlMs;
+    const suppliedExpiry =
+      parts.leaseExpiresAt === undefined
+        ? undefined
+        : parseExpiry(parts.leaseExpiresAt, 'leaseExpiresAt');
+    if (
+      overrides.expiresAtMs === undefined &&
+      suppliedExpiry !== undefined &&
+      suppliedExpiry <= now
+    ) {
+      throw new AgentCardRegistryError('expired', 'Agent Card lease has expired');
+    }
+    // Direct registration always starts a fresh lease from this call's clock;
+    // caller metadata can never extend that effective TTL.
+    const expiresAtMs = Math.min(overrides.expiresAtMs ?? freshDeadline, freshDeadline);
     if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now) {
       throw new AgentCardRegistryError('expired', 'Agent Card lease has expired');
     }
@@ -1842,6 +2053,12 @@ export class AgentCardRegistry {
         'runtime identity is already registered; renew the exact existing owner instead',
       );
     }
+    if (this.retiredIds.size >= MAX_RETIRED_RUNTIME_IDENTITIES) {
+      throw new AgentCardRegistryError(
+        'busy',
+        'retired runtime tombstone capacity is exhausted; retry after the grace period',
+      );
+    }
 
     const endpointCopy = cloneEndpoint(parts.endpoint, identity.runtimeId);
     const baseCard = cloneCard(parts.card, identity);
@@ -1857,7 +2074,30 @@ export class AgentCardRegistry {
       renewalIntervalMs,
     );
     const record = makeRuntimeAdvertisement(identity, this.roomId, card, endpointCopy, lease);
-    const generation = ++this.nextGeneration;
+
+    // Accessors and owner callbacks are rejected or snapshotted above, but a
+    // reentrant caller may still have committed or retired this identity while
+    // the candidate record was being built.  Never overwrite that newer state.
+    const currentBeforeCommit = this.records.get(identity.runtimeId);
+    if (currentBeforeCommit !== undefined) {
+      throw new AgentCardRegistryConflictError(
+        'runtime identity was registered reentrantly before this registration committed',
+      );
+    }
+    if (this.retiredIds.has(identity.runtimeId)) {
+      throw new AgentCardRegistryError(
+        'expired',
+        'runtime identity was retired reentrantly before this registration committed',
+      );
+    }
+    if (this.retiredIds.size >= MAX_RETIRED_RUNTIME_IDENTITIES) {
+      throw new AgentCardRegistryError(
+        'busy',
+        'retired runtime tombstone capacity is exhausted; retry after the grace period',
+      );
+    }
+    const generation = this.nextGeneration + 1;
+    this.nextGeneration = generation;
     this.records.set(identity.runtimeId, {
       record,
       owner: identity,
@@ -1867,22 +2107,28 @@ export class AgentCardRegistry {
     });
     return record;
   }
-
-  private retireRecord(record: StoredRuntimeAdvertisement, now: number): void {
+  private retireRecord(record: StoredRuntimeAdvertisement, now: number): boolean {
     const current = this.records.get(record.record.runtimeId);
     if (current !== record) {
-      return;
+      return false;
     }
+    this.pruneRetired(now);
     const retired: RetiredRuntimeIdentity = {
       owner: record.owner,
       generation: record.generation,
       retiredAtMs: now,
     };
     const previous = this.retiredIds.get(record.record.runtimeId);
-    if (previous === undefined || previous.generation <= record.generation) {
-      this.retiredIds.set(record.record.runtimeId, retired);
+    if (previous !== undefined && previous.generation >= record.generation) {
+      return true;
     }
-    this.pruneRetired(now);
+    // Live tombstones are never evicted for capacity.  Keeping the expired
+    // record in place is safer than deleting it without generation protection.
+    if (this.retiredIds.size >= MAX_RETIRED_RUNTIME_IDENTITIES) {
+      return false;
+    }
+    this.retiredIds.set(record.record.runtimeId, retired);
+    return true;
   }
 
   private pruneRetired(now: number): void {
@@ -1890,20 +2136,6 @@ export class AgentCardRegistry {
       if (now >= retired.retiredAtMs + RETIRED_RUNTIME_GRACE_MS) {
         this.retiredIds.delete(runtimeId);
       }
-    }
-    while (this.retiredIds.size > MAX_RETIRED_RUNTIME_IDENTITIES) {
-      let oldestRuntimeId: RuntimeId | undefined;
-      let oldestTime = Number.POSITIVE_INFINITY;
-      for (const [runtimeId, retired] of this.retiredIds) {
-        if (retired.retiredAtMs < oldestTime) {
-          oldestRuntimeId = runtimeId;
-          oldestTime = retired.retiredAtMs;
-        }
-      }
-      if (oldestRuntimeId === undefined) {
-        break;
-      }
-      this.retiredIds.delete(oldestRuntimeId);
     }
   }
 
@@ -1917,11 +2149,37 @@ export class AgentCardRegistry {
       return false;
     }
     const retiredAtMs = this.clock();
+    // A user-supplied clock may reenter the registry.  Re-read the exact
+    // reference and generation before reserving its tombstone or deleting it.
+    const currentAfterClock = this.records.get(owner.runtimeId);
+    if (
+      currentAfterClock === undefined ||
+      currentAfterClock.generation !== generation ||
+      !runtimeIdentitiesEqual(currentAfterClock.owner, owner)
+    ) {
+      return false;
+    }
+    this.pruneRetired(retiredAtMs);
+    const previous = this.retiredIds.get(owner.runtimeId);
+    if (previous === undefined && this.retiredIds.size >= MAX_RETIRED_RUNTIME_IDENTITIES) {
+      return false;
+    }
+    if (previous !== undefined && previous.generation > generation) {
+      return false;
+    }
     this.retiredIds.set(owner.runtimeId, {
-      owner: current.owner,
-      generation: current.generation,
+      owner: currentAfterClock.owner,
+      generation: currentAfterClock.generation,
       retiredAtMs,
     });
+    const currentBeforeDelete = this.records.get(owner.runtimeId);
+    if (
+      currentBeforeDelete === undefined ||
+      currentBeforeDelete.generation !== generation ||
+      !runtimeIdentitiesEqual(currentBeforeDelete.owner, owner)
+    ) {
+      return false;
+    }
     this.records.delete(owner.runtimeId);
     this.pruneRetired(retiredAtMs);
     return true;
