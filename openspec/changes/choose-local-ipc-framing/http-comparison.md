@@ -31,7 +31,7 @@ Baseline candidate commit: `f30e4ca6e2eadc5342c6c22d53ca20b6732f8e5b`; integrate
 
 The focused suite is `tests/fixtures/local-ipc-http/http-candidate.test.ts`.
 On this Linux runner (`node v25.0.0`, repository minimum `node >=22.19.0`),
-all 10 tests passed. The checks cover:
+all 12 tests passed. The checks cover:
 
 | Behavior               | Evidence                                                                                                                                                            | Linux result |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
