@@ -54,7 +54,7 @@ HTTP named-pipe path also needs a native Windows run before its portability can
 be treated as established.
 
 The Ubuntu evidence is not a claim that HTTP works everywhere: Node `v25.0.0`
-passed all 14 HTTP fixture tests three times on a native Unix socket, while the
+passed all 15 HTTP fixture tests three times on a native Unix socket, while the
 macOS and Windows rows remain explicitly unavailable. The HTTP fixture also
 does not exercise a slow-drip response peer, so it supplies no slow-drip result.
 See [`http-comparison.md`](http-comparison.md) for the detailed candidate
@@ -72,41 +72,43 @@ npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-ip
 npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
 ```
 
-The same one-line commands are valid in Bash, PowerShell, and `cmd.exe`. The Node
-guard must exit with status `0`; `node --version` records the exact runtime, and
-the verbose output must be retained. Canonical raw evidence is indexed as
-`raw-run-1.txt`, `raw-run-2.txt`, and `raw-run-3.txt` (71 tests in 6 files each);
-canonical HTTP evidence is `http-run-1.txt`, `http-run-2.txt`, and `http-run-3.txt`
-(14 tests in 1 file each). `cleanup-baseline-delta.txt` is a separate pre/post
-inventory around the third pair, not an additional test run. Non-native platform
-cases are explicit limitation assertions; no native macOS or Windows support is
-claimed from the Ubuntu run.
+The same one-line commands are valid in Bash, PowerShell, and `cmd.exe`. The
+Node guard must exit with status `0`; `node --version` records the exact
+runtime, and the verbose output must be retained. Canonical raw evidence is
+indexed as `raw-run-1.txt`, `raw-run-2.txt`, and `raw-run-3.txt` (72 tests in 6
+files each); canonical HTTP evidence is `http-run-1.txt`, `http-run-2.txt`, and
+`http-run-3.txt` (15 tests in 1 file each). `cleanup-baseline-delta.txt` is a
+separate pre/post inventory around the third raw/HTTP pair, not an additional
+test run. Non-native platform cases are explicit limitation assertions; no
+native macOS or Windows support is claimed from the Ubuntu run.
 
 | Candidate                      | Ubuntu/Linux, Node `v25.0.0`                                                                  | macOS, Node `>=22.19.0`                                      | Windows, Node `>=22.19.0`                                              |
 | ------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| Raw length-prefixed `node:net` | **PASS** — 71/71 tests per run; native Unix socket                                            | **UNAVAILABLE** — native macOS run required; no pass claimed | **UNAVAILABLE** — native named-pipe run required; no pass claimed      |
-| HTTP/local IPC comparison      | **PASS** — 14/14 tests per run; native Unix socket                                            | **UNAVAILABLE** — native macOS run required; no pass claimed | **UNAVAILABLE** — native named-pipe HTTP run required; no pass claimed |
+| Raw length-prefixed `node:net` | **PASS** — 72/72 tests per run; native Unix socket                                            | **UNAVAILABLE** — native macOS run required; no pass claimed | **UNAVAILABLE** — native named-pipe run required; no pass claimed      |
+| HTTP/local IPC comparison      | **PASS** — 15/15 tests per run; native Unix socket                                            | **UNAVAILABLE** — native macOS run required; no pass claimed | **UNAVAILABLE** — native named-pipe HTTP run required; no pass claimed |
 | Repeated cleanup               | **PASS** — three focused repetitions, empty pre/post artifact delta and zero fixture children | **UNAVAILABLE** — native filesystem/process run required     | **UNAVAILABLE** — native named-pipe/process run required               |
 
 The raw matrix covers native endpoint selection, short names and byte limits,
 normal opaque round trips, split/coalesced framing, one-operation closure,
 malformed/truncated/trailing/oversized request and response frames, unavailable
 endpoints, connect/write/read deadlines, slow-drip reads, cancellation,
-backpressure, concurrency, clean shutdown, abrupt child exit, stale endpoint
-probing, endpoint ownership and quarantine replacement races, child diagnostics, and platform limitations. The
-HTTP matrix covers native round trips, request/response limits, bounded writes
-and close, connect/write/read deadlines, cancellation, split/chunked and
-malformed parser input, concurrency, keep-alive/cleanup, endpoint replacement
-safety, and the Windows endpoint limitation. The evidence matrix maps each
-scenario to its exact test name and retained output file.
+backpressure, concurrency, clean shutdown, abrupt child exit, inconclusive
+listener probes, stale endpoint probing, endpoint ownership and quarantine
+replacement races, child diagnostics, and platform limitations. The HTTP
+matrix covers native round trips, request/response limits, bounded writes and
+close, connect/write/read deadlines, cancellation, split/chunked and malformed
+parser input, concurrency, keep-alive/cleanup, regular-file/symlink/live
+endpoint replacement safety, and the Windows endpoint limitation. The evidence
+matrix maps each scenario to its exact test name and retained output file.
 
-Repository checks are recorded in `evidence/ubuntu-node-25.0.0/repository-checks.txt`:
-`npm run typecheck` and focused ESLint both pass, and `npm test` passes all 86
-tests in 8 files. `npm run format:check` exits 1 because the coordinator
-snapshot has 13 pre-existing formatting warnings in `.pi/prompts/*.md`,
-`.pi/skills/**/*.md`, and `AGENTS.md`; the changed ADR and evidence Markdown
-files pass their focused Prettier check. This pre-existing documentation warning
-does not indicate a spike or production-code failure.
+Repository checks are recorded in
+`evidence/ubuntu-node-25.0.0/repository-checks.txt`: typecheck, focused and full
+ESLint, build, focused formatting, strict OpenSpec validation, diff checks, and
+`npm test` all pass. `npm test` passes all 88 tests in 8 files. The repository
+wide `npm run format:check` remains a pre-existing failure on coordinator
+snapshot documentation files under `.pi/` and `AGENTS.md`; it does not implicate
+the changed Markdown reports. The exact commands, statuses, and the focused
+formatting result are retained in the check artifact.
 
 ## Endpoint strategy
 
@@ -136,11 +138,12 @@ non-socket, a live listener, an arbitrary root, or an inconclusive probe is not
 blindly unlinked. Windows named-pipe lifetime is delegated to the operating
 system and requires native Windows evidence.
 
-The separate `cleanup-baseline-delta.txt` records the pre/post artifact inventory
-captured around `raw-run-3.txt` and `http-run-3.txt`; it is not a fourth test run.
-The baseline contained three pre-existing `/tmp/p2p-*.sock` files and eleven
-`/tmp/p2p-*` temporary directories. The run introduced no new socket, quarantine
-entry, temporary directory, or fixture child, and it did not remove those unrelated
+The separate `cleanup-baseline-delta.txt` records the pre/post artifact
+inventory captured around `raw-run-3.txt` and `http-run-3.txt`; it is not a
+fourth test run. The baseline contained three pre-existing `/tmp/p2p-*.sock`
+files, zero quarantine entries, and eleven `/tmp/p2p-*` temporary directories,
+with zero fixture children. The run introduced no new socket, quarantine entry,
+temporary directory, or fixture child, and it did not remove those unrelated
 baseline entries because ownership was not established. This is the honest cleanup
 result; a global absence claim would be incorrect.
 
@@ -204,7 +207,8 @@ recorded as a follow-up decision rather than silently changing this evidence.
    require native runners. No unavailable row is reported as a pass.
 2. The available runtime was Node `v25.0.0`, which satisfies but does not equal
    the declared minimum `v22.19.0`. The reproducible Node guard command enforces
-   the lower bound; a release matrix should still include the minimum line explicitly.
+   the lower bound; a release matrix should still include the minimum line
+   explicitly.
 3. The HTTP suite did not include a slow-drip response peer. The selected raw
    candidate does, and no equivalent HTTP claim is made.
 4. The spike is behavioral evidence, not a throughput or latency benchmark. It
@@ -213,8 +217,8 @@ recorded as a follow-up decision rather than silently changing this evidence.
    trust boundary. A future reliability/security decision may add a capability
    token, but that is outside this spike.
 6. Existing unrelated `/tmp/p2p-*` artifacts were observed during cleanup
-   inventory. The fixture correctly leaves paths of unknown ownership alone;
-   CI should provide an isolated temporary environment when a zero-baseline
+   inventory. The fixture correctly leaves paths of unknown ownership alone; CI
+   should provide an isolated temporary environment when a zero-baseline
    inventory is required.
 
 ## Consequence

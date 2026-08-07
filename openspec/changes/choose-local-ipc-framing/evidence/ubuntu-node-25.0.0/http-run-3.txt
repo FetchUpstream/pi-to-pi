@@ -1,27 +1,31 @@
+$ node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 22 || (major === 22 && minor < 19)) { console.error('Node >=22.19.0 required; found ' + process.version); process.exit(1); }"
+NODE_GUARD_EXIT_STATUS=0
 $ node --version
 v25.0.0
+NODE_VERSION_EXIT_STATUS=0
 $ npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
 
- RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p-003-spike-and-choose-the-local-ipc-framing-s
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-final-evidence-refresh
 
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > round-trips one request and one response over the native POSIX endpoint 10ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized request before invoking the handler 2ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized response without retaining an unbounded body 4ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds server response writes and completes resource cleanup 2ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized response without retaining an unbounded body 3ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds server response writes and completes resource cleanup 1ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds raw HTTP response capture 2ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > applies finite connect, write, and read phase deadlines 18ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > destroys the request when the caller aborts 12ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > destroys the request when the caller aborts 11ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > handles split HTTP headers/body and rejects malformed HTTP through the parser 3ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > supports concurrent one-operation requests and preserves response association 23ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > supports concurrent one-operation requests and preserves response association 21ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > closes the HTTP server, disables keep-alive, and removes its POSIX socket 16ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved regular-file replacement without following it 14ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved symlink replacement without following it 14ms
- ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds close by the caller deadline and preserves a failed close 1ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved symlink replacement without following it 13ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > preserves a live moved replacement when the endpoint is claimed before relink 1ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds close by the caller deadline and preserves a failed close 0ms
  ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > represents Windows named pipes explicitly even when this run is not Windows 0ms
 
  Test Files  1 passed (1)
-      Tests  14 passed (14)
-   Start at  16:11:01
-   Duration  237ms (transform 40ms, setup 0ms, import 60ms, tests 121ms, environment 0ms)
+      Tests  15 passed (15)
+   Start at  18:21:23
+   Duration  227ms (transform 39ms, setup 0ms, import 57ms, tests 117ms, environment 0ms)
 
-EXIT_STATUS=0
+HTTP_EXIT_STATUS=0

@@ -1,5 +1,11 @@
+WORKTREE=/home/louis/orca/workspaces/pi-to-pi/p2p003-final-evidence-refresh
+HEAD=7c65677cb518fbc08dead7e26d00f12962a2c6ae
+PLATFORM=Linux 7.0.0-28-generic x86_64
+$ node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 22 || (major === 22 && minor < 19)) { console.error('Node >=22.19.0 required; found ' + process.version); process.exit(1); }"
+NODE_GUARD_EXIT_STATUS=0
 $ node --version
 v25.0.0
+NODE_VERSION_EXIT_STATUS=0
 $ npm run typecheck
 
 > pi-to-pi@0.0.1 typecheck
@@ -8,16 +14,28 @@ $ npm run typecheck
 TYPECHECK_EXIT_STATUS=0
 $ npx vitest run tests/fixtures/local-ipc-spike/raw-net.unit.test.ts tests/fixtures/local-ipc-spike/test-helpers.test.ts tests/fixtures/local-ipc-spike/raw-net.test.ts tests/fixtures/local-ipc-spike/raw-net.process.test.ts --reporter=dot
 
- RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-raw-ownership-evidence-fix
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-final-evidence-refresh
 
-······················································
+·······················································
 
  Test Files  4 passed (4)
-      Tests  54 passed (54)
-   Start at  17:10:19
-   Duration  641ms (transform 115ms, setup 0ms, import 196ms, tests 588ms, environment 0ms)
+      Tests  55 passed (55)
+   Start at  18:22:17
+   Duration  617ms (transform 139ms, setup 0ms, import 201ms, tests 585ms, environment 0ms)
 
 FOCUSED_RAW_HELPER_EXIT_STATUS=0
+$ npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=dot
+
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-final-evidence-refresh
+
+···············
+
+ Test Files  1 passed (1)
+      Tests  15 passed (15)
+   Start at  18:22:18
+   Duration  235ms (transform 40ms, setup 0ms, import 58ms, tests 120ms, environment 0ms)
+
+FOCUSED_HTTP_EXIT_STATUS=0
 $ npx eslint tests/fixtures/local-ipc tests/fixtures/local-ipc-spike tests/fixtures/local-ipc-http
 FOCUSED_ESLINT_EXIT_STATUS=0
 $ npm run lint
@@ -26,7 +44,7 @@ $ npm run lint
 > eslint .
 
 FULL_ESLINT_EXIT_STATUS=0
-$ npx prettier --check tests/fixtures/local-ipc-spike/raw-net.ts tests/fixtures/local-ipc-spike/raw-net.unit.test.ts openspec/changes/choose-local-ipc-framing/adr.md openspec/changes/choose-local-ipc-framing/evidence-matrix.md
+$ npx prettier --check openspec/changes/choose-local-ipc-framing/adr.md openspec/changes/choose-local-ipc-framing/evidence-matrix.md openspec/changes/choose-local-ipc-framing/http-comparison.md
 Checking formatting...
 All matched files use Prettier code style!
 FOCUSED_FORMAT_EXIT_STATUS=0
@@ -36,6 +54,20 @@ $ npm run format:check
 > prettier --check .
 
 Checking formatting...
+[warn] .pi/prompts/opsx-apply.md
+[warn] .pi/prompts/opsx-archive.md
+[warn] .pi/prompts/opsx-explore.md
+[warn] .pi/prompts/opsx-propose.md
+[warn] .pi/prompts/opsx-sync.md
+[warn] .pi/prompts/opsx-update.md
+[warn] .pi/skills/openspec-apply-change/SKILL.md
+[warn] .pi/skills/openspec-archive-change/SKILL.md
+[warn] .pi/skills/openspec-explore/SKILL.md
+[warn] .pi/skills/openspec-propose/SKILL.md
+[warn] .pi/skills/openspec-sync-specs/SKILL.md
+[warn] .pi/skills/openspec-update-change/SKILL.md
+[warn] AGENTS.md
+[warn] Code style issues found in 13 files. Run Prettier with --write to fix.
 FORMAT_CHECK_EXIT_STATUS=1
 $ npm run build
 
@@ -49,13 +81,13 @@ $ npm test
 > vitest run
 
 
- RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-raw-ownership-evidence-fix
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p003-final-evidence-refresh
 
 
  Test Files  8 passed (8)
-      Tests  86 passed (86)
-   Start at  17:10:30
-   Duration  655ms (transform 313ms, setup 0ms, import 484ms, tests 720ms, environment 0ms)
+      Tests  88 passed (88)
+   Start at  18:22:21
+   Duration  653ms (transform 375ms, setup 0ms, import 541ms, tests 722ms, environment 0ms)
 
 NPM_TEST_EXIT_STATUS=0
 $ openspec validate choose-local-ipc-framing --type change --strict
@@ -63,16 +95,31 @@ Change 'choose-local-ipc-framing' is valid
 OPEN_SPEC_VALIDATE_EXIT_STATUS=0
 $ git diff --check
 DIFF_CHECK_EXIT_STATUS=0
-$ scope check (allowed raw/test/ADR/matrix/direct evidence paths only)
+$ git status --short
+ M openspec/changes/choose-local-ipc-framing/adr.md
+ M openspec/changes/choose-local-ipc-framing/evidence-matrix.md
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/cleanup-baseline-delta.txt
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/http-run-1.txt
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/http-run-2.txt
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/http-run-3.txt
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/raw-run-1.txt
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/raw-run-2.txt
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/raw-run-3.txt
+ M openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/repository-checks.txt
+ M openspec/changes/choose-local-ipc-framing/http-comparison.md
+$ scope check (allowed ADR/report/evidence paths only)
 openspec/changes/choose-local-ipc-framing/adr.md
 openspec/changes/choose-local-ipc-framing/evidence-matrix.md
 openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/cleanup-baseline-delta.txt
+openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/http-run-1.txt
+openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/http-run-2.txt
+openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/http-run-3.txt
 openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/raw-run-1.txt
 openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/raw-run-2.txt
 openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/raw-run-3.txt
 openspec/changes/choose-local-ipc-framing/evidence/ubuntu-node-25.0.0/repository-checks.txt
-tests/fixtures/local-ipc-spike/raw-net.ts
-tests/fixtures/local-ipc-spike/raw-net.unit.test.ts
+openspec/changes/choose-local-ipc-framing/http-comparison.md
 SCOPE_CHECK=PASS
+REPOSITORY_CHECKS_PASS_EXCEPT_FORMAT_CHECK=0
+FORMAT_CHECK_NOTE=FAIL is pre-existing: coordinator snapshot documentation files under .pi/ and AGENTS.md are not Prettier-formatted; the changed Markdown reports pass focused formatting.
 REPOSITORY_CHECK_EXIT_STATUS=1
-FORMAT_CHECK_NOTE=FAIL is pre-existing: .pi/prompts/*.md, .pi/skills/**/*.md, and AGENTS.md are not Prettier-formatted on the coordinator snapshot; no changed ADR/evidence/fixture file is implicated.
