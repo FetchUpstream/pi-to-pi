@@ -24,9 +24,12 @@ behavior require their respective CI runners.
 length-prefixed request and response per connection, validates optional JSON
 payloads before handler invocation, applies absolute connect/write/read
 phase deadlines, supports cancellation, and closes owned resources. Binding and
-shutdown transitions are serialized; shutdown rejects new requests and waits for
-tracked socket closure. A complete frame dispatches immediately without requiring
-peer EOF, while trailing bytes remain a protocol error. POSIX stale-path cleanup
-only removes a default-generated socket after `lstat` confirms a socket, a bounded
-connection probe confirms no live listener, and a final inode identity check
-still matches, so a replacement path is left untouched.
+shutdown transitions are serialized; shutdown rejects new requests, force-closes
+active sockets after the primary deadline, and confirms the bounded forced drain
+before cleaning the endpoint. A complete frame dispatches immediately without
+requiring peer EOF, while trailing bytes remain a protocol error. Server responses
+force-close one-operation connections after their bytes are flushed, including when
+the peer keeps its readable side open. POSIX stale-path cleanup only removes a
+default-generated socket after `lstat` confirms a socket and a bounded connection
+probe confirms no live listener; it atomically quarantines the entry, verifies its
+identity after rename, and restores a replacement without overwriting or unlinking it.

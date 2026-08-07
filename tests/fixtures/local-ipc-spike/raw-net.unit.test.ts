@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { AbortError, PhaseDeadlineExceededError } from './test-helpers.js';
+import { AbortError, MAX_TIMER_DELAY_MS, PhaseDeadlineExceededError } from './test-helpers.js';
 import {
   DEFAULT_RAW_NET_READ_TIMEOUT_MS,
   DEFAULT_RAW_NET_WRITE_TIMEOUT_MS,
@@ -33,6 +33,17 @@ describe('raw node:net candidate unit boundaries', () => {
     expect(() => new RawNetTransport({ maxPayloadBytes: -1 })).toThrow();
     expect(() => new RawNetTransport({ readTimeoutMs: Number.POSITIVE_INFINITY })).toThrow();
     expect(() => new RawNetTransport({ writeTimeoutMs: Number.NaN })).toThrow();
+    for (const option of [
+      'connectTimeoutMs',
+      'writeTimeoutMs',
+      'readTimeoutMs',
+      'shutdownTimeoutMs',
+      'staleProbeTimeoutMs',
+    ] as const) {
+      expect(() => new RawNetTransport({ [option]: MAX_TIMER_DELAY_MS + 1 })).toThrow(
+        /no greater than/,
+      );
+    }
     void transport.close();
   });
 

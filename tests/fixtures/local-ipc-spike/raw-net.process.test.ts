@@ -76,12 +76,14 @@ async function waitForReady(child: ChildProcess): Promise<void> {
 
 async function stopChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) {
+    await waitForChildExit(child, createPhaseDeadline('child-close', 500));
     return;
   }
   await cleanupChildProcess(child, {
     timeoutMs: 500,
     forceWaitMs: 500,
   });
+  await waitForChildExit(child, createPhaseDeadline('child-close', 500));
 }
 
 describe('raw node:net process lifecycle evidence', () => {

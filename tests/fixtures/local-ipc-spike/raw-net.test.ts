@@ -117,7 +117,7 @@ async function rawExchange(
             socket.write(chunk);
             await nextTurn();
           }
-          socket.end();
+          // The complete frame is sufficient; keep the peer readable until the response closes it.
         } catch (error: unknown) {
           settle(() => reject(error));
         }
@@ -279,6 +279,24 @@ class HangingResponseSocket extends FakeSocket {
   }
 }
 
+class DeferredCloseSocket extends FakeSocket {
+  private closePending = false;
+
+  override destroy(): this {
+    if (!this.destroyed) {
+      this.destroyed = true;
+      this.closePending = true;
+    }
+    return this;
+  }
+
+  releaseClose(): void {
+    if (this.closePending) {
+      this.closePending = false;
+      this.emit('close', false);
+    }
+  }
+}
 describe('raw node:net local IPC candidate', () => {
   it('uses the native platform endpoint and records the cross-platform matrix boundary', () => {
     const endpoint = createIpcEndpoint();
@@ -407,6 +425,48 @@ describe('raw node:net local IPC candidate', () => {
     } finally {
       await transport.close();
       await closeServer(fixture.server, fixture.sockets);
+    }
+  });
+  it('force-closes the server side after a response to a peer that stays open', async () => {
+    const endpoint = createIpcEndpoint();
+    const transport = new RawNetTransport();
+    await transport.bind(endpoint, (payload) => payload);
+    const socket = createConnection(endpoint);
+    socket.on('error', () => undefined);
+    const responseDecoder = new FrameDecoder();
+    const response = new Promise<Buffer>((resolve, reject) => {
+      socket.on('data', (chunk) => {
+        try {
+          const payload = responseDecoder.push(chunk);
+          if (payload !== undefined) {
+            resolve(payload);
+          }
+        } catch (error: unknown) {
+          reject(error);
+        }
+      });
+    });
+    const closed = new Promise<void>((resolve) => socket.once('close', resolve));
+    try {
+      await withPhaseDeadline(
+        'peer-held-connect',
+        TEST_TIMEOUT_MS,
+        new Promise<void>((resolve) => socket.once('connect', resolve)),
+        { onTimeout: () => socket.destroy() },
+      );
+      socket.write(encodeFrame(Buffer.from('request')));
+      await expect(
+        withPhaseDeadline('peer-held-response', TEST_TIMEOUT_MS, response, {
+          onTimeout: () => socket.destroy(),
+        }),
+      ).resolves.toEqual(Buffer.from('request'));
+      await withPhaseDeadline('peer-held-close', TEST_TIMEOUT_MS, closed, {
+        onTimeout: () => socket.destroy(),
+      });
+      expect(socket.destroyed).toBe(true);
+    } finally {
+      socket.destroy();
+      await transport.close();
     }
   });
   it('closes a connection when trailing request bytes arrive after response dispatch', async () => {
@@ -676,6 +736,24 @@ describe('raw node:net local IPC candidate', () => {
     queueMicrotask(() => serverSockets.add(lateSocket));
     await expect(closing).resolves.toBeUndefined();
     expect(closed).toBe(true);
+  });
+  it('waits for the close event after forcing a destroyed socket during shutdown', async () => {
+    const transport = new RawNetTransport({ shutdownTimeoutMs: 0 });
+    const serverSockets = (transport as unknown as { serverSockets: Set<Socket> }).serverSockets;
+    const socket = new DeferredCloseSocket(false, false);
+    serverSockets.add(socket as unknown as Socket);
+    socket.once('close', () => serverSockets.delete(socket as unknown as Socket));
+    const closing = transport.close();
+    await nextTurn();
+    expect(socket.destroyed).toBe(true);
+    let settled = false;
+    void closing.finally(() => {
+      settled = true;
+    });
+    await nextTurn();
+    expect(settled).toBe(false);
+    socket.releaseClose();
+    await expect(closing).resolves.toBeUndefined();
   });
   it('serializes bind with close and rejects requests after shutdown', async () => {
     const endpoint = createIpcEndpoint();

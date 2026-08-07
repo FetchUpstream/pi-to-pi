@@ -5,7 +5,8 @@
  * one bounded response on each path-based local endpoint, then closes the
  * connection. It does not import production transport or Pi protocol modules.
  */
-import { lstatSync, promises as fs, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { lstatSync, linkSync, promises as fs, renameSync, unlinkSync } from 'node:fs';
 import { basename } from 'node:path';
 import { createConnection, createServer } from 'node:net';
 import type { Server, Socket } from 'node:net';
@@ -14,6 +15,7 @@ import { TextDecoder } from 'node:util';
 import {
   AbortError,
   createPhaseDeadline,
+  MAX_TIMER_DELAY_MS,
   type Deadline,
   onAbort,
   PhaseDeadlineExceededError,
@@ -40,6 +42,7 @@ export const DEFAULT_RAW_NET_CONNECT_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_WRITE_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_READ_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_SHUTDOWN_TIMEOUT_MS = 1_000;
+export const DEFAULT_RAW_NET_FORCE_SHUTDOWN_TIMEOUT_MS = 250;
 export const DEFAULT_RAW_NET_STALE_PROBE_TIMEOUT_MS = 250;
 const DEFAULT_GENERATED_RUNTIME_ID_PATTERN = /^[a-f0-9]{24}$/;
 
@@ -47,6 +50,7 @@ interface PosixSocketIdentity {
   readonly dev: number;
   readonly ino: number;
   readonly ctimeMs: number;
+  readonly birthtimeMs: number;
 }
 
 export type RawNetErrorCode =
@@ -134,8 +138,10 @@ function errorCode(value: unknown): string | undefined {
 
 function normalizeTimeout(value: number | undefined, fallback: number, name: string): number {
   const timeout = value ?? fallback;
-  if (!Number.isSafeInteger(timeout) || timeout < 0) {
-    throw new RangeError(`${name} must be a non-negative safe integer, got ${String(timeout)}`);
+  if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > MAX_TIMER_DELAY_MS) {
+    throw new RangeError(
+      `${name} must be a non-negative safe integer no greater than ${MAX_TIMER_DELAY_MS}, got ${String(timeout)}`,
+    );
   }
   return timeout;
 }
@@ -218,12 +224,31 @@ function isRefusedOrMissing(error: unknown): boolean {
   return code === 'ECONNREFUSED' || code === 'ENOENT' || code === 'ENOTDIR';
 }
 
-function socketIdentity(stats: { dev: number; ino: number; ctimeMs: number }): PosixSocketIdentity {
-  return { dev: stats.dev, ino: stats.ino, ctimeMs: stats.ctimeMs };
+function socketIdentity(stats: {
+  dev: number;
+  ino: number;
+  ctimeMs: number;
+  birthtimeMs: number;
+}): PosixSocketIdentity {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    ctimeMs: stats.ctimeMs,
+    birthtimeMs: stats.birthtimeMs,
+  };
 }
 
 function sameSocketIdentity(left: PosixSocketIdentity, right: PosixSocketIdentity): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.ctimeMs === right.ctimeMs;
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.ctimeMs === right.ctimeMs &&
+    left.birthtimeMs === right.birthtimeMs
+  );
+}
+
+function sameSocketObjectIdentity(left: PosixSocketIdentity, right: PosixSocketIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
 }
 
 async function lstatSocket(endpoint: string): Promise<PosixSocketIdentity | undefined> {
@@ -241,11 +266,37 @@ async function lstatSocket(endpoint: string): Promise<PosixSocketIdentity | unde
 /**
  * Remove only the exact socket inode observed by the caller.
  *
- * The identity check is repeated synchronously immediately before unlink so an
- * endpoint replaced while an asynchronous stale probe was running is never
- * treated as owned. `server.close()` normally removes a live endpoint itself;
- * this fallback is limited to a path that still has the bound inode.
+ * The endpoint is atomically renamed to a private quarantine path before it is
+ * unlinked. If the inode changed while the probe was running, the quarantine is
+ * linked back only when the endpoint is still vacant; an existing replacement is
+ * never overwritten or removed.
  */
+function restoreQuarantinedSocket(endpoint: string, quarantine: string): void {
+  try {
+    lstatSync(quarantine);
+  } catch (error: unknown) {
+    if (errorCode(error) === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+  try {
+    linkSync(quarantine, endpoint);
+  } catch (error: unknown) {
+    if (errorCode(error) === 'EEXIST') {
+      return;
+    }
+    throw error;
+  }
+  try {
+    unlinkSync(quarantine);
+  } catch (error: unknown) {
+    if (errorCode(error) !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
 function unlinkOwnedSocket(endpoint: string, expected?: PosixSocketIdentity): boolean {
   if (!isPosixRuntime()) {
     return false;
@@ -269,12 +320,61 @@ function unlinkOwnedSocket(endpoint: string, expected?: PosixSocketIdentity): bo
   if (expected !== undefined && !sameSocketIdentity(current, expected)) {
     return false;
   }
+
+  const quarantine = `${endpoint}.cleanup-${randomUUID()}`;
+  let quarantineCreated = false;
   try {
-    unlinkSync(endpoint);
+    try {
+      renameSync(endpoint, quarantine);
+    } catch (error: unknown) {
+      if (errorCode(error) === 'ENOENT') {
+        return false;
+      }
+      throw error;
+    }
+    quarantineCreated = true;
+
+    let quarantinedStats: ReturnType<typeof lstatSync>;
+    try {
+      quarantinedStats = lstatSync(quarantine);
+    } catch (error: unknown) {
+      if (errorCode(error) === 'ENOENT') {
+        quarantineCreated = false;
+        return false;
+      }
+      throw error;
+    }
+    if (
+      !quarantinedStats.isSocket() ||
+      (expected !== undefined &&
+        !sameSocketObjectIdentity(socketIdentity(quarantinedStats), expected))
+    ) {
+      restoreQuarantinedSocket(endpoint, quarantine);
+      quarantineCreated = false;
+      return false;
+    }
+
+    try {
+      unlinkSync(quarantine);
+    } catch (error: unknown) {
+      if (errorCode(error) === 'ENOENT') {
+        quarantineCreated = false;
+        return false;
+      }
+      throw error;
+    }
+    quarantineCreated = false;
     return true;
   } catch (error: unknown) {
-    if (errorCode(error) === 'ENOENT') {
-      return false;
+    if (quarantineCreated) {
+      try {
+        restoreQuarantinedSocket(endpoint, quarantine);
+      } catch (recoveryError: unknown) {
+        throw new AggregateError(
+          [error, recoveryError],
+          'Raw node:net endpoint quarantine recovery failed',
+        );
+      }
     }
     throw error;
   }
@@ -391,6 +491,8 @@ function writeFrameAndEnd(
   frame: Buffer,
   signal: AbortSignal,
   onBackpressure: (() => void) | undefined,
+  endAfterWrite = true,
+  destroyAfterEnd = false,
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -427,12 +529,21 @@ function writeFrameAndEnd(
       callbackCompleted = true;
       maybeEnd();
     };
-    const onEnd = (): void => settle(resolve);
+    const onEnd = (): void => {
+      settle(resolve);
+      if (destroyAfterEnd) {
+        destroySocket(socket);
+      }
+    };
     const maybeEnd = (): void => {
       if (settled || ended || !writeReturned || !callbackCompleted || !drained) {
         return;
       }
       ended = true;
+      if (!endAfterWrite) {
+        settle(resolve);
+        return;
+      }
       try {
         socket.end(onEnd);
       } catch (error: unknown) {
@@ -682,22 +793,32 @@ export async function removeStalePosixEndpoint(
   return unlinkOwnedSocket(endpoint, observed);
 }
 
-function waitForSocketClosure(socket: Socket): Promise<void> {
-  return new Promise<void>((resolve) => {
-    let settled = false;
-    const settle = (): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      socket.off('close', settle);
-      resolve();
-    };
-    socket.once('close', settle);
-    if (socket.destroyed) {
-      setImmediate(settle);
-    }
+interface SocketClosureState {
+  readonly completion: Promise<void>;
+  readonly markClosed: () => void;
+}
+
+const socketClosureStates = new WeakMap<Socket, SocketClosureState>();
+
+function trackSocketClosure(socket: Socket): SocketClosureState {
+  const existing = socketClosureStates.get(socket);
+  if (existing !== undefined) {
+    return existing;
+  }
+  let markClosed!: () => void;
+  const completion = new Promise<void>((resolve) => {
+    markClosed = resolve;
   });
+  const state: SocketClosureState = { completion, markClosed };
+  socketClosureStates.set(socket, state);
+  socket.once('close', () => {
+    state.markClosed();
+  });
+  return state;
+}
+
+function waitForSocketClosure(socket: Socket): Promise<void> {
+  return trackSocketClosure(socket).completion;
 }
 export class RawNetTransport {
   readonly maxPayloadBytes: number;
@@ -829,8 +950,10 @@ export class RawNetTransport {
     }
 
     const socket = this.options.socketFactory(endpoint);
+    trackSocketClosure(socket);
     if (this.closing || this.closed) {
       destroySocket(socket);
+      await waitForSocketClosure(socket);
       throw new RawNetError('shutdown-error', 'Transport is shutting down');
     }
     this.clientSockets.add(socket);
@@ -859,6 +982,7 @@ export class RawNetTransport {
             this.options.onWriteBackpressure === undefined
               ? undefined
               : () => this.options.onWriteBackpressure?.('request'),
+            false,
           ),
         writeDeadline,
         { signal: options.signal, onTimeout: () => destroySocket(socket) },
@@ -899,7 +1023,9 @@ export class RawNetTransport {
   }
 
   private createServer(): Server {
-    const server = createServer({ allowHalfOpen: true }, (socket) => this.handleConnection(socket));
+    const server = createServer({ allowHalfOpen: false }, (socket) =>
+      this.handleConnection(socket),
+    );
     // A listener keeps asynchronous server errors from becoming uncaught errors
     // after bind has resolved. Individual connection errors are handled below.
     server.on('error', () => undefined);
@@ -907,6 +1033,7 @@ export class RawNetTransport {
   }
 
   private handleConnection(socket: Socket): void {
+    trackSocketClosure(socket);
     this.serverSockets.add(socket);
     const handler = this.handler;
     if (handler === undefined || this.closing || this.closed) {
@@ -982,6 +1109,7 @@ export class RawNetTransport {
               this.options.onWriteBackpressure === undefined
                 ? undefined
                 : () => this.options.onWriteBackpressure?.('response'),
+              true,
             ),
           deadline,
           { onTimeout: () => destroySocket(socket) },
@@ -1019,7 +1147,13 @@ export class RawNetTransport {
     socket.once('end', onEnd);
     socket.once('error', onError);
     socket.once('close', onClose);
-    const deadline = createPhaseDeadline('server-read', this.options.readTimeoutMs);
+    let deadline: Deadline;
+    try {
+      deadline = createPhaseDeadline('server-read', this.options.readTimeoutMs);
+    } catch {
+      fail();
+      return;
+    }
     const delay = remainingMs(deadline);
     readTimer = setTimeout(() => {
       fail();
@@ -1027,6 +1161,12 @@ export class RawNetTransport {
   }
 
   private async closeInternal(): Promise<void> {
+    let deadline: Deadline;
+    try {
+      deadline = createPhaseDeadline('shutdown', this.options.shutdownTimeoutMs);
+    } catch (error: unknown) {
+      throw new RawNetError('shutdown-error', asError(error).message, error);
+    }
     const server = this.server;
     const ownedEndpoint = this.ownedEndpoint;
     this.server = undefined;
@@ -1035,7 +1175,6 @@ export class RawNetTransport {
     this.handler = undefined;
 
     let closeError: unknown;
-    const deadline = createPhaseDeadline('shutdown', this.options.shutdownTimeoutMs);
     let serverClosed = server === undefined;
     let serverCloseError: unknown;
     const serverCloseCompletion = (async (): Promise<void> => {
@@ -1075,27 +1214,44 @@ export class RawNetTransport {
     };
     const closeAllConnections = (): void => {
       for (const socket of new Set([...this.clientSockets, ...this.serverSockets])) {
+        trackSocketClosure(socket);
         destroySocket(socket);
       }
       (
         server as (Server & { closeAllConnections?: () => void }) | undefined
       )?.closeAllConnections?.();
     };
+    const resourcesCompletion = Promise.all([serverCloseCompletion, drainResources()]).then(() => {
+      if (serverCloseError !== undefined) {
+        throw serverCloseError;
+      }
+    });
+    let resourcesConfirmed = false;
     try {
-      await withDeadline(
-        Promise.all([serverCloseCompletion, drainResources()]).then(() => {
-          if (serverCloseError !== undefined) {
-            throw serverCloseError;
-          }
-        }),
-        deadline,
-        { onTimeout: closeAllConnections },
-      );
+      await withDeadline(resourcesCompletion, deadline, { onTimeout: closeAllConnections });
+      resourcesConfirmed = true;
     } catch (error: unknown) {
-      closeError = error;
+      if (error instanceof PhaseDeadlineExceededError) {
+        closeAllConnections();
+        try {
+          const forceDeadline = createPhaseDeadline(
+            'shutdown-force',
+            DEFAULT_RAW_NET_FORCE_SHUTDOWN_TIMEOUT_MS,
+          );
+          await withDeadline(resourcesCompletion, forceDeadline, {
+            onTimeout: closeAllConnections,
+          });
+          resourcesConfirmed = true;
+        } catch (forceError: unknown) {
+          closeError = forceError;
+        }
+      } else {
+        closeError = error;
+      }
     }
 
     if (
+      resourcesConfirmed &&
       ownedEndpoint !== undefined &&
       isPosixRuntime() &&
       (server === undefined || !server.listening)
