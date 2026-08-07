@@ -20,8 +20,10 @@ import {
 
 The barrel exposes workspace, bounded-wait, output/JSON-lines, and managed-process helpers. The
 support modules do not import protocol, registry, transport, routing, or Pi implementation code;
-later tests can therefore reuse them without importing the final wire protocol. Tests that verify a
-support module itself may import that module directly from the same directory.
+later tests can therefore reuse them without importing the final wire protocol. Support-module tests
+under `tests/support/` may import their module directly. The process-harness acceptance test
+(`tests/process/harness.test.ts`) is also an intentional direct-import exception: it imports
+`process.js`, `wait.js`, and `workspace.js` while exercising the harness implementation.
 
 ## Fixture control and cleanup
 
@@ -31,9 +33,11 @@ support module itself may import that module directly from the same directory.
   commands, and use lifecycle commands such as `shutdown`, `hang`, or `diagnostic` rather than
   fixed sleeps.
 - Wrap each test in `withTestWorkspace` (or explicitly call `createTestWorkspace` and
-  `workspace.cleanup()`), pass the workspace to every managed child, and await `waitForClose()` in
-  the test's normal path. The workspace cleanup hook terminates any remaining children before
-  removing temporary runtime and room paths.
+  `workspace.cleanup()`). For an individual managed child, pass the workspace to
+  `createManagedProcess` and await `waitForClose()` in the normal path. For a managed process group,
+  pass the workspace to `createManagedProcessGroup`; its `group.spawn()` children are owned by the
+  group and do not receive a workspace of their own. The workspace cleanup hook terminates any
+  remaining children before removing temporary runtime and room paths.
 - Keep cleanup in a `finally` path when a test owns a process directly. Repeated cleanup and
   `killAbruptly()` calls are expected to be safe; do not remove a workspace while a child is still
   running.
@@ -44,10 +48,12 @@ not hidden; retry the cleanup after the owner has released its resources.
 
 ## Bounded diagnostics
 
-Managed children capture stdout and stderr independently with fixed retention limits. Readiness,
-exit, timeout, spawn, and JSON-lines failures include the process label/PID, lifecycle state, exit
-code or signal, and retained output. Fixture diagnostics must remain bounded; use the output helper
-instead of accumulating unbounded child output in a test.
+Managed children capture stdout and stderr independently with fixed retention limits. Managed-child
+lifecycle diagnostics for readiness, exit, timeout, and spawn failures include the process label/PID,
+lifecycle state, exit code or signal, and retained output. A `JsonLinesParseError` from a managed child
+exposes process identity, line details, and bounded output, but does not carry lifecycle state or exit
+code/signal; use the managed child's diagnostics for those fields. Fixture diagnostics must remain
+bounded; use the output helper instead of accumulating unbounded child output in a test.
 
 ## Node harness versus real Pi integration
 

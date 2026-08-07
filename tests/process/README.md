@@ -6,7 +6,8 @@ worker without a daemon, provider credentials, network service, TTY, or interact
 
 ## Support imports
 
-Use the reusable support barrel from `tests/support/index.ts`:
+Process and integration consumers should use the reusable support barrel from `tests/support/index.ts`.
+The acceptance test's direct imports are an intentional exception documented in `tests/support/README.md`.
 
 ```ts
 import {
@@ -26,13 +27,17 @@ transport, routing, or Pi implementation code.
 
 - Wait for `ready` before sending a command; coordinate concurrent children with readiness events,
   not fixed sleeps. The lifecycle fixture accepts `shutdown`, `hang`, and `diagnostic` commands.
-- Wrap each test in `withTestWorkspace`, pass the workspace to every managed child or group, and
-  keep direct cleanup in `finally` when the test owns a process explicitly.
+- Wrap each test in `withTestWorkspace`; pass the workspace to each directly created managed child,
+  or once to `createManagedProcessGroup`. Children from `group.spawn()` are owned by their group and
+  do not receive a workspace themselves. Keep direct cleanup in `finally` when the test owns a process
+  explicitly.
 - Await clean `waitForClose()` results in the normal path. On failure or timeout, managed cleanup
   must terminate every child before workspace removal; repeated `cleanup()` and `killAbruptly()` are
   safe.
-- Keep diagnostics bounded and separate: failures retain process identity, state, exit code/signal,
-  spawn errors, and bounded stdout/stderr. Do not leave temporary workspaces, child processes,
+- Keep diagnostics bounded and separate: managed-child lifecycle failures retain process identity, state,
+  exit code/signal, spawn errors, and bounded stdout/stderr. `JsonLinesParseError` retains process
+  identity, line details, and bounded output, but not lifecycle state or exit code/signal; consult the
+  managed child's diagnostics for those fields. Do not leave temporary workspaces, child processes,
   polling loops, or timers behind.
 
 The portable fixture control protocol is lifecycle-only and must not become the eventual Pi-to-Pi
