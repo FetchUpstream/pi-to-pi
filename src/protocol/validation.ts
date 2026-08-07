@@ -257,6 +257,47 @@ function hasOwn(value: UnknownRecord, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+function hasOwnArrayIndex(value: readonly unknown[], index: number): boolean {
+  return Object.prototype.hasOwnProperty.call(value, index);
+}
+
+function isDenseOwnArray(value: readonly unknown[]): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!hasOwnArrayIndex(value, index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function everyOwnArrayEntry<T>(
+  value: readonly T[],
+  predicate: (entry: T, index: number) => boolean,
+): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!hasOwnArrayIndex(value, index) || !predicate(value[index], index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function someOwnArrayEntry<T>(
+  value: readonly T[],
+  predicate: (entry: T, index: number) => boolean,
+): boolean {
+  let matched = false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!hasOwnArrayIndex(value, index)) {
+      return false;
+    }
+    if (predicate(value[index], index)) {
+      matched = true;
+    }
+  }
+  return matched;
+}
+
 function isPlainObject(value: unknown): value is UnknownRecord {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return false;
@@ -693,6 +734,14 @@ function measureJsonBytes(
     if (Array.isArray(candidate)) {
       let bytes = 2;
       for (let index = 0; index < candidate.length; index += 1) {
+        if (!hasOwnArrayIndex(candidate, index)) {
+          context.seen.delete(candidate);
+          return {
+            kind: 'invalid',
+            path: `${path}[${index}]`,
+            reason: 'array entries must be own properties',
+          };
+        }
         const child = measure(candidate[index], `${path}[${index}]`, depth + 1);
         if (child.kind !== 'ok') {
           result = child;
@@ -1279,8 +1328,11 @@ function validateSchemaShape(
       (typeof candidate === 'string' && JSON_SCHEMA_TYPES.has(candidate)) ||
       (Array.isArray(candidate) &&
         candidate.length > 0 &&
-        new Set(candidate).size === candidate.length &&
-        candidate.every((entry) => typeof entry === 'string' && JSON_SCHEMA_TYPES.has(entry))),
+        everyOwnArrayEntry(
+          candidate,
+          (entry) => typeof entry === 'string' && JSON_SCHEMA_TYPES.has(entry),
+        ) &&
+        new Set(candidate).size === candidate.length),
     'type must be a JSON Schema type name or a non-empty array of unique type names',
   );
   if (typeIssue !== undefined) {
@@ -1374,8 +1426,8 @@ function validateSchemaShape(
     if (key === 'required') {
       if (
         !Array.isArray(value[key]) ||
-        new Set(value[key]).size !== value[key].length ||
-        !value[key].every((entry) => typeof entry === 'string')
+        !everyOwnArrayEntry(value[key], (entry) => typeof entry === 'string') ||
+        new Set(value[key]).size !== value[key].length
       ) {
         seen.delete(value);
         return issue(
@@ -1393,8 +1445,8 @@ function validateSchemaShape(
       for (const [property, dependencies] of Object.entries(value[key])) {
         if (
           !Array.isArray(dependencies) ||
-          new Set(dependencies).size !== dependencies.length ||
-          !dependencies.every((entry) => typeof entry === 'string')
+          !everyOwnArrayEntry(dependencies, (entry) => typeof entry === 'string') ||
+          new Set(dependencies).size !== dependencies.length
         ) {
           seen.delete(value);
           return issue(
@@ -1415,7 +1467,10 @@ function validateSchemaShape(
     }
   }
 
-  if (hasOwn(value, 'enum') && (!Array.isArray(value.enum) || value.enum.length === 0)) {
+  if (
+    hasOwn(value, 'enum') &&
+    (!Array.isArray(value.enum) || value.enum.length === 0 || !isDenseOwnArray(value.enum))
+  ) {
     seen.delete(value);
     return issue('malformed', `${path}.enum`, 'enum must be a non-empty array', 'enum');
   }
@@ -1423,7 +1478,8 @@ function validateSchemaShape(
   for (const key of ['allOf', 'anyOf', 'oneOf'] as const) {
     if (
       hasOwn(value, key) &&
-      (!Array.isArray(value[key]) || !value[key].every((entry) => isSchemaValue(entry)))
+      (!Array.isArray(value[key]) ||
+        !everyOwnArrayEntry(value[key], (entry) => isSchemaValue(entry)))
     ) {
       seen.delete(value);
       return issue('malformed', `${path}.${key}`, `${key} must be an array of schemas`, key);
@@ -1514,9 +1570,18 @@ function validateSchemaShape(
         'prefixItems',
       );
     }
-    value.prefixItems.forEach((child, index) =>
-      schemaChildren.push([`prefixItems.${index}`, child]),
-    );
+    for (let index = 0; index < value.prefixItems.length; index += 1) {
+      if (!hasOwnArrayIndex(value.prefixItems, index)) {
+        seen.delete(value);
+        return issue(
+          'malformed',
+          `${path}.prefixItems[${index}]`,
+          'array entries must be own properties',
+          'prefixItems',
+        );
+      }
+      schemaChildren.push([`prefixItems.${index}`, value.prefixItems[index]]);
+    }
   }
 
   for (const [childPathPart, child] of schemaChildren) {
@@ -1538,7 +1603,17 @@ function validateSchemaShape(
 
   for (const key of ['allOf', 'anyOf', 'oneOf'] as const) {
     if (hasOwn(value, key) && Array.isArray(value[key])) {
-      for (const [index, child] of value[key].entries()) {
+      for (let index = 0; index < value[key].length; index += 1) {
+        if (!hasOwnArrayIndex(value[key], index)) {
+          seen.delete(value);
+          return issue(
+            'malformed',
+            `${path}.${key}[${index}]`,
+            'array entries must be own properties',
+            key,
+          );
+        }
+        const child = value[key][index];
         const childIssue = validateSchemaShape(child, `${path}.${key}[${index}]`, seen, references);
         if (childIssue !== undefined) {
           seen.delete(value);
@@ -1589,7 +1664,7 @@ function resolveSchemaReference(index: SchemaIndex, reference: string): JsonSche
         } else if (
           Array.isArray(current) &&
           /^(?:0|[1-9]\d*)$/u.test(token) &&
-          Object.prototype.hasOwnProperty.call(current, token)
+          hasOwnArrayIndex(current, Number(token))
         ) {
           current = current[Number(token)];
         } else {
@@ -1675,11 +1750,19 @@ function collectSchemaIndex(root: JsonSchema): SchemaIndex {
       }
     }
     if (hasOwn(value, 'prefixItems') && Array.isArray(value.prefixItems)) {
-      value.prefixItems.forEach((child, index) => schemaChild(`prefixItems.${index}`, child));
+      for (let index = 0; index < value.prefixItems.length; index += 1) {
+        if (hasOwnArrayIndex(value.prefixItems, index)) {
+          schemaChild(`prefixItems.${index}`, value.prefixItems[index]);
+        }
+      }
     }
     for (const key of ['allOf', 'anyOf', 'oneOf'] as const) {
       if (hasOwn(value, key) && Array.isArray(value[key])) {
-        value[key].forEach((child, index) => schemaChild(`${key}[${index}]`, child));
+        for (let index = 0; index < value[key].length; index += 1) {
+          if (hasOwnArrayIndex(value[key], index)) {
+            schemaChild(`${key}[${index}]`, value[key][index]);
+          }
+        }
       }
     }
   };
@@ -2317,6 +2400,14 @@ export function validateEnvelope(
     operation === 'message.reply'
       ? resolveExpectedRequestExpiresAt(options.expectedRequestExpiresAt)
       : undefined;
+  if (operation === 'message.reply' && originalRequestDeadline === undefined) {
+    return validationFailure(
+      'malformed',
+      'protocol envelope is malformed',
+      '$.expiresAt',
+      'message.reply validation requires the original request deadline context',
+    );
+  }
   if (originalRequestDeadline !== undefined) {
     if (compareTimestamps(originalRequestDeadline, now) <= 0) {
       return validationFailure(
@@ -2405,7 +2496,8 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     );
   }
   if (
-    !value.supportedProtocolVersions.every(
+    !everyOwnArrayEntry(
+      value.supportedProtocolVersions,
       (version) => typeof version === 'string' && version.length > 0,
     )
   ) {
@@ -2425,8 +2517,7 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     );
   }
   if (
-    !value.supportedProtocolVersions.includes(PROTOCOL_VERSION) ||
-    value.supportedProtocolVersions.some((version) => version !== PROTOCOL_VERSION)
+    !everyOwnArrayEntry(value.supportedProtocolVersions, (version) => version === PROTOCOL_VERSION)
   ) {
     return issue(
       'incompatible',
@@ -2448,7 +2539,16 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     );
   }
   const seenOperations = new Set<string>();
-  for (const [index, operation] of value.operations.entries()) {
+  for (let index = 0; index < value.operations.length; index += 1) {
+    if (!hasOwnArrayIndex(value.operations, index)) {
+      return issue(
+        'malformed',
+        `${path}.operations[${index}]`,
+        'array entries must be own properties',
+        'operations',
+      );
+    }
+    const operation = value.operations[index];
     const operationPath = `${path}.operations[${index}]`;
     if (
       !isPlainObject(operation) ||
@@ -2496,7 +2596,16 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     );
   }
   const seenContentTypes = new Set<string>();
-  for (const [index, capability] of value.contentCapabilities.entries()) {
+  for (let index = 0; index < value.contentCapabilities.length; index += 1) {
+    if (!hasOwnArrayIndex(value.contentCapabilities, index)) {
+      return issue(
+        'malformed',
+        `${path}.contentCapabilities[${index}]`,
+        'array entries must be own properties',
+        'contentCapabilities',
+      );
+    }
+    const capability = value.contentCapabilities[index];
     const capabilityPath = `${path}.contentCapabilities[${index}]`;
     if (
       !isPlainObject(capability) ||
@@ -2681,11 +2790,11 @@ function validateTaskSnapshotInternal(
   if (!isTerminalTaskState(state) && compareTimestamps(expiresAt, now) <= 0) {
     return issue('expired', `${path}.expiresAt`, 'task snapshot deadline has passed', 'expiresAt');
   }
-  if (compareTimestamps(updatedAt, expiresAt) > 0 && state !== 'expired') {
+  if (state !== 'expired' && compareTimestamps(updatedAt, expiresAt) >= 0) {
     return issue(
       'malformed',
       `${path}.updatedAt`,
-      'task snapshot update time must not exceed its deadline',
+      'task snapshot update time must be strictly before its deadline',
       'updatedAt',
     );
   }
@@ -2838,14 +2947,6 @@ function validateTaskSnapshotInternal(
   }
   switch (state) {
     case 'completed':
-      if (!hasContent) {
-        return issue(
-          'invalid_content',
-          `${path}.content`,
-          'completed task snapshots require terminal content',
-          'content',
-        );
-      }
       if (hasError) {
         return issue(
           'malformed',
@@ -2863,14 +2964,6 @@ function validateTaskSnapshotInternal(
           `${path}.content`,
           `${state} task snapshots cannot include completed content`,
           'content',
-        );
-      }
-      if (!hasError) {
-        return issue(
-          'malformed',
-          `${path}.error`,
-          `${state} task snapshots require structured failure information`,
-          'error',
         );
       }
       break;
@@ -3162,6 +3255,9 @@ function deepEqualJson(left: JsonValue, right: JsonValue, budget?: EvaluationBud
       return false;
     }
     for (let index = 0; index < left.length; index += 1) {
+      if (!hasOwnArrayIndex(left, index) || !hasOwnArrayIndex(right, index)) {
+        return false;
+      }
       if (!deepEqualJson(left[index], right[index], budget)) {
         return false;
       }
@@ -3261,8 +3357,14 @@ function matchesSchema(
   }
 
   if (hasOwn(schema, 'type')) {
-    const types = typeof schema.type === 'string' ? [schema.type] : (schema.type as unknown[]);
-    if (!types.some((type) => typeof type === 'string' && schemaTypeMatches(value, type))) {
+    const matchesType =
+      typeof schema.type === 'string'
+        ? schemaTypeMatches(value, schema.type)
+        : someOwnArrayEntry(
+            schema.type as unknown[],
+            (type) => typeof type === 'string' && schemaTypeMatches(value, type),
+          );
+    if (!matchesType) {
       return { valid: false, path, reason: 'value does not match schema type' };
     }
   }
@@ -3274,7 +3376,11 @@ function matchesSchema(
   }
   if (hasOwn(schema, 'enum') && Array.isArray(schema.enum)) {
     let matched = false;
-    for (const entry of schema.enum) {
+    for (let index = 0; index < schema.enum.length; index += 1) {
+      if (!hasOwnArrayIndex(schema.enum, index)) {
+        return { valid: false, path, reason: 'array entries must be own properties' };
+      }
+      const entry = schema.enum[index];
       if (deepEqualJson(value, entry as JsonValue, context.budget)) {
         matched = true;
         break;
@@ -3361,7 +3467,11 @@ function matchesSchema(
     }
     if (hasOwn(schema, 'uniqueItems') && schema.uniqueItems === true) {
       const itemSignatures = new Set<string>();
-      for (const item of value) {
+      for (let index = 0; index < value.length; index += 1) {
+        if (!hasOwnArrayIndex(value, index)) {
+          return { valid: false, path, reason: 'array entries must be own properties' };
+        }
+        const item = value[index];
         if (!consumeEvaluationBudget(context.budget)) {
           return budgetFailure(path);
         }
@@ -3382,6 +3492,9 @@ function matchesSchema(
     }
     if (hasOwn(schema, 'prefixItems') && Array.isArray(schema.prefixItems)) {
       for (let index = 0; index < schema.prefixItems.length && index < value.length; index += 1) {
+        if (!hasOwnArrayIndex(value, index) || !hasOwnArrayIndex(schema.prefixItems, index)) {
+          return { valid: false, path, reason: 'array entries must be own properties' };
+        }
         const childResult = matchesSchema(
           value[index],
           schema.prefixItems[index],
@@ -3401,6 +3514,9 @@ function matchesSchema(
         : 0;
     if (hasOwn(schema, 'items')) {
       for (let index = prefixLength; index < value.length; index += 1) {
+        if (!hasOwnArrayIndex(value, index)) {
+          return { valid: false, path, reason: 'array entries must be own properties' };
+        }
         const childResult = matchesSchema(
           value[index],
           schema.items as JsonSchema,
@@ -3417,6 +3533,9 @@ function matchesSchema(
     if (hasOwn(schema, 'contains')) {
       let matching = 0;
       for (let index = 0; index < value.length; index += 1) {
+        if (!hasOwnArrayIndex(value, index)) {
+          return { valid: false, path, reason: 'array entries must be own properties' };
+        }
         const childResult = matchesSchema(
           value[index],
           schema.contains as JsonSchema,
@@ -3465,7 +3584,11 @@ function matchesSchema(
       return { valid: false, path, reason: 'object has more than maxProperties' };
     }
     if (hasOwn(schema, 'required') && Array.isArray(schema.required)) {
-      for (const required of schema.required) {
+      for (let index = 0; index < schema.required.length; index += 1) {
+        if (!hasOwnArrayIndex(schema.required, index)) {
+          return { valid: false, path, reason: 'array entries must be own properties' };
+        }
+        const required = schema.required[index];
         if (typeof required === 'string' && !hasOwn(value, required)) {
           return {
             valid: false,
@@ -3564,7 +3687,11 @@ function matchesSchema(
     if (hasOwn(schema, 'dependentRequired') && isPlainObject(schema.dependentRequired)) {
       for (const [property, dependencies] of Object.entries(schema.dependentRequired)) {
         if (hasOwn(value, property) && Array.isArray(dependencies)) {
-          for (const dependency of dependencies) {
+          for (let index = 0; index < dependencies.length; index += 1) {
+            if (!hasOwnArrayIndex(dependencies, index)) {
+              return { valid: false, path, reason: 'array entries must be own properties' };
+            }
+            const dependency = dependencies[index];
             if (typeof dependency === 'string' && !hasOwn(value, dependency)) {
               return {
                 valid: false,
@@ -3611,7 +3738,11 @@ function matchesSchema(
   }
 
   if (hasOwn(schema, 'allOf') && Array.isArray(schema.allOf)) {
-    for (const childSchema of schema.allOf) {
+    for (let index = 0; index < schema.allOf.length; index += 1) {
+      if (!hasOwnArrayIndex(schema.allOf, index)) {
+        return { valid: false, path, reason: 'array entries must be own properties' };
+      }
+      const childSchema = schema.allOf[index];
       const childResult = matchesSchema(
         value,
         childSchema as JsonSchema,
@@ -3627,7 +3758,11 @@ function matchesSchema(
   }
   if (hasOwn(schema, 'anyOf') && Array.isArray(schema.anyOf)) {
     let matched = false;
-    for (const childSchema of schema.anyOf) {
+    for (let index = 0; index < schema.anyOf.length; index += 1) {
+      if (!hasOwnArrayIndex(schema.anyOf, index)) {
+        return { valid: false, path, reason: 'array entries must be own properties' };
+      }
+      const childSchema = schema.anyOf[index];
       const childResult = matchesSchema(
         value,
         childSchema as JsonSchema,
@@ -3653,7 +3788,11 @@ function matchesSchema(
   }
   if (hasOwn(schema, 'oneOf') && Array.isArray(schema.oneOf)) {
     let matches = 0;
-    for (const childSchema of schema.oneOf) {
+    for (let index = 0; index < schema.oneOf.length; index += 1) {
+      if (!hasOwnArrayIndex(schema.oneOf, index)) {
+        return { valid: false, path, reason: 'array entries must be own properties' };
+      }
+      const childSchema = schema.oneOf[index];
       const childResult = matchesSchema(
         value,
         childSchema as JsonSchema,
@@ -3881,7 +4020,15 @@ function canonicalizeValue(value: unknown, seen: Set<object>, budget?: Evaluatio
 
   let result: string;
   if (Array.isArray(value)) {
-    result = `[${value.map((entry) => canonicalizeValue(entry, seen, budget)).join(',')}]`;
+    const entries: string[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!hasOwnArrayIndex(value, index)) {
+        seen.delete(value);
+        throw new TypeError('array entries must be own properties');
+      }
+      entries.push(canonicalizeValue(value[index], seen, budget));
+    }
+    result = `[${entries.join(',')}]`;
   } else if (isPlainObject(value)) {
     if (Object.getOwnPropertySymbols(value).length > 0) {
       seen.delete(value);
