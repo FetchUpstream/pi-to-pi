@@ -1,8 +1,8 @@
 ## 1. Build the deterministic Pi fixture
 
-- [ ] 1.1 Add a reusable in-process runtime fixture using `createAgentSessionRuntime()`, `createAgentSessionServices()`, `SessionManager`, `SettingsManager`, and a registered faux provider.
-- [ ] 1.2 Add an inline probe extension and rebinding helper that records lifecycle, agent, custom-message, session identity, and idle-state observations.
-- [ ] 1.3 Add persisted-session fixture helpers using isolated temporary directories for reload, resume, fork, and clone scenarios.
+- [x] 1.1 Add a reusable in-process runtime fixture using `createAgentSessionRuntime()`, `createAgentSessionServices()`, `SessionManager`, `SettingsManager`, and a registered faux provider.
+- [x] 1.2 Add an inline probe extension and rebinding helper that records lifecycle, agent, custom-message, session identity, and idle-state observations.
+- [x] 1.3 Add persisted-session fixture helpers using isolated temporary directories for reload, resume, fork, and clone scenarios.
 
 ## 2. Verify Pi session lifecycle
 
