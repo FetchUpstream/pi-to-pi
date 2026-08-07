@@ -36,6 +36,7 @@ import {
   validateExpectedResponse,
   validateJsonSchema,
   validateJsonValueAgainstSchema,
+  MAX_PROTOCOL_ERROR_MESSAGE_LENGTH,
   validateOperationResponse,
   validateReplyContent,
   type ValidationResult,
@@ -156,6 +157,15 @@ function expectFailure<Value>(
   expect(result.error.code).toBe(code);
   return result.error;
 }
+function makeDescribeResponse(agentCard: unknown): TestRecord {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    operation: 'peer.describe',
+    operationId: DESCRIBE_OPERATION_ID,
+    traceId: TRACE_ID,
+    result: { agentCard },
+  };
+}
 
 const localSchema: JsonSchema = {
   $schema: JSON_SCHEMA_DRAFT_2020_12,
@@ -195,6 +205,14 @@ const validAgentCard = {
     maxQueueEntries: DEFAULT_QUEUE_LIMIT,
   },
 };
+const AGENT_CARD_LIMIT_CEILINGS = [
+  ['requestTtlMs', MAX_REQUEST_TTL_MS],
+  ['maxRequestTtlMs', MAX_REQUEST_TTL_MS],
+  ['maxControlTtlMs', MAX_CONTROL_TTL_MS],
+  ['maxEnvelopeBytes', MAX_ENVELOPE_BYTES],
+  ['maxSchemaBytes', MAX_SCHEMA_BYTES],
+  ['maxQueueEntries', DEFAULT_QUEUE_LIMIT],
+] as const;
 
 describe('protocol envelope foundations', () => {
   it('accepts a deterministic v1 message.request envelope', () => {
@@ -260,6 +278,45 @@ describe('protocol envelope foundations', () => {
   ] as const)('rejects %s as malformed before admission', (_label, candidate) => {
     expectFailure(validateEnvelope(candidate, { now: NOW }), 'malformed');
   });
+  it.each([
+    [
+      'empty sender sessionId',
+      { ...asRecord(validRequest), sender: { ...validRequest.sender, sessionId: '' } },
+    ],
+    [
+      'control sender sessionId',
+      {
+        ...asRecord(validRequest),
+        sender: { ...validRequest.sender, sessionId: 'session-\u0000-a' },
+      },
+    ],
+    [
+      'empty sender runtimeId',
+      { ...asRecord(validRequest), sender: { ...validRequest.sender, runtimeId: '' } },
+    ],
+    [
+      'control sender runtimeId',
+      {
+        ...asRecord(validRequest),
+        sender: { ...validRequest.sender, runtimeId: 'runtime-\u0007-a' },
+      },
+    ],
+    ['empty recipient runtimeId', { ...asRecord(validRequest), recipientRuntimeId: '' }],
+    [
+      'control recipient runtimeId',
+      { ...asRecord(validRequest), recipientRuntimeId: 'runtime-\u000b-b' },
+    ],
+  ] as const)('rejects %s identifiers as malformed before admission', (_label, candidate) => {
+    expectFailure(validateEnvelope(candidate, { now: NOW }), 'malformed');
+  });
+  it.each([
+    ['room id missing canonical prefix', { ...asRecord(validRequest), roomId: ROOM_ID.slice(3) }],
+    ['room id wrong length', { ...asRecord(validRequest), roomId: ROOM_ID.slice(0, -1) }],
+    ['room id uppercase', { ...asRecord(validRequest), roomId: ROOM_ID.toUpperCase() }],
+    ['room id with extra suffix', { ...asRecord(validRequest), roomId: `${ROOM_ID}0` }],
+  ] as const)('rejects %s as malformed before admission', (_label, candidate) => {
+    expectFailure(validateEnvelope(candidate, { now: NOW }), 'malformed');
+  });
 
   it.each([
     ['message.request missing requestId', withoutField(validRequest, 'requestId')],
@@ -298,8 +355,10 @@ describe('protocol envelope foundations', () => {
   });
 
   it.each([
+    ['peer.describe', validDescribe],
     ['message.request', validRequest],
     ['message.reply', validReply],
+    ['message.notify', validNotify],
     ['task.status', validStatus],
     ['task.cancel', validCancel],
   ] as const)('rejects a non-UUID operationId for %s before admission', (_operation, envelope) => {
@@ -349,6 +408,9 @@ describe('protocol envelope foundations', () => {
       ),
       'malformed',
     );
+    expect(
+      validateEnvelope({ ...asRecord(validRequest), parentOperationId: OTHER_ID }, { now: NOW }).ok,
+    ).toBe(true);
   });
 
   it('validates UUIDv4 and RFC 3339 UTC helpers at their boundaries', () => {
@@ -455,6 +517,16 @@ describe('typed content and schema validation', () => {
     expect(matching.ok).toBe(true);
     expectFailure(mismatching, 'invalid_content');
   });
+  it('admits a valid expectedResponse at message.request envelope validation', () => {
+    const envelope = {
+      ...asRecord(validRequest),
+      payload: {
+        ...validRequest.payload,
+        expectedResponse: { contentType: 'json', schema: localSchema },
+      },
+    };
+    expect(validateEnvelope(envelope, { now: NOW }).ok).toBe(true);
+  });
 
   it('rejects remote and unresolved local schema references without network access', () => {
     const remote = validateJsonSchema({ $ref: 'https://example.test/schema.json' });
@@ -495,7 +567,50 @@ describe('typed content and schema validation', () => {
       code,
     );
   });
+  it.each([
+    ['expected response missing schema', { contentType: 'json' }, 'malformed'],
+    ['expected response wrong contentType', { contentType: 'text', schema: {} }, 'incompatible'],
+    [
+      'expected response non-Draft-2020-12 schema',
+      { contentType: 'json', schema: { $schema: 'https://json-schema.org/draft-07/schema#' } },
+      'incompatible',
+    ],
+  ] as const)(
+    'rejects %s at message.request envelope admission',
+    (_label, expectedResponse, code) => {
+      expectFailure(
+        validateEnvelope(
+          {
+            ...asRecord(validRequest),
+            payload: { ...validRequest.payload, expectedResponse },
+          },
+          { now: NOW },
+        ),
+        code,
+      );
+    },
+  );
 
+  it.each([
+    ['completed', validReply.payload],
+    ['failed', { outcome: 'failed', error: createProtocolError('internal', 'failed fixture') }],
+    [
+      'rejected',
+      { outcome: 'rejected', error: createProtocolError('malformed', 'rejected fixture') },
+    ],
+    ['cancelled without error', { outcome: 'cancelled' }],
+    [
+      'cancelled with error',
+      { outcome: 'cancelled', error: createProtocolError('cancelled', 'cancelled fixture') },
+    ],
+    ['expired without error', { outcome: 'expired' }],
+    [
+      'expired with error',
+      { outcome: 'expired', error: createProtocolError('expired', 'expired fixture') },
+    ],
+  ] as const)('accepts a valid %s reply outcome at envelope admission', (_label, payload) => {
+    expect(validateEnvelope({ ...asRecord(validReply), payload }, { now: NOW }).ok).toBe(true);
+  });
   it.each([
     ['notify missing content', { ...asRecord(validNotify), payload: {} }, 'invalid_content'],
     [
@@ -522,6 +637,63 @@ describe('typed content and schema validation', () => {
     [
       'reply failed missing wire error',
       { ...asRecord(validReply), payload: { outcome: 'failed' } },
+      'malformed',
+    ],
+    [
+      'rejected missing wire error',
+      { ...asRecord(validReply), payload: { outcome: 'rejected' } },
+      'malformed',
+    ],
+    [
+      'failed reply with content',
+      {
+        ...asRecord(validReply),
+        payload: {
+          outcome: 'failed',
+          content: { type: 'text', text: 'not allowed' },
+          error: createProtocolError('internal', 'failed fixture'),
+        },
+      },
+      'malformed',
+    ],
+    [
+      'rejected reply with content',
+      {
+        ...asRecord(validReply),
+        payload: {
+          outcome: 'rejected',
+          content: { type: 'text', text: 'not allowed' },
+          error: createProtocolError('malformed', 'rejected fixture'),
+        },
+      },
+      'malformed',
+    ],
+    [
+      'cancelled reply with content',
+      {
+        ...asRecord(validReply),
+        payload: { outcome: 'cancelled', content: { type: 'text', text: 'not allowed' } },
+      },
+      'malformed',
+    ],
+    [
+      'expired reply with content',
+      {
+        ...asRecord(validReply),
+        payload: { outcome: 'expired', content: { type: 'text', text: 'not allowed' } },
+      },
+      'malformed',
+    ],
+    [
+      'completed reply with error',
+      {
+        ...asRecord(validReply),
+        payload: {
+          outcome: 'completed',
+          content: { type: 'text', text: 'done' },
+          error: createProtocolError('internal', 'not allowed'),
+        },
+      },
       'malformed',
     ],
     [
@@ -636,6 +808,34 @@ describe('operation responses, versions, and limits', () => {
       expect(validateOperationResponse(response, { now: NOW }).ok).toBe(true);
     },
   );
+  it('rejects expectedRequestId mismatches for replies, status, and cancellation responses', () => {
+    expectFailure(
+      validateOperationResponse(validOperationResponses[2][1], {
+        expectedRequestId: OTHER_ID,
+      }),
+      'malformed',
+    );
+    expectFailure(
+      validateOperationResponse(
+        {
+          ...asRecord(validOperationResponses[4][1]),
+          result: { snapshot: { ...validTaskSnapshot, requestId: OTHER_ID } },
+        },
+        { expectedRequestId: REQUEST_ID },
+      ),
+      'malformed',
+    );
+    expectFailure(
+      validateOperationResponse(
+        {
+          ...asRecord(validOperationResponses[5][1]),
+          result: { snapshot: { ...validTaskSnapshot, requestId: OTHER_ID } },
+        },
+        { expectedRequestId: REQUEST_ID },
+      ),
+      'malformed',
+    );
+  });
 
   it.each([
     ['peer.describe missing agent card', validOperationResponses[0][1], {}],
@@ -750,6 +950,57 @@ describe('operation responses, versions, and limits', () => {
       validateOperationResponse({ ...asRecord(validRequestResponse), protocolVersion: '2.0' }),
       'incompatible',
     );
+    for (const version of ['0.9', '1.1']) {
+      expectFailure(
+        validateEnvelope({ ...asRecord(validRequest), protocolVersion: version }, { now: NOW }),
+        'incompatible',
+      );
+      expectFailure(
+        validateOperationResponse({ ...asRecord(validRequestResponse), protocolVersion: version }),
+        'incompatible',
+      );
+    }
+    expect(
+      validateEnvelope(
+        {
+          ...asRecord(validDescribe),
+          payload: { requestedProtocolVersion: PROTOCOL_VERSION },
+        },
+        { now: NOW },
+      ).ok,
+    ).toBe(true);
+    expectFailure(
+      validateEnvelope(
+        { ...asRecord(validDescribe), payload: { requestedProtocolVersion: '0.9' } },
+        { now: NOW },
+      ),
+      'incompatible',
+    );
+    expectFailure(
+      validateEnvelope(
+        { ...asRecord(validDescribe), payload: { requestedProtocolVersion: '1.1' } },
+        { now: NOW },
+      ),
+      'incompatible',
+    );
+    expectFailure(
+      validateEnvelope(
+        { ...asRecord(validDescribe), payload: { requestedProtocolVersion: 1 } },
+        { now: NOW },
+      ),
+      'malformed',
+    );
+    expectFailure(
+      validateOperationResponse(
+        {
+          ...asRecord(validRequestResponse),
+          operation: 'message.unknown',
+          result: {},
+        },
+        { now: NOW },
+      ),
+      'incompatible',
+    );
     expect(
       validateEnvelope(
         { ...asRecord(validRequest), optionalExtension: { fixture: true } },
@@ -787,6 +1038,256 @@ describe('operation responses, versions, and limits', () => {
       }),
       'malformed',
     );
+  });
+  it.each([
+    ['missing agent card name', withoutField(validAgentCard, 'name'), 'malformed'],
+    ['missing agent card sessionId', withoutField(validAgentCard, 'sessionId'), 'malformed'],
+    ['missing agent card runtimeId', withoutField(validAgentCard, 'runtimeId'), 'malformed'],
+    [
+      'missing supported protocol versions',
+      withoutField(validAgentCard, 'supportedProtocolVersions'),
+      'incompatible',
+    ],
+    [
+      'empty supported protocol versions',
+      { ...validAgentCard, supportedProtocolVersions: [] },
+      'incompatible',
+    ],
+    [
+      'duplicate supported protocol versions',
+      { ...validAgentCard, supportedProtocolVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION] },
+      'malformed',
+    ],
+    [
+      'unsupported supported protocol version',
+      { ...validAgentCard, supportedProtocolVersions: ['1.1'] },
+      'incompatible',
+    ],
+    ['missing operations', withoutField(validAgentCard, 'operations'), 'malformed'],
+    ['empty operations', { ...validAgentCard, operations: [] }, 'malformed'],
+    [
+      'operation capability missing operation',
+      { ...validAgentCard, operations: [{}] },
+      'malformed',
+    ],
+    [
+      'duplicate operation capability',
+      {
+        ...validAgentCard,
+        operations: [{ operation: 'peer.describe' }, ...validAgentCard.operations],
+      },
+      'malformed',
+    ],
+    [
+      'unsupported operation capability',
+      { ...validAgentCard, operations: [{ operation: 'message.unknown' }] },
+      'incompatible',
+    ],
+    [
+      'missing content capabilities',
+      withoutField(validAgentCard, 'contentCapabilities'),
+      'malformed',
+    ],
+    ['empty content capabilities', { ...validAgentCard, contentCapabilities: [] }, 'malformed'],
+    [
+      'content capability missing type',
+      { ...validAgentCard, contentCapabilities: [{}] },
+      'malformed',
+    ],
+    [
+      'duplicate content capability',
+      { ...validAgentCard, contentCapabilities: [{ type: 'text' }, { type: 'text' }] },
+      'malformed',
+    ],
+    [
+      'unsupported content capability',
+      { ...validAgentCard, contentCapabilities: [{ type: 'xml' }] },
+      'malformed',
+    ],
+    [
+      'non-boolean content schema capability',
+      { ...validAgentCard, contentCapabilities: [{ type: 'json', supportsSchema: 'yes' }] },
+      'malformed',
+    ],
+    ['missing capabilities', withoutField(validAgentCard, 'capabilities'), 'malformed'],
+    [
+      'missing cancellation capability',
+      {
+        ...validAgentCard,
+        capabilities: withoutField(validAgentCard.capabilities, 'supportsCancellation'),
+      },
+      'malformed',
+    ],
+    [
+      'non-boolean cancellation capability',
+      {
+        ...validAgentCard,
+        capabilities: { ...validAgentCard.capabilities, supportsCancellation: 'yes' },
+      },
+      'malformed',
+    ],
+    [
+      'missing notification capability',
+      {
+        ...validAgentCard,
+        capabilities: withoutField(validAgentCard.capabilities, 'supportsNotifications'),
+      },
+      'malformed',
+    ],
+    [
+      'non-boolean notification capability',
+      {
+        ...validAgentCard,
+        capabilities: { ...validAgentCard.capabilities, supportsNotifications: 1 },
+      },
+      'malformed',
+    ],
+    ['missing limits', withoutField(validAgentCard, 'limits'), 'malformed'],
+    [
+      'missing requestTtlMs limit',
+      { ...validAgentCard, limits: withoutField(validAgentCard.limits, 'requestTtlMs') },
+      'malformed',
+    ],
+    [
+      'missing maxRequestTtlMs limit',
+      { ...validAgentCard, limits: withoutField(validAgentCard.limits, 'maxRequestTtlMs') },
+      'malformed',
+    ],
+    [
+      'missing maxControlTtlMs limit',
+      { ...validAgentCard, limits: withoutField(validAgentCard.limits, 'maxControlTtlMs') },
+      'malformed',
+    ],
+    [
+      'missing maxEnvelopeBytes limit',
+      { ...validAgentCard, limits: withoutField(validAgentCard.limits, 'maxEnvelopeBytes') },
+      'malformed',
+    ],
+    [
+      'missing maxSchemaBytes limit',
+      { ...validAgentCard, limits: withoutField(validAgentCard.limits, 'maxSchemaBytes') },
+      'malformed',
+    ],
+    [
+      'missing maxQueueEntries limit',
+      { ...validAgentCard, limits: withoutField(validAgentCard.limits, 'maxQueueEntries') },
+      'malformed',
+    ],
+  ] as const)('rejects %s in an Agent Card', (_label, agentCard, code) => {
+    expectFailure(validateOperationResponse(makeDescribeResponse(agentCard)), code);
+  });
+  it('accepts explicit false cancellation and notification capability booleans', () => {
+    expect(
+      validateOperationResponse(
+        makeDescribeResponse({
+          ...validAgentCard,
+          capabilities: { supportsCancellation: false, supportsNotifications: false },
+        }),
+      ).ok,
+    ).toBe(true);
+  });
+  it.each(AGENT_CARD_LIMIT_CEILINGS)(
+    'accepts Agent Card %s at its exact v1 ceiling',
+    (field, ceiling) => {
+      expect(
+        validateOperationResponse(
+          makeDescribeResponse({
+            ...validAgentCard,
+            limits: { ...validAgentCard.limits, [field]: ceiling },
+          }),
+        ).ok,
+      ).toBe(true);
+    },
+  );
+  it.each(AGENT_CARD_LIMIT_CEILINGS)(
+    'rejects Agent Card %s above its v1 ceiling',
+    (field, ceiling) => {
+      expectFailure(
+        validateOperationResponse(
+          makeDescribeResponse({
+            ...validAgentCard,
+            limits: { ...validAgentCard.limits, [field]: ceiling + 1 },
+          }),
+        ),
+        'malformed',
+      );
+    },
+  );
+  it.each(AGENT_CARD_LIMIT_CEILINGS)(
+    'rejects zero and non-integer Agent Card %s limits',
+    (field) => {
+      for (const value of [0, 1.5]) {
+        expectFailure(
+          validateOperationResponse(
+            makeDescribeResponse({
+              ...validAgentCard,
+              limits: { ...validAgentCard.limits, [field]: value },
+            }),
+          ),
+          'malformed',
+        );
+      }
+    },
+  );
+  it('rejects an Agent Card whose request TTL exceeds its maximum TTL', () => {
+    expectFailure(
+      validateOperationResponse(
+        makeDescribeResponse({
+          ...validAgentCard,
+          limits: {
+            ...validAgentCard.limits,
+            requestTtlMs: MAX_REQUEST_TTL_MS,
+            maxRequestTtlMs: DEFAULT_REQUEST_TTL_MS,
+          },
+        }),
+      ),
+      'malformed',
+    );
+  });
+  it.each(AGENT_CARD_LIMIT_CEILINGS)(
+    'accepts configured %s at its exact v1 ceiling',
+    (field, ceiling) => {
+      const overrides =
+        field === 'maxRequestTtlMs'
+          ? { [field]: ceiling, requestTtlMs: DEFAULT_REQUEST_TTL_MS }
+          : { [field]: ceiling };
+      expect(createProtocolConfig(overrides)).toMatchObject(overrides);
+    },
+  );
+  it.each([
+    ['requestTtlMs', { requestTtlMs: DEFAULT_REQUEST_TTL_MS - 1 }],
+    [
+      'maxRequestTtlMs',
+      { requestTtlMs: DEFAULT_REQUEST_TTL_MS, maxRequestTtlMs: DEFAULT_REQUEST_TTL_MS },
+    ],
+    ['maxControlTtlMs', { maxControlTtlMs: MAX_CONTROL_TTL_MS - 1 }],
+    ['maxEnvelopeBytes', { maxEnvelopeBytes: MAX_ENVELOPE_BYTES - 1 }],
+    ['maxSchemaBytes', { maxSchemaBytes: MAX_SCHEMA_BYTES - 1 }],
+    ['maxQueueEntries', { maxQueueEntries: DEFAULT_QUEUE_LIMIT - 1 }],
+  ] as const)('accepts stricter configured %s overrides', (_field, overrides) => {
+    expect(createProtocolConfig(overrides)).toMatchObject(overrides);
+  });
+  it.each(AGENT_CARD_LIMIT_CEILINGS)(
+    'rejects configured %s above its v1 ceiling',
+    (field, ceiling) => {
+      expect(() => createProtocolConfig({ [field]: ceiling + 1 })).toThrow(RangeError);
+    },
+  );
+  it.each(AGENT_CARD_LIMIT_CEILINGS)(
+    'rejects zero and non-integer configured %s overrides',
+    (field) => {
+      for (const value of [0, 1.5]) {
+        expect(() => createProtocolConfig({ [field]: value })).toThrow(RangeError);
+      }
+    },
+  );
+  it('rejects configured request TTL values that exceed maxRequestTtlMs', () => {
+    expect(() =>
+      createProtocolConfig({
+        requestTtlMs: DEFAULT_REQUEST_TTL_MS + 1,
+        maxRequestTtlMs: DEFAULT_REQUEST_TTL_MS,
+      }),
+    ).toThrow(RangeError);
   });
 
   it('enforces normal, control, envelope, and schema limits', () => {
@@ -918,6 +1419,93 @@ describe('canonical request fingerprints', () => {
       ),
     ).not.toBe(fingerprint);
   });
+  it('changes fingerprints for every mutable immutable-field fixture', () => {
+    const candidates = [
+      [
+        'sender sessionId',
+        validRequest,
+        { ...asRecord(validRequest), sender: { ...validRequest.sender, sessionId: 'session-c' } },
+      ],
+      [
+        'sender runtimeId',
+        validRequest,
+        { ...asRecord(validRequest), sender: { ...validRequest.sender, runtimeId: 'runtime-c' } },
+      ],
+      ['operationId', validReply, { ...asRecord(validReply), operationId: OTHER_ID }],
+      [
+        'operationId and initial requestId',
+        validRequest,
+        { ...asRecord(validRequest), operationId: OTHER_ID, requestId: OTHER_ID },
+      ],
+      ['target requestId', validReply, { ...asRecord(validReply), requestId: OTHER_ID }],
+      [
+        'roomId',
+        validRequest,
+        {
+          ...asRecord(validRequest),
+          roomId: deriveRoomId('explicit', 'different-conformance-room'),
+        },
+      ],
+      [
+        'createdAt',
+        validRequest,
+        { ...asRecord(validRequest), createdAt: '2026-08-07T10:01:00.000Z' },
+      ],
+      [
+        'expiresAt',
+        validRequest,
+        { ...asRecord(validRequest), expiresAt: '2026-08-07T10:11:00.000Z' },
+      ],
+      [
+        'traceId',
+        validRequest,
+        { ...asRecord(validRequest), traceId: `${TRACE_ID.slice(0, -1)}7` },
+      ],
+      [
+        'parentOperationId',
+        validRequest,
+        { ...asRecord(validRequest), parentOperationId: OTHER_ID },
+      ],
+      [
+        'operation',
+        validRequest,
+        withoutField(
+          {
+            ...asRecord(validRequest),
+            operation: 'message.notify',
+            payload: { content: validRequest.payload.content },
+          },
+          'requestId',
+        ),
+      ],
+      [
+        'recipientRuntimeId',
+        validRequest,
+        { ...asRecord(validRequest), recipientRuntimeId: 'runtime-c' },
+      ],
+      [
+        'payload',
+        validRequest,
+        { ...asRecord(validRequest), payload: { content: { type: 'text', text: 'changed' } } },
+      ],
+    ] as const;
+    for (const [label, original, candidate] of candidates) {
+      expect(canonicalRequestFingerprint(candidate, { now: NOW }), label).not.toBe(
+        canonicalRequestFingerprint(original, { now: NOW }),
+      );
+    }
+  });
+  it('binds protocolVersion into canonical data while rejecting other exact versions', () => {
+    expect(canonicalRequestData(validRequest, { now: NOW })).toContain(
+      `"protocolVersion":"${PROTOCOL_VERSION}"`,
+    );
+    expect(() =>
+      canonicalRequestFingerprint(
+        { ...asRecord(validRequest), protocolVersion: '1.1' },
+        { now: NOW },
+      ),
+    ).toThrow();
+  });
 });
 
 describe('stable protocol errors and retryability', () => {
@@ -995,6 +1583,92 @@ describe('stable protocol errors and retryability', () => {
     );
   });
 
+  it.each([
+    ['empty', ''],
+    ['leading whitespace', ' queue is full'],
+    ['trailing whitespace', 'queue is full '],
+    ['control character', 'queue is full\n'],
+    ['overlong', 'x'.repeat(MAX_PROTOCOL_ERROR_MESSAGE_LENGTH + 1)],
+  ] as const)('rejects %s wire-error message fixture', (_label, message) => {
+    const error = { ...createProtocolError('busy', 'queue is full'), message };
+    expectFailure(
+      validateOperationResponse({
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'message.request',
+        operationId: REQUEST_ID,
+        traceId: TRACE_ID,
+        error,
+      }),
+      'malformed',
+    );
+  });
+  it('accepts bounded structured error details', () => {
+    const error = createProtocolError('busy', 'queue is full', {
+      retryAfterMs: 250,
+      details: { queue: 'inbound', attempt: 2, nested: { available: false } },
+    });
+    const result = validateOperationResponse({
+      protocolVersion: PROTOCOL_VERSION,
+      operation: 'message.request',
+      operationId: REQUEST_ID,
+      traceId: TRACE_ID,
+      error,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect((result.value as { error: ProtocolError }).error.details).toEqual(error.details);
+    }
+  });
+  it.each([
+    ['primitive string details', 'not-an-object'],
+    ['primitive number details', 42],
+    ['primitive boolean details', true],
+    ['null details', null],
+    ['array details', []],
+  ] as const)('rejects %s on a wire error', (_label, details) => {
+    const error = { ...createProtocolError('busy', 'queue is full'), details };
+    expectFailure(
+      validateOperationResponse({
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'message.request',
+        operationId: REQUEST_ID,
+        traceId: TRACE_ID,
+        error,
+      }),
+      'malformed',
+    );
+  });
+  it('rejects oversized structured error details', () => {
+    const error = {
+      ...createProtocolError('busy', 'queue is full'),
+      details: { note: 'x'.repeat(MAX_ENVELOPE_BYTES) },
+    };
+    expectFailure(
+      validateOperationResponse({
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'message.request',
+        operationId: REQUEST_ID,
+        traceId: TRACE_ID,
+        error,
+      }),
+      'oversized',
+    );
+  });
+  it.each(['busy', 'unreachable'] as const)(
+    'accepts retryAfterMs for retryable %s errors',
+    (code) => {
+      const error = createProtocolError(code, `${code} fixture`, { retryAfterMs: 250 });
+      expect(
+        validateOperationResponse({
+          protocolVersion: PROTOCOL_VERSION,
+          operation: 'message.request',
+          operationId: REQUEST_ID,
+          traceId: TRACE_ID,
+          error,
+        }).ok,
+      ).toBe(true);
+    },
+  );
   it.each([
     [
       'busy retryAfterMs zero',
