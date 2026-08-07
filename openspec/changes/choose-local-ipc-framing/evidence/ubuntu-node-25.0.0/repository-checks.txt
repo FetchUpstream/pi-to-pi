@@ -1,0 +1,49 @@
+$ node --version
+v25.0.0
+$ npm run typecheck
+
+> pi-to-pi@0.0.1 typecheck
+> tsc --noEmit
+
+TYPECHECK_EXIT_STATUS=0
+$ npx eslint tests/fixtures/local-ipc tests/fixtures/local-ipc-spike tests/fixtures/local-ipc-http
+FOCUSED_ESLINT_EXIT_STATUS=0
+$ npm run format:check
+
+> pi-to-pi@0.0.1 format:check
+> prettier --check .
+
+Checking formatting...
+[warn] .pi/prompts/opsx-apply.md
+[warn] .pi/prompts/opsx-archive.md
+[warn] .pi/prompts/opsx-explore.md
+[warn] .pi/prompts/opsx-propose.md
+[warn] .pi/prompts/opsx-sync.md
+[warn] .pi/prompts/opsx-update.md
+[warn] .pi/skills/openspec-apply-change/SKILL.md
+[warn] .pi/skills/openspec-archive-change/SKILL.md
+[warn] .pi/skills/openspec-explore/SKILL.md
+[warn] .pi/skills/openspec-propose/SKILL.md
+[warn] .pi/skills/openspec-sync-specs/SKILL.md
+[warn] .pi/skills/openspec-update-change/SKILL.md
+[warn] AGENTS.md
+[warn] Code style issues found in 13 files. Run Prettier with --write to fix.
+FORMAT_CHECK_EXIT_STATUS=1
+$ npm test
+
+> pi-to-pi@0.0.1 test
+> vitest run
+
+
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p-003-spike-and-choose-the-local-ipc-framing-s
+
+
+ Test Files  8 passed (8)
+      Tests  85 passed (85)
+   Start at  16:16:04
+   Duration  644ms (transform 254ms, setup 0ms, import 469ms, tests 703ms, environment 0ms)
+
+NPM_TEST_EXIT_STATUS=0
+REPOSITORY_CHECK_EXIT_STATUS=1
+FORMAT_CHECK_NOTE=FAIL is pre-existing: .pi/prompts/*.md, .pi/skills/**/*.md, and AGENTS.md are not Prettier-formatted on the coordinator snapshot; no changed ADR/evidence file is implicated.
+EXIT_STATUS=1

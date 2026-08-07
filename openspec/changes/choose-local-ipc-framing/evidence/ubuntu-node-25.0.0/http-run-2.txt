@@ -1,0 +1,27 @@
+$ node --version
+v25.0.0
+$ npx vitest run tests/fixtures/local-ipc-http/http-candidate.test.ts --reporter=verbose
+
+ RUN  v4.1.10 /home/louis/orca/workspaces/pi-to-pi/p2p-003-spike-and-choose-the-local-ipc-framing-s
+
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > round-trips one request and one response over the native POSIX endpoint 10ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized request before invoking the handler 2ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > rejects an oversized response without retaining an unbounded body 3ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds server response writes and completes resource cleanup 1ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds raw HTTP response capture 2ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > applies finite connect, write, and read phase deadlines 18ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > destroys the request when the caller aborts 10ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > handles split HTTP headers/body and rejects malformed HTTP through the parser 3ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > supports concurrent one-operation requests and preserves response association 21ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > closes the HTTP server, disables keep-alive, and removes its POSIX socket 17ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved regular-file replacement without following it 14ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > recovers an unchanged moved symlink replacement without following it 14ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > bounds close by the caller deadline and preserves a failed close 1ms
+ ✓ tests/fixtures/local-ipc-http/http-candidate.test.ts > HTTP over local IPC comparison candidate > represents Windows named pipes explicitly even when this run is not Windows 0ms
+
+ Test Files  1 passed (1)
+      Tests  14 passed (14)
+   Start at  16:09:54
+   Duration  238ms (transform 40ms, setup 0ms, import 62ms, tests 118ms, environment 0ms)
+
+EXIT_STATUS=0
