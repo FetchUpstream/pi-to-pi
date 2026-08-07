@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 
@@ -5,6 +8,7 @@ import {
   appendTaskMetadata,
   completeTaskMetadata,
   createPersistedPiSessionFixture,
+  createPiRuntimeFixture,
   createTaskStateLifecycle,
   defaultFauxResponse,
   expireTaskMetadata,
@@ -56,6 +60,14 @@ function taskEntryId(sessionManager: SessionManager, requestId: string): string 
     throw new Error(`Missing p2p.task entry for ${requestId}`);
   }
   return entry.id;
+}
+
+function currentTaskBinding(fixture: PiRuntimeFixture) {
+  const binding = fixture.taskStateBinding;
+  if (!binding) {
+    throw new Error('Task-state lifecycle is not bound to the current Pi session');
+  }
+  return binding;
 }
 
 describe('p2p.task metadata schema and transitions', () => {
@@ -332,6 +344,66 @@ describe('p2p.task persistence and reload recovery', () => {
       await fixture.dispose();
     }
   });
+  it('rebuilds active task state through automatic reload and replaces it on boundaries', async () => {
+    const taskStateLifecycle = lifecycle('runtime-auto-reload');
+    const fixture = await persistedFixtureWithAssistant(taskStateLifecycle);
+    const originalBinding = currentTaskBinding(fixture);
+    const originalSessionFile = fixture.sessionFile;
+    expect(originalSessionFile).toBeDefined();
+    try {
+      taskStateLifecycle.append(originalBinding, {
+        requestId: 'request-reload',
+        runtimeId: 'runtime-original',
+        state: 'accepted',
+        updatedAt: UPDATED_AT,
+        expiresAt: FUTURE_EXPIRY,
+      });
+      expect(taskStateLifecycle.recovered.map((task) => task.requestId)).toEqual([
+        'request-reload',
+      ]);
+      const persisted = fixture.openSession(originalSessionFile!);
+      expect(recoverTaskMetadata(persisted, RECOVERY_AT).map((task) => task.requestId)).toEqual([
+        'request-reload',
+      ]);
+      await fixture.reloadSession();
+      expect(fixture.probe.latest('session_start')?.reason).toBe('reload');
+      expect(taskStateLifecycle.starts.at(-1)?.reason).toBe('reload');
+      expect(taskStateLifecycle.binding).toBe(originalBinding);
+      expect(taskStateLifecycle.recovered.map((task) => task.requestId)).toEqual([
+        'request-reload',
+      ]);
+      expect(currentTaskBinding(fixture)).toBe(originalBinding);
+
+      await fixture.newSession();
+      expect(taskStateLifecycle.recovered).toEqual([]);
+      expect(() =>
+        taskStateLifecycle.complete(originalBinding, 'request-reload', {
+          runtimeId: 'runtime-original',
+          updatedAt: NEXT_AT,
+        }),
+      ).toThrow(/binding is no longer active/u);
+
+      const replacementBinding = currentTaskBinding(fixture);
+      taskStateLifecycle.append(replacementBinding, {
+        requestId: 'request-replacement',
+        runtimeId: 'runtime-replacement',
+        state: 'accepted',
+        updatedAt: UPDATED_AT,
+        expiresAt: FUTURE_EXPIRY,
+      });
+      expect(taskStateLifecycle.recovered.map((task) => task.requestId)).toEqual([
+        'request-replacement',
+      ]);
+
+      await fixture.resumeSession(originalSessionFile!);
+      expect(taskStateLifecycle.recovered.map((task) => task.requestId)).toEqual([
+        'request-reload',
+      ]);
+      expect(foldLatestTaskMetadata(fixture.sessionManager).has('request-replacement')).toBe(false);
+    } finally {
+      await fixture.dispose();
+    }
+  });
 });
 
 describe('p2p.task session ownership and lifecycle recovery', () => {
@@ -339,7 +411,7 @@ describe('p2p.task session ownership and lifecycle recovery', () => {
     const taskStateLifecycle = lifecycle('runtime-session');
     const fixture = await persistedFixtureWithAssistant(taskStateLifecycle);
     try {
-      taskStateLifecycle.append(fixture.sessionManager, {
+      taskStateLifecycle.append(currentTaskBinding(fixture), {
         requestId: 'request-original',
         runtimeId: 'runtime-original',
         peerId: 'peer-a',
@@ -360,7 +432,7 @@ describe('p2p.task session ownership and lifecycle recovery', () => {
       expect(recoverTaskMetadata(fixture.sessionManager, RECOVERY_AT)).toEqual([]);
       expect(taskStateLifecycle.recovered).toEqual([]);
 
-      taskStateLifecycle.append(fixture.sessionManager, {
+      taskStateLifecycle.append(currentTaskBinding(fixture), {
         requestId: 'request-new',
         runtimeId: 'runtime-new',
         state: 'accepted',
@@ -368,7 +440,7 @@ describe('p2p.task session ownership and lifecycle recovery', () => {
         expiresAt: FUTURE_EXPIRY,
       });
       expect(taskStateLifecycle.recovered.map((task) => task.requestId)).toEqual(['request-new']);
-      taskStateLifecycle.complete(fixture.sessionManager, 'request-new', {
+      taskStateLifecycle.complete(currentTaskBinding(fixture), 'request-new', {
         runtimeId: 'runtime-new',
         updatedAt: NEXT_AT,
       });
@@ -414,6 +486,64 @@ describe('p2p.task session ownership and lifecycle recovery', () => {
       await fixture.dispose();
     }
   });
+  it('rejects a stale lifecycle binding when an in-memory fork reuses its SessionManager', async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), 'pi-p2p-task-memory-fork-'));
+    const cwd = join(rootDir, 'workspace');
+    const agentDir = join(rootDir, 'agent');
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    const sessionManager = SessionManager.inMemory(cwd);
+    const taskStateLifecycle = lifecycle('runtime-memory-fork');
+    const fixture = await createPiRuntimeFixture({
+      cwd,
+      agentDir,
+      sessionManager,
+      taskStateLifecycle,
+    });
+    try {
+      fixture.faux.setResponses([defaultFauxResponse('memory bootstrap')]);
+      await fixture.session.sendCustomMessage(
+        {
+          customType: 'p2p.memory-bootstrap',
+          content: 'memory bootstrap body',
+          display: false,
+        },
+        { triggerTurn: true },
+      );
+      const originalBinding = currentTaskBinding(fixture);
+      const originalSession = fixture.session;
+      taskStateLifecycle.append(originalBinding, {
+        requestId: 'request-memory-fork',
+        runtimeId: 'runtime-memory-source',
+        state: 'accepted',
+        updatedAt: UPDATED_AT,
+        expiresAt: FUTURE_EXPIRY,
+      });
+      const acceptedEntryId = taskEntryId(sessionManager, 'request-memory-fork');
+      await fixture.fork(acceptedEntryId, { position: 'at' });
+      expect(fixture.sessionManager).toBe(sessionManager);
+      expect(fixture.session).not.toBe(originalSession);
+      expect(taskStateLifecycle.recovered).toEqual([]);
+      expect(() =>
+        taskStateLifecycle.append(originalBinding, {
+          requestId: 'request-stale-append',
+          runtimeId: 'runtime-memory-source',
+          state: 'accepted',
+          updatedAt: UPDATED_AT,
+          expiresAt: FUTURE_EXPIRY,
+        }),
+      ).toThrow(/binding is no longer active/u);
+      expect(() =>
+        taskStateLifecycle.complete(originalBinding, 'request-memory-fork', {
+          runtimeId: 'runtime-memory-source',
+          updatedAt: NEXT_AT,
+        }),
+      ).toThrow(/binding is no longer active/u);
+    } finally {
+      await fixture.dispose();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('p2p.task fork and clone lifecycle supersession', () => {
@@ -423,7 +553,7 @@ describe('p2p.task fork and clone lifecycle supersession', () => {
     let clone: Awaited<ReturnType<typeof fixture.cloneSession>> | undefined;
     let cloneRuntime: PiRuntimeFixture | undefined;
     try {
-      sourceLifecycle.append(fixture.sessionManager, {
+      sourceLifecycle.append(currentTaskBinding(fixture), {
         requestId: 'request-clone',
         runtimeId: 'runtime-source',
         peerId: 'peer-a',
@@ -475,7 +605,7 @@ describe('p2p.task fork and clone lifecycle supersession', () => {
     const taskStateLifecycle = lifecycle('runtime-fork');
     const fixture = await persistedFixtureWithAssistant(taskStateLifecycle);
     try {
-      taskStateLifecycle.append(fixture.sessionManager, {
+      taskStateLifecycle.append(currentTaskBinding(fixture), {
         requestId: 'request-fork',
         runtimeId: 'runtime-source',
         peerId: 'peer-a',

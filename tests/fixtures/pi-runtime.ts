@@ -31,8 +31,7 @@ import {
   createPiProbe,
   type PiProbe,
 } from './pi-probe.js';
-import { TaskStateLifecycle } from './task-state.js';
-
+import { TaskStateLifecycle, type TaskStateLifecycleBinding } from './task-state.js';
 export const DEFAULT_FAUX_PROVIDER_ID = 'pi-p2p-fixture-faux';
 export const DEFAULT_FAUX_MODEL_ID = 'pi-p2p-fixture-model';
 export const DEFAULT_FAUX_API = 'faux';
@@ -79,6 +78,7 @@ export interface PiRuntimeFixture {
   readonly runtime: AgentSessionRuntime;
   readonly probe: PiProbe;
   readonly taskStateLifecycle: TaskStateLifecycle | undefined;
+  readonly taskStateBinding: TaskStateLifecycleBinding | undefined;
   readonly faux: FauxProviderHandle;
   readonly services: AgentSessionServices;
   readonly model: Model<string>;
@@ -291,6 +291,7 @@ export async function createPiRuntimeFixture(
     unsubscribe = runtime.session.subscribe((event: AgentSessionEvent) => {
       probe.recordSessionEvent(event, runtime.session.sessionManager);
     });
+    options.taskStateLifecycle?.bindRuntimeSession(runtime, runtime.session);
   };
 
   try {
@@ -323,6 +324,9 @@ export async function createPiRuntimeFixture(
     },
     probe,
     taskStateLifecycle: options.taskStateLifecycle,
+    get taskStateBinding() {
+      return options.taskStateLifecycle?.binding;
+    },
     faux,
     get model() {
       return options.model ?? modelFromRuntime(modelRuntime, providerId, modelId);

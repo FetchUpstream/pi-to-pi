@@ -1,4 +1,6 @@
 import type {
+  AgentSession,
+  AgentSessionRuntime,
   ExtensionAPI,
   InlineExtension,
   SessionEntry,
@@ -66,6 +68,17 @@ export interface TaskStateLifecycleOptions {
   now?: () => Date;
 }
 
+/**
+ * Exact runtime/session binding captured after the lifecycle hook starts.
+ * Session IDs remain useful for persisted ownership, but object identity prevents
+ * a stale AgentSession or reused in-memory SessionManager from mutating the new scope.
+ */
+export interface TaskStateLifecycleBinding {
+  readonly runtime: AgentSessionRuntime;
+  readonly session: AgentSession;
+  readonly sessionManager: SessionManager;
+  readonly sessionId: string;
+}
 export interface TaskLifecycleSessionStart {
   sessionId: string;
   reason: SessionStartEvent['reason'];
@@ -595,6 +608,9 @@ export class TaskStateLifecycle {
   };
 
   private activeSessionId: string | undefined;
+  private activeSessionManager: SessionManager | undefined;
+  private activeBinding: TaskStateLifecycleBinding | undefined;
+  private sessionActive = false;
   private activeTasks = new Map<string, TaskMetadataRecord>();
   private readonly _starts: TaskLifecycleSessionStart[] = [];
   private readonly _shutdowns: TaskLifecycleSessionShutdown[] = [];
@@ -615,6 +631,10 @@ export class TaskStateLifecycle {
     return this.activeSessionId;
   }
 
+  get binding(): TaskStateLifecycleBinding | undefined {
+    return this.activeBinding;
+  }
+
   get recovered(): readonly TaskMetadataRecord[] {
     return [...this.activeTasks.values()];
   }
@@ -627,12 +647,36 @@ export class TaskStateLifecycle {
     return this._shutdowns;
   }
 
+  /** Bind operations to the exact runtime and AgentSession currently hosted by Pi. */
+  bindRuntimeSession(
+    runtime: AgentSessionRuntime,
+    session: AgentSession,
+  ): TaskStateLifecycleBinding {
+    const sessionId = session.sessionId;
+    if (
+      !this.sessionActive ||
+      this.activeSessionManager !== session.sessionManager ||
+      this.activeSessionId !== sessionId ||
+      runtime.session !== session
+    ) {
+      throw new Error('p2p.task lifecycle runtime/session binding is no longer active');
+    }
+    const binding = Object.freeze({
+      runtime,
+      session,
+      sessionManager: session.sessionManager,
+      sessionId,
+    });
+    this.activeBinding = binding;
+    return binding;
+  }
+
   append(
-    sessionManager: SessionManager,
+    binding: TaskStateLifecycleBinding,
     options: Omit<AppendTaskMetadataOptions, 'now'>,
   ): TaskMetadataRecord {
-    this.assertActive(sessionManager);
-    const record = appendTaskMetadata(sessionManager, { ...options, now: this.now() });
+    this.assertActive(binding);
+    const record = appendTaskMetadata(binding.sessionManager, { ...options, now: this.now() });
     if (isTerminalTaskState(record.state)) {
       this.activeTasks.delete(record.requestId);
     } else {
@@ -642,19 +686,19 @@ export class TaskStateLifecycle {
   }
 
   complete(
-    sessionManager: SessionManager,
+    binding: TaskStateLifecycleBinding,
     requestId: string,
     options: TaskTransitionOptions,
   ): TaskMetadataRecord {
-    return this.append(sessionManager, { ...options, requestId, state: 'completed' });
+    return this.append(binding, { ...options, requestId, state: 'completed' });
   }
 
   fail(
-    sessionManager: SessionManager,
+    binding: TaskStateLifecycleBinding,
     requestId: string,
     options: TaskTransitionOptions,
   ): TaskMetadataRecord {
-    return this.append(sessionManager, { ...options, requestId, state: 'failed' });
+    return this.append(binding, { ...options, requestId, state: 'failed' });
   }
 
   private install(pi: ExtensionAPI): void {
@@ -668,6 +712,13 @@ export class TaskStateLifecycle {
 
   private handleSessionStart(event: SessionStartEvent, sessionManager: SessionManager): void {
     const sessionId = sessionManager.getSessionId();
+    const previousBinding = this.activeBinding;
+    const canReuseBinding =
+      previousBinding !== undefined &&
+      previousBinding.sessionManager === sessionManager &&
+      previousBinding.sessionId === sessionId &&
+      previousBinding.runtime.session === previousBinding.session &&
+      previousBinding.session.sessionManager === sessionManager;
     const now = this.now();
     const inherited =
       sessionManager.getHeader()?.parentSession !== undefined || event.reason === 'fork';
@@ -679,27 +730,48 @@ export class TaskStateLifecycle {
         })
       : [];
     const recovered = recoverTaskMetadata(sessionManager, now);
+    this.activeSessionManager = sessionManager;
     this.activeSessionId = sessionId;
+    this.sessionActive = true;
+    this.activeBinding = canReuseBinding ? previousBinding : undefined;
     this.activeTasks = new Map(recovered.map((record) => [record.requestId, record]));
     this._starts.push({ sessionId, reason: event.reason, recovered, superseded });
   }
 
   private handleSessionShutdown(event: SessionShutdownEvent, sessionManager: SessionManager): void {
-    const sessionId = sessionManager.getSessionId();
+    const currentSession = this.activeSessionManager === sessionManager;
+    const sessionId =
+      currentSession && this.activeSessionId ? this.activeSessionId : sessionManager.getSessionId();
     this._shutdowns.push({
       sessionId,
       reason: event.reason,
       targetSessionFile: event.targetSessionFile,
     });
-    if (this.activeSessionId === sessionId) {
+    // SessionManager can be reused by in-memory fork/branch operations and may
+    // already expose the destination ID when the outgoing session shuts down.
+    if (currentSession) {
+      this.sessionActive = false;
       this.activeSessionId = undefined;
+      this.activeSessionManager = undefined;
       this.activeTasks = new Map();
+      if (event.reason !== 'reload') {
+        this.activeBinding = undefined;
+      }
     }
   }
 
-  private assertActive(sessionManager: SessionManager): void {
-    if (this.activeSessionId !== sessionManager.getSessionId()) {
-      throw new Error('p2p.task lifecycle session is no longer active');
+  private assertActive(binding: TaskStateLifecycleBinding): void {
+    if (
+      !this.sessionActive ||
+      this.activeBinding !== binding ||
+      this.activeSessionManager !== binding.sessionManager ||
+      this.activeSessionId !== binding.sessionId ||
+      this.activeSessionManager.getSessionId() !== this.activeSessionId ||
+      binding.sessionManager !== binding.session.sessionManager ||
+      binding.sessionId !== binding.session.sessionId ||
+      binding.runtime.session !== binding.session
+    ) {
+      throw new Error('p2p.task lifecycle runtime/session binding is no longer active');
     }
   }
 }
