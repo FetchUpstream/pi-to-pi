@@ -50,6 +50,7 @@ export interface LeaseRenewalResult {
 }
 
 export type LeaseRenewal = () => void | LeaseRenewalResult | PromiseLike<void | LeaseRenewalResult>;
+export type LeaseEndpointUpdate = (endpoint: RoutingEndpoint) => void;
 export type LeaseErrorHandler = (error: unknown) => void;
 
 /** The identity that is allowed to renew one lease. */
@@ -88,6 +89,8 @@ export interface SerializedLeaseOptions {
   readonly onError?: LeaseErrorHandler;
   /** Called synchronously when the lease stops or expires. */
   readonly onStop?: () => void;
+  /** Persist endpoint changes through the owning registry/binding. */
+  readonly onEndpointUpdate?: LeaseEndpointUpdate;
   readonly scheduler?: LeaseScheduler;
   readonly now?: LeaseClock;
 }
@@ -204,9 +207,10 @@ export class SerializedLease {
   private readonly renewal: LeaseRenewal;
   private readonly onError: LeaseErrorHandler | undefined;
   private readonly onStop: (() => void) | undefined;
+  private readonly onEndpointUpdate: LeaseEndpointUpdate | undefined;
   private readonly scheduler: LeaseScheduler;
   private readonly now: LeaseClock;
-  private pending: Promise<void> = Promise.resolve();
+  private inFlightRenewal: Promise<void> | undefined;
   private timer: LeaseTimer | undefined;
   private state: LeaseState = 'idle';
   private startPromise: Promise<void> | undefined;
@@ -245,6 +249,7 @@ export class SerializedLease {
     );
     this.onError = options.onError;
     this.onStop = options.onStop;
+    this.onEndpointUpdate = options.onEndpointUpdate;
     this.scheduler = options.scheduler ?? defaultScheduler;
     this.now = options.now ?? Date.now;
     this.currentEndpoint =
@@ -257,9 +262,12 @@ export class SerializedLease {
     return this.ownerIdentity;
   }
 
-  /** Queue one owner renewal behind all earlier owner renewals. */
+  /** Start one owner renewal; overlapping calls share the in-flight attempt. */
   public renew(): Promise<void> {
-    const operation = this.pending.then(async () => {
+    if (this.inFlightRenewal !== undefined) {
+      return this.inFlightRenewal;
+    }
+    const operation = Promise.resolve().then(async () => {
       if (this.state === 'stopped') {
         throw new LeaseStoppedError();
       }
@@ -339,17 +347,25 @@ export class SerializedLease {
       this.expiresAt = renewedAt + this.ttlMs;
       this.state = 'active';
     });
-
-    // A failed renewal must not poison later owner renewals.  The caller still
-    // observes this operation's rejection, while the queue continues safely.
-    this.pending = operation.then(
-      () => undefined,
-      (error: unknown) => {
-        this.lastError = error;
-        if (this.expiresAt !== null && clockValue(this.now) >= this.expiresAt) {
-          this.markExpired();
+    this.inFlightRenewal = operation;
+    void operation.then(
+      () => {
+        if (this.inFlightRenewal === operation) {
+          this.inFlightRenewal = undefined;
         }
-        return undefined;
+      },
+      (error: unknown) => {
+        if (this.inFlightRenewal === operation) {
+          this.inFlightRenewal = undefined;
+        }
+        this.lastError = error;
+        try {
+          if (this.expiresAt !== null && clockValue(this.now) >= this.expiresAt) {
+            this.markExpired();
+          }
+        } catch (handlerError: unknown) {
+          this.lastError = handlerError;
+        }
       },
     );
     return operation;
@@ -384,8 +400,8 @@ export class SerializedLease {
     return this.startPromise;
   }
 
-  /** Stop timer work and wait for one in-flight owner renewal. */
-  public async stop(): Promise<void> {
+  /** Stop timer work without waiting for a potentially hung owner renewal. */
+  public stop(): Promise<void> {
     if (this.state !== 'stopped') {
       const wasExpired = this.state === 'expired';
       this.state = 'stopped';
@@ -397,7 +413,7 @@ export class SerializedLease {
         this.timer = undefined;
       }
     }
-    await this.pending;
+    return Promise.resolve();
   }
 
   /** Mark a missed lease deadline without changing the immutable owner identity. */
@@ -435,19 +451,14 @@ export class SerializedLease {
       throw new LeaseExpiredError();
     }
     const endpointCopy = cloneEndpoint(endpoint, this.ownerIdentity?.runtimeId);
+    // Persist through the owning registry before changing this lease's local
+    // snapshot.  A failed publication therefore cannot create divergent state.
+    this.onEndpointUpdate?.(endpointCopy);
     this.endpointGeneration += 1;
     // Publish the defensive copy immediately for callers that need the current
-    // endpoint synchronously.  The queue below orders later renewals behind it,
-    // and the generation check prevents an in-flight callback from overwriting it.
+    // endpoint synchronously.  The generation check prevents an in-flight
+    // callback from overwriting this newer endpoint.
     this.currentEndpoint = endpointCopy;
-    const operation = this.pending.then(() => undefined);
-    this.pending = operation.then(
-      () => undefined,
-      (error: unknown) => {
-        this.lastError = error;
-        return undefined;
-      },
-    );
   }
 
   public get running(): boolean {
@@ -567,18 +578,20 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
   if (
     endpoint.kind !== undefined &&
     (typeof endpoint.kind !== 'string' ||
+      endpoint.kind.trim().length === 0 ||
       endpoint.kind.length > MAX_ENDPOINT_LENGTH ||
       CONTROL_CHARACTER_PATTERN.test(endpoint.kind))
   ) {
-    throw new LeaseConfigurationError('routing endpoint kind must be bounded text');
+    throw new LeaseConfigurationError('routing endpoint kind must be bounded non-empty text');
   }
   if (
     endpoint.transport !== undefined &&
     (typeof endpoint.transport !== 'string' ||
+      endpoint.transport.trim().length === 0 ||
       endpoint.transport.length > MAX_ENDPOINT_LENGTH ||
       CONTROL_CHARACTER_PATTERN.test(endpoint.transport))
   ) {
-    throw new LeaseConfigurationError('routing endpoint transport must be bounded text');
+    throw new LeaseConfigurationError('routing endpoint transport must be bounded non-empty text');
   }
   if (
     endpoint.kind !== undefined &&
@@ -586,9 +599,6 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
     endpoint.kind !== endpoint.transport
   ) {
     throw new LeaseConfigurationError('routing endpoint kind and transport must agree');
-  }
-  if (endpoint.kind === undefined && endpoint.transport === undefined) {
-    throw new LeaseConfigurationError('routing endpoint must identify its transport kind');
   }
   if (endpoint.runtimeId !== undefined) {
     if (!isUuidV4(endpoint.runtimeId)) {

@@ -35,6 +35,7 @@ import {
   type UtcTimestamp,
 } from '../protocol/messages.js';
 import { isRoomId, roomStorageKey, roomsEqual, type RoomIdentity } from '../room.js';
+import { validateEnvelope, validateOperationResponse } from '../protocol/validation.js';
 import {
   DEFAULT_LEASE_RENEWAL_INTERVAL_MS,
   DEFAULT_LEASE_TTL_MS,
@@ -57,6 +58,7 @@ export type {
   CurrentRoutingEndpoint,
   EndpointDescriptor,
   LeaseClock,
+  LeaseEndpointUpdate,
   LeaseExpiryOptions,
   LeaseLifecycleState,
   LeaseOwnerIdentity,
@@ -153,7 +155,7 @@ export interface RegistryRenewalOptions extends LeaseExpiryOptions {
 
 export interface RegistryLeaseOptions extends Omit<
   SerializedLeaseOptions,
-  'renew' | 'identity' | 'endpoint' | 'ttlMs' | 'renewalIntervalMs'
+  'renew' | 'identity' | 'endpoint' | 'ttlMs' | 'renewalIntervalMs' | 'onEndpointUpdate'
 > {
   readonly ttlMs?: number;
   readonly renewalIntervalMs?: number;
@@ -266,10 +268,19 @@ export function createAuthenticatedOperation<Envelope extends TargetedOperation>
   if (!isTargetedOperation(envelope)) {
     throw new AgentCardRegistryError('malformed', 'authenticated envelope is not targeted');
   }
+  if (bindingMetadata !== undefined && !isRecord(bindingMetadata)) {
+    throw new AgentCardRegistryError('malformed', 'binding metadata must be an object');
+  }
+  const envelopeSnapshot = cloneFrozenSnapshot(envelope);
+  const metadataSnapshot =
+    bindingMetadata === undefined ? undefined : cloneFrozenSnapshot(bindingMetadata);
+  if (!isTargetedOperation(envelopeSnapshot)) {
+    throw new AgentCardRegistryError('malformed', 'authenticated envelope is not targeted');
+  }
   const wrapper = Object.freeze({
     [AUTHENTICATED_OPERATION_BRAND]: true as const,
-    envelope,
-    ...(bindingMetadata === undefined ? {} : { bindingMetadata }),
+    envelope: envelopeSnapshot,
+    ...(metadataSnapshot === undefined ? {} : { bindingMetadata: metadataSnapshot }),
   });
   trustedAuthenticatedOperations.add(wrapper);
   return wrapper;
@@ -327,8 +338,13 @@ interface PublicationParts {
 }
 
 const MAX_ENDPOINT_LENGTH = 16_384;
-const MAX_NAME_LENGTH = 512;
-const MAX_DESCRIPTION_LENGTH = 8_192;
+const MAX_NAME_LENGTH = 256;
+const MAX_DESCRIPTION_LENGTH = 1_024;
+const MAX_SUPPORTED_PROTOCOL_VERSIONS = 1;
+const MAX_OPERATION_CAPABILITIES = OPERATION_NAMES.length;
+const MAX_CONTENT_CAPABILITIES = 2;
+const CANONICAL_CARD_VALIDATION_OPERATION_ID = '00000000-0000-4000-8000-000000000000';
+const CANONICAL_CARD_VALIDATION_TRACE_ID = '00000000000000000000000000000000';
 const CONTROL_CHARACTER_PATTERN = /\p{C}/u;
 const FORBIDDEN_METADATA_KEYS = new Set([
   'apiKey',
@@ -343,6 +359,60 @@ const FORBIDDEN_METADATA_KEYS = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Clone and recursively freeze values crossing the authenticated binding boundary. */
+function cloneFrozenSnapshot<T>(value: T, seen = new Map<object, unknown>()): T {
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'function') {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'authenticated snapshot cannot contain functions',
+      );
+    }
+    return value;
+  }
+  const existing = seen.get(value);
+  if (existing !== undefined) {
+    return existing as T;
+  }
+  if (Array.isArray(value)) {
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'authenticated snapshot cannot contain symbols',
+      );
+    }
+    const copy: unknown[] = [];
+    seen.set(value, copy);
+    for (const entry of value) {
+      copy.push(cloneFrozenSnapshot(entry, seen));
+    }
+    return Object.freeze(copy) as T;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'authenticated snapshot must contain plain objects',
+    );
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new AgentCardRegistryError('malformed', 'authenticated snapshot cannot contain symbols');
+  }
+  const copy = Object.create(null) as Record<string, unknown>;
+  seen.set(value, copy);
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !('value' in descriptor)) {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'authenticated snapshot cannot contain accessors',
+      );
+    }
+    copy[key] = cloneFrozenSnapshot(descriptor.value, seen);
+  }
+  return Object.freeze(copy) as T;
 }
 
 function nonEmptyText(value: unknown, label: string, maxLength = MAX_NAME_LENGTH): string {
@@ -493,6 +563,18 @@ function cloneEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): Routin
   return Object.freeze(copy);
 }
 
+function endpointsEqual(left: RoutingEndpoint, right: RoutingEndpoint): boolean {
+  if (typeof left === 'string' || typeof right === 'string') {
+    return typeof left === 'string' && typeof right === 'string' && left === right;
+  }
+  return (
+    left.address === right.address &&
+    left.kind === right.kind &&
+    left.transport === right.transport &&
+    left.runtimeId === right.runtimeId
+  );
+}
+
 function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): void {
   if (typeof endpoint === 'string') {
     if (
@@ -524,26 +606,25 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
   if (
     endpoint.kind !== undefined &&
     (typeof endpoint.kind !== 'string' ||
+      endpoint.kind.trim().length === 0 ||
       endpoint.kind.length > MAX_ENDPOINT_LENGTH ||
       CONTROL_CHARACTER_PATTERN.test(endpoint.kind))
   ) {
-    throw new AgentCardRegistryError('malformed', 'routing endpoint kind must be bounded text');
+    throw new AgentCardRegistryError(
+      'malformed',
+      'routing endpoint kind must be bounded non-empty text',
+    );
   }
   if (
     endpoint.transport !== undefined &&
     (typeof endpoint.transport !== 'string' ||
+      endpoint.transport.trim().length === 0 ||
       endpoint.transport.length > MAX_ENDPOINT_LENGTH ||
       CONTROL_CHARACTER_PATTERN.test(endpoint.transport))
   ) {
     throw new AgentCardRegistryError(
       'malformed',
-      'routing endpoint transport must be bounded text',
-    );
-  }
-  if (endpoint.kind === undefined && endpoint.transport === undefined) {
-    throw new AgentCardRegistryError(
-      'malformed',
-      'routing endpoint must identify its transport kind',
+      'routing endpoint transport must be bounded non-empty text',
     );
   }
   if (
@@ -575,10 +656,39 @@ function unique<T>(values: readonly T[], label: string): void {
   }
 }
 
+function validateCardArrayBudget(card: AgentCard): void {
+  const arrays: readonly [string, unknown, number][] = [
+    ['supportedProtocolVersions', card.supportedProtocolVersions, MAX_SUPPORTED_PROTOCOL_VERSIONS],
+    ['operations', card.operations, MAX_OPERATION_CAPABILITIES],
+    ['contentCapabilities', card.contentCapabilities, MAX_CONTENT_CAPABILITIES],
+  ];
+  for (const [label, value, maximum] of arrays) {
+    if (Array.isArray(value) && value.length > maximum) {
+      throw new AgentCardRegistryError('malformed', `Agent Card ${label} exceeds its array budget`);
+    }
+  }
+}
+
+/** Apply the canonical peer.describe Agent Card validation and envelope budget. */
+function validateCanonicalAgentCard(card: AgentCard): void {
+  const result = validateOperationResponse({
+    protocolVersion: PROTOCOL_VERSION,
+    operation: 'peer.describe',
+    operationId: CANONICAL_CARD_VALIDATION_OPERATION_ID,
+    traceId: CANONICAL_CARD_VALIDATION_TRACE_ID,
+    result: { agentCard: card },
+  });
+  if (!result.ok) {
+    throw new AgentCardRegistryError('malformed', `Agent Card is invalid: ${result.error.message}`);
+  }
+}
+
 function cloneCard(card: AgentCard, identity?: SessionRuntimeIdentity): AgentCard {
   if (!isRecord(card)) {
     throw new AgentCardRegistryError('malformed', 'Agent Card must be an object');
   }
+  validateCardArrayBudget(card);
+  validateCanonicalAgentCard(card);
   const name = nonEmptyText(card.name, 'Agent Card name');
   const sessionId = sessionValue(card.sessionId, 'Agent Card sessionId');
   const runtimeId = runtimeValue(card.runtimeId, 'Agent Card runtimeId');
@@ -639,9 +749,12 @@ function cloneCard(card: AgentCard, identity?: SessionRuntimeIdentity): AgentCar
   const description = card.description;
   if (
     description !== undefined &&
-    (typeof description !== 'string' || description.length > MAX_DESCRIPTION_LENGTH)
+    (typeof description !== 'string' ||
+      description.trim().length === 0 ||
+      description.length > MAX_DESCRIPTION_LENGTH ||
+      CONTROL_CHARACTER_PATTERN.test(description))
   ) {
-    throw new AgentCardRegistryError('malformed', 'Agent Card description is too large');
+    throw new AgentCardRegistryError('malformed', 'Agent Card description is invalid');
   }
 
   return Object.freeze({
@@ -662,8 +775,16 @@ function cloneOperationCapability(value: OperationCapability): OperationCapabili
     throw new AgentCardRegistryError('malformed', 'operation capability is malformed');
   }
   const operation = value.operation as OperationName;
-  if (value.description !== undefined && typeof value.description !== 'string') {
-    throw new AgentCardRegistryError('malformed', 'operation capability description must be text');
+  if (
+    value.description !== undefined &&
+    (typeof value.description !== 'string' ||
+      value.description.trim().length === 0 ||
+      CONTROL_CHARACTER_PATTERN.test(value.description))
+  ) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'operation capability description must be bounded safe text',
+    );
   }
   return Object.freeze({
     operation,
@@ -758,6 +879,21 @@ function extractPublication(input: AgentCardPublication | AgentCard): Publicatio
     ...(leaseTtlMs === undefined ? {} : { leaseTtlMs }),
   };
 }
+function assertSerializedEnvelopeSize(value: unknown, label: string): void {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new AgentCardRegistryError('malformed', `${label} is not JSON serializable`);
+  }
+  if (serialized === undefined) {
+    throw new AgentCardRegistryError('malformed', `${label} is not JSON serializable`);
+  }
+  const bytes = Buffer.byteLength(serialized, 'utf8');
+  if (bytes > DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes) {
+    throw new AgentCardRegistryError('malformed', `${label} exceeds the envelope size limit`);
+  }
+}
 
 function cardWithDiscoveryFields(
   card: AgentCard,
@@ -765,12 +901,14 @@ function cardWithDiscoveryFields(
   endpoint: RoutingEndpoint,
   leaseExpiresAt: UtcTimestamp,
 ): AdvertisedAgentCard {
-  return Object.freeze({
+  const advertised = Object.freeze({
     ...card,
     roomId,
     endpoint,
     leaseExpiresAt,
   });
+  assertSerializedEnvelopeSize(advertised, 'advertised Agent Card');
+  return advertised;
 }
 
 function leaseSnapshot(
@@ -833,33 +971,30 @@ function isTargetedOperation(value: unknown): value is TargetedOperation {
 
 function unwrapInbound<Envelope extends TargetedOperation>(
   input: AuthenticatedOperation<Envelope> | Envelope,
-): { envelope: Envelope; metadata: BindingMetadata | undefined } {
+): { envelope: Envelope; metadata: BindingMetadata | undefined } | undefined {
   if (
-    isRecord(input) &&
-    trustedAuthenticatedOperations.has(input) &&
-    isTargetedOperation(input.envelope)
+    !isRecord(input) ||
+    !trustedAuthenticatedOperations.has(input) ||
+    !isTargetedOperation(input.envelope)
   ) {
-    const metadata = (input.bindingMetadata ?? input.metadata) as BindingMetadata | undefined;
-    return { envelope: input.envelope as Envelope, metadata };
+    return undefined;
   }
-  return { envelope: input as Envelope, metadata: undefined };
+  const metadata = (input.bindingMetadata ?? input.metadata) as BindingMetadata | undefined;
+  return { envelope: input.envelope as Envelope, metadata };
 }
 
 function authenticatedIdentity(value: unknown): SessionRuntimeIdentity | undefined {
-  if (!isRecord(value)) {
-    return undefined;
-  }
-  const candidate = isRecord(value.identity)
-    ? value.identity
-    : isRecord(value.sender)
-      ? value.sender
-      : value;
-  if (!isCanonicalIdentity(candidate)) {
+  if (
+    !isRecord(value) ||
+    value.authenticated !== true ||
+    !isRecord(value.identity) ||
+    !isCanonicalIdentity(value.identity)
+  ) {
     return undefined;
   }
   return Object.freeze({
-    sessionId: candidate.sessionId,
-    runtimeId: candidate.runtimeId,
+    sessionId: value.identity.sessionId,
+    runtimeId: value.identity.runtimeId,
   });
 }
 
@@ -874,11 +1009,8 @@ async function authenticateBinding(
   }
   try {
     const result = await method.call(authenticator, metadata, context);
-    if (isRecord(result) && result.authenticated === false) {
+    if (!isRecord(result) || result.authenticated !== true) {
       return undefined;
-    }
-    if (isRecord(result) && result.authenticated === true) {
-      return authenticatedIdentity(result);
     }
     return authenticatedIdentity(result);
   } catch {
@@ -933,7 +1065,11 @@ export async function verifyAuthenticatedTarget<Envelope extends TargetedOperati
           input as Envelope,
           authenticatorOrMetadata as BindingMetadata | undefined,
         );
-  const { envelope, metadata } = unwrapInbound(verificationInput);
+  const unwrapped = unwrapInbound(verificationInput);
+  if (unwrapped === undefined) {
+    return unauthorizedResult();
+  }
+  const { envelope, metadata } = unwrapped;
   if (!isTargetedOperation(envelope) || !isUuidV4(target.runtimeId) || !isRoomId(target.roomId)) {
     return unauthorizedResult();
   }
@@ -1331,7 +1467,11 @@ export class AgentCardRegistry {
   /** Create an owner lease that publishes/renews only the source runtime. */
   public createLease(source: AgentCardSource, options: RegistryLeaseOptions = {}): SerializedLease {
     let owner: SessionRuntimeIdentity | undefined;
+    let committedOwner: SessionRuntimeIdentity | undefined;
     let registrationGeneration: number | undefined;
+    let endpointOverride: RoutingEndpoint | undefined;
+    let endpointOverrideBaseline: RoutingEndpoint | undefined;
+    let stopHandled = false;
     const leaseHolder: { value?: SerializedLease } = {};
     if (typeof source !== 'function') {
       const parts = extractPublication(source);
@@ -1348,16 +1488,31 @@ export class AgentCardRegistry {
         throw new LeaseExpiredError();
       }
     };
+    const applyEndpointOverride = (parts: PublicationParts): PublicationParts => {
+      if (endpointOverride === undefined) {
+        return parts;
+      }
+      if (
+        endpointOverrideBaseline !== undefined &&
+        !endpointsEqual(parts.endpoint, endpointOverrideBaseline)
+      ) {
+        endpointOverride = undefined;
+        endpointOverrideBaseline = undefined;
+        return parts;
+      }
+      return { ...parts, endpoint: endpointOverride };
+    };
     const renewal = async (): Promise<LeaseRenewalResult> => {
       assertLeaseActive();
       const ownerAtStart = owner;
+      const committedOwnerAtStart = committedOwner;
       const existingAtStart =
         ownerAtStart === undefined ? undefined : this.records.get(ownerAtStart.runtimeId);
-      const generationAtStart = existingAtStart?.generation;
+      const committedGenerationAtStart = registrationGeneration;
       const publication = await resolveSource();
       assertLeaseActive();
       const parts =
-        'card' in (publication as object)
+        isRecord(publication) && Object.hasOwn(publication, 'card')
           ? extractPublication(publication as AgentCardPublication)
           : extractPublication(publication as AgentCard);
       const publicationOwner = canonicalIdentity(
@@ -1370,34 +1525,122 @@ export class AgentCardRegistry {
       } else if (!runtimeIdentitiesEqual(owner, publicationOwner)) {
         throw new AgentCardRegistryAuthorizationError('lease source changed its runtime identity');
       }
+      const sourceEndpoint = parts.endpoint;
+      const effectiveParts = applyEndpointOverride(parts);
       assertLeaseActive();
 
       const current = this.records.get(owner.runtimeId);
       let record: RuntimeAdvertisement;
       if (current === undefined) {
-        if (ownerAtStart !== undefined || registrationGeneration !== undefined) {
+        if (existingAtStart !== undefined || committedGenerationAtStart !== undefined) {
           throw new AgentCardRegistryError(
             'not_found',
             'lease owner record was removed before renewal',
           );
         }
-        record = this.register(publication);
+        const publicationForRegistration: AgentCardPublication = {
+          card: effectiveParts.card,
+          endpoint: effectiveParts.endpoint,
+          ...(effectiveParts.roomId === undefined ? {} : { roomId: effectiveParts.roomId }),
+          ...(effectiveParts.leaseExpiresAt === undefined
+            ? {}
+            : { leaseExpiresAt: effectiveParts.leaseExpiresAt }),
+          ...(effectiveParts.leaseTtlMs === undefined
+            ? {}
+            : { leaseTtlMs: effectiveParts.leaseTtlMs }),
+        };
+        record = this.register(publicationForRegistration);
+        committedOwner = owner;
       } else {
-        const expectedGeneration = generationAtStart ?? registrationGeneration;
-        if (expectedGeneration === undefined) {
+        const expectedGeneration = committedGenerationAtStart;
+        if (committedOwnerAtStart === undefined || expectedGeneration === undefined) {
           throw new AgentCardRegistryConflictError(
             'runtime identity was registered by another owner before this lease renewal',
           );
         }
         const ttlMs = resolveDuration(options.ttlMs, current.ttlMs, 'leaseTtlMs');
-        record = this.renewExact(owner, expectedGeneration, parts, ttlMs, this.clock() + ttlMs);
+        record = this.renewExact(
+          owner,
+          expectedGeneration,
+          effectiveParts,
+          ttlMs,
+          this.clock() + ttlMs,
+        );
       }
       const currentAfterRenewal = this.records.get(owner.runtimeId);
       registrationGeneration = currentAfterRenewal?.generation;
       if (registrationGeneration === undefined) {
         throw new AgentCardRegistryError('not_found', 'lease owner record was removed');
       }
+      committedOwner ??= owner;
+      if (endpointOverride !== undefined && endpointOverrideBaseline === undefined) {
+        endpointOverrideBaseline = sourceEndpoint;
+      }
       return { endpoint: record.endpoint, identity: owner };
+    };
+    const persistEndpoint = (endpoint: RoutingEndpoint): void => {
+      assertLeaseActive();
+      const expectedOwner = owner;
+      if (committedOwner === undefined || registrationGeneration === undefined) {
+        const current =
+          expectedOwner === undefined ? undefined : this.records.get(expectedOwner.runtimeId);
+        if (current !== undefined) {
+          throw new AgentCardRegistryConflictError(
+            'runtime identity was registered by another owner before this endpoint update',
+          );
+        }
+        endpointOverride = endpoint;
+        endpointOverrideBaseline = undefined;
+        return;
+      }
+      const current = this.records.get(committedOwner.runtimeId);
+      if (
+        current === undefined ||
+        current.generation !== registrationGeneration ||
+        !runtimeIdentitiesEqual(current.owner, committedOwner)
+      ) {
+        throw new AgentCardRegistryAuthorizationError(
+          'runtime advertisement owner generation is stale',
+        );
+      }
+      const baseline = current.record.endpoint;
+      this.updateEndpoint(committedOwner, endpoint);
+      endpointOverride = endpoint;
+      endpointOverrideBaseline = baseline;
+      const currentAfterUpdate = this.records.get(committedOwner.runtimeId);
+      registrationGeneration = currentAfterUpdate?.generation;
+      if (registrationGeneration === undefined) {
+        throw new AgentCardRegistryError('not_found', 'lease owner record was removed');
+      }
+    };
+    const onStop = (): void => {
+      if (stopHandled) {
+        return;
+      }
+      stopHandled = true;
+      let callbackError: unknown;
+      let callbackFailed = false;
+      try {
+        if (committedOwner !== undefined && registrationGeneration !== undefined) {
+          this.unregisterExact(committedOwner, registrationGeneration);
+          registrationGeneration = undefined;
+          committedOwner = undefined;
+        }
+      } catch (error: unknown) {
+        callbackFailed = true;
+        callbackError = error;
+      }
+      try {
+        options.onStop?.();
+      } catch (error: unknown) {
+        if (!callbackFailed) {
+          callbackFailed = true;
+          callbackError = error;
+        }
+      }
+      if (callbackFailed) {
+        throw callbackError;
+      }
     };
     const lease = new SerializedLeaseImplementation({
       ...options,
@@ -1406,12 +1649,8 @@ export class AgentCardRegistry {
       renewalIntervalMs: options.renewalIntervalMs ?? this.leaseRenewalIntervalMs,
       scheduler: options.scheduler ?? this.scheduler,
       now: options.now ?? this.now,
-      onStop: () => {
-        if (owner !== undefined && registrationGeneration !== undefined) {
-          this.unregisterExact(owner, registrationGeneration);
-          registrationGeneration = undefined;
-        }
-      },
+      onStop,
+      onEndpointUpdate: persistEndpoint,
       renew: renewal,
     });
     leaseHolder.value = lease;
@@ -1642,7 +1881,9 @@ function makeRuntimeAdvertisement(
     capabilities: card.capabilities,
     limits: card.limits,
   };
-  return Object.freeze(record);
+  const frozen = Object.freeze(record);
+  assertSerializedEnvelopeSize(frozen, 'runtime advertisement');
+  return frozen;
 }
 
 /** Short aliases used by discovery callers. */
@@ -1700,7 +1941,9 @@ export const cleanupExpiredRecords = cleanupStaleAgentCards;
 
 /** A small runtime guard for callers that receive an arbitrary protocol value. */
 export function isProtocolEnvelope(value: unknown): value is ProtocolEnvelope {
-  return (
-    isTargetedOperation(value) && typeof (value as { operation?: unknown }).operation === 'string'
-  );
+  try {
+    return validateEnvelope(value).ok;
+  } catch {
+    return false;
+  }
 }
