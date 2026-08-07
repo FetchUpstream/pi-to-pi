@@ -10,9 +10,12 @@ with an exact version-1, body-free schema containing:
 - `sessionId`, the immutable origin session identity captured when the task is
   accepted;
 - `ownerSessionId`, the current session identity that wrote the latest record;
-- `runtimeId`, a non-empty caller-supplied fixture provenance label; the fixture
-  does not derive or validate it from `AgentSessionRuntime`, enforce uniqueness,
-  or authenticate the writer; actual runtime identity is outside this spike;
+- `runtimeId`, an adapter-assigned opaque writer identity for the latest writer;
+  the Pi SDK does not mint this value. In this fixture it is a non-empty,
+  caller-supplied provenance label from the fixture option or transition call; the
+  fixture does not derive or validate it against `AgentSessionRuntime`, enforce
+  uniqueness, or authenticate the writer; actual runtime identity remains outside
+  this spike;
 - `peerId`, the peer identity when known, otherwise `null`;
 - `state`, one of `accepted`, `completed`, `failed`, `expired`, or `superseded`;
 - `updatedAt`, an ISO timestamp;
@@ -28,6 +31,11 @@ argument and is not derived from or validated against the bound runtime object.
 For a `superseded` record, the destination `ownerSessionId` is audit-only and
 does not grant live ownership or completion authority. The adapter SHALL NOT
 duplicate request or response bodies in task metadata.
+
+The fixture binds metadata operations to the exact runtime, session, and manager
+objects. Callers supply the opaque `runtimeId` for each writer; a replacement
+runtime uses a distinct ID for its supersession record, and a stale binding MUST
+be rejected even when a `SessionManager` object is reused.
 
 #### Scenario: Accepted request is recorded
 
@@ -91,7 +99,12 @@ and current `ownerSessionId` and SHALL NOT silently migrate pending work across
 session creation or replacement. The lifecycle binding SHALL clear the active
 in-memory task scope on `session_shutdown`, fold the selected branch on
 `session_start`, and complete fork/clone supersession before destination
-handling can complete an inherited task.
+handling can complete an inherited task. A `session_tree` event within the same
+runtime re-folds the selected branch and replaces its in-memory recoverable
+scope without changing the runtime/session binding. Direct calls to
+`SessionManager.branch()` do not emit that event; a persisted clone helper given
+only a file therefore uses the last persisted entry unless its caller supplies the
+selected `sourceLeafId`.
 
 #### Scenario: New session starts clean
 
@@ -117,6 +130,12 @@ session and `runtimeId` to its caller-supplied fixture option. Fork/clone
 replacement is superseded-only: it SHALL
 not reopen copied work or create another non-terminal state for the inherited
 request.
+
+The fixture's persisted clone helper copies only the selected branch using
+`createBranchedSession`; it does not use `SessionManager.forkFrom`, which copies
+inactive JSONL branches. Because JSONL does not persist a live `session_tree` leaf,
+callers must provide `sourceLeafId` when the selected leaf is not the file's last
+entry.
 
 #### Scenario: Clone contains pending metadata
 

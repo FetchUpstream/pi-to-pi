@@ -128,17 +128,22 @@ latest record; it starts equal to `sessionId` and changes to the destination
 session only when that destination appends a supersession record.
 For a superseded record, `ownerSessionId` is audit-only: the terminal
 state grants no live ownership or completion authority.
-In this fixture, `runtimeId` is a non-empty, caller-supplied provenance label
-from the fixture option or transition call. It is not derived from or validated
-against the bound `AgentSessionRuntime`; uniqueness and writer authenticity are
-not enforced, so it is not evidence of actual runtime identity. That production
-identity contract remains outside this spike. `peerId` is the peer identity when
-known and immutable across transitions. `reason` is `null` except on a
-`superseded` record, where it is required. `expiresAt` is nullable. The state
-vocabulary is exactly `accepted`, `completed`, `failed`, `expired`, and
-`superseded`; only `accepted` is recoverable/non-terminal.
-Each transition appends a new record, and folding by `requestId` makes the
-latest record authoritative. Metadata contains no request or response body.
+`runtimeId` is an adapter-assigned opaque writer identity; the Pi SDK does not
+mint an ID for `AgentSessionRuntime`. In this fixture, it is a non-empty,
+caller-supplied provenance label from the fixture option or transition call. It
+is not derived from or validated against the bound runtime object; uniqueness and
+writer authenticity are not enforced, so it is not evidence of actual runtime
+identity. The lifecycle binding separately checks exact runtime, `AgentSession`,
+and `SessionManager` object identity. A replacement runtime uses its own writer
+ID for supersession records, and a stale binding cannot write after shutdown even
+if a `SessionManager` object is reused. That production identity contract remains
+outside this spike. `peerId` is the peer identity when known and immutable across
+transitions. `reason` is `null` except on a `superseded` record, where it is
+required. `expiresAt` is nullable. The state vocabulary is exactly `accepted`,
+`completed`, `failed`, `expired`, and `superseded`; only `accepted` is
+recoverable/non-terminal. Each transition appends a new record, and folding by
+`requestId` makes the latest record authoritative. Metadata contains no request or
+response body.
 
 The fixture applies this transition matrix; expiry is evaluated at `now`, and a
 `null` `expiresAt` means that an accepted record does not expire:
@@ -158,6 +163,15 @@ Every allowed transition appends a record, preserves `sessionId`, `peerId`, and
 `expiresAt`, and does not move `updatedAt` backwards. `requestId` is folded only
 within the selected session branch; this fixture does not establish process-global
 request ID uniqueness.
+
+On a `session_tree` navigation within the same runtime, the fixture folds the
+new active branch and replaces its in-memory recoverable scope. Direct calls to
+`SessionManager.branch()` do not emit that Pi event; callers that clone a file
+after such a navigation must pass the selected `sourceLeafId`. JSONL files do not
+persist the live tree leaf, so a clone helper given only a file uses its last
+persisted entry as the active leaf. The fixture uses `createBranchedSession`
+for this reason; `SessionManager.forkFrom` would copy inactive branch records
+and would not satisfy the task-state branch scope.
 
 On `session_start(reason: "reload")`, fold the latest `p2p.task` record for
 each request ID and recover only records whose state is `accepted`, whose

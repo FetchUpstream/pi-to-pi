@@ -64,7 +64,12 @@ from the portable process harness above:
 - `pi-probe.ts` exports the inline lifecycle/custom-message probe and `bindPiProbe()` rebinding
   helper.
 - `persisted-session.ts` exports isolated temporary-directory helpers for reload, resume, fork,
-  and clone scenarios.
+  and clone scenarios. Persisted clones copy the selected branch only; pass `sourceLeafId` when
+  a live `session_tree` selection is not represented by the file's last entry.
+- `task-state.ts` exports the body-free append-only `p2p.task` metadata schema, latest-state
+  folding/recovery helpers, and the runtime/session-bound lifecycle that resets on shutdown,
+  re-scopes on `session_tree`, and supersedes inherited fork/clone records before destination
+  delivery. `runtimeId` is an adapter-assigned writer identity; Pi does not mint it.
 - `index.ts` is the import barrel for follow-on tests.
 
 ## Inbound-delivery invariants

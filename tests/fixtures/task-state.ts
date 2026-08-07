@@ -45,6 +45,7 @@ export interface TaskMetadataRecord extends TaskMetadata {
 
 export interface AppendTaskMetadataOptions {
   requestId: string;
+  /** Adapter-assigned opaque identity of the runtime writing this record. */
   runtimeId: string;
   state: TaskState;
   peerId?: string | null;
@@ -64,6 +65,7 @@ export interface SupersedeInheritedTaskMetadataOptions {
 }
 
 export interface TaskStateLifecycleOptions {
+  /** Adapter-assigned opaque identity for the runtime writing lifecycle records. */
   runtimeId: string;
   now?: () => Date;
 }
@@ -72,6 +74,8 @@ export interface TaskStateLifecycleOptions {
  * Exact runtime/session binding captured after the lifecycle hook starts.
  * Session IDs remain useful for persisted ownership, but object identity prevents
  * a stale AgentSession or reused in-memory SessionManager from mutating the new scope.
+ * `runtimeId` is not supplied by Pi; callers assign it to the active runtime and
+ * pass the writer identity on each metadata append/transition.
  */
 export interface TaskStateLifecycleBinding {
   readonly runtime: AgentSessionRuntime;
@@ -708,6 +712,9 @@ export class TaskStateLifecycle {
     pi.on('session_shutdown', (event, ctx) => {
       this.handleSessionShutdown(event, ctx.sessionManager as SessionManager);
     });
+    pi.on('session_tree', (_event, ctx) => {
+      this.handleSessionTree(ctx.sessionManager as SessionManager);
+    });
   }
 
   private handleSessionStart(event: SessionStartEvent, sessionManager: SessionManager): void {
@@ -736,6 +743,15 @@ export class TaskStateLifecycle {
     this.activeBinding = canReuseBinding ? previousBinding : undefined;
     this.activeTasks = new Map(recovered.map((record) => [record.requestId, record]));
     this._starts.push({ sessionId, reason: event.reason, recovered, superseded });
+  }
+
+  /** Re-scope recovered state when Pi navigates within the current session tree. */
+  private handleSessionTree(sessionManager: SessionManager): void {
+    if (this.activeSessionManager !== sessionManager || !this.sessionActive) {
+      return;
+    }
+    const recovered = recoverTaskMetadata(sessionManager, this.now());
+    this.activeTasks = new Map(recovered.map((record) => [record.requestId, record]));
   }
 
   private handleSessionShutdown(event: SessionShutdownEvent, sessionManager: SessionManager): void {

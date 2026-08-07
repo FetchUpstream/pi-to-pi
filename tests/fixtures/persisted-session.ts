@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -27,6 +27,8 @@ export interface PersistedPiSessionFixtureOptions extends Omit<
 
 export interface CloneSessionOptions {
   sourceSessionFile?: string;
+  /** Explicit active branch leaf; otherwise the last persisted entry is used. */
+  sourceLeafId?: string;
   id?: string;
   rootDir?: string;
   cwd?: string;
@@ -72,6 +74,14 @@ async function ensureDirectories(paths: string[]): Promise<void> {
 
 function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
+}
+
+function assertValidCloneId(id: string): void {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(id)) {
+    throw new Error(
+      "Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character",
+    );
+  }
 }
 
 function sessionPaths(
@@ -207,12 +217,38 @@ async function clonePersistedSession(
     const cwd = options.cwd ?? join(rootDir, 'workspace');
     const sessionDir = options.sessionDir ?? join(rootDir, 'sessions');
     await ensureDirectories([rootDir, cwd, join(rootDir, 'agent'), sessionDir]);
-    const sessionManager = SessionManager.forkFrom(sourceSessionFile, cwd, sessionDir, {
-      id: options.id,
-    });
-    const sessionFile = sessionManager.getSessionFile();
+
+    // SessionManager.forkFrom copies every JSONL entry, including entries that
+    // belong to inactive branches. The runtime clone contract is branch-scoped,
+    // so select the persisted leaf and ask SessionManager to write that branch.
+    const sourceSessionManager = SessionManager.open(sourceSessionFile, sessionDir, cwd);
+    const sourceLeafId = options.sourceLeafId ?? sourceSessionManager.getLeafId();
+    if (!sourceLeafId) {
+      throw new Error('Cannot clone a session without a persisted branch leaf');
+    }
+    let sessionFile = sourceSessionManager.createBranchedSession(sourceLeafId);
     if (!sessionFile) {
       throw new Error('Pi did not return a file for the cloned session');
+    }
+    let sessionManager = sourceSessionManager;
+
+    if (options.id !== undefined && options.id !== sessionManager.getSessionId()) {
+      assertValidCloneId(options.id);
+      const fileContents = await readFile(sessionFile, 'utf8');
+      const lines = fileContents.trimEnd().split('\n');
+      const header = JSON.parse(lines[0] ?? '') as Record<string, unknown>;
+      if (header.type !== 'session') {
+        throw new Error('Pi did not write a valid header for the cloned session');
+      }
+      header.id = options.id;
+      await writeFile(sessionFile, `${[JSON.stringify(header), ...lines.slice(1)].join('\n')}\n`);
+      const separator = sessionFile.lastIndexOf('_');
+      const renamedSessionFile = `${sessionFile.slice(0, separator + 1)}${options.id}.jsonl`;
+      if (renamedSessionFile !== sessionFile) {
+        await rename(sessionFile, renamedSessionFile);
+      }
+      sessionFile = renamedSessionFile;
+      sessionManager = SessionManager.open(sessionFile, sessionDir, cwd);
     }
 
     let cleaned = false;

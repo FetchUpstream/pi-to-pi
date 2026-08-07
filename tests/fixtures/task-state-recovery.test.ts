@@ -544,6 +544,39 @@ describe('p2p.task session ownership and lifecycle recovery', () => {
       await rm(rootDir, { recursive: true, force: true });
     }
   });
+  it('re-scopes recovered tasks when the active session tree branch changes', async () => {
+    const taskStateLifecycle = lifecycle('runtime-tree');
+    const fixture = await persistedFixtureWithAssistant(taskStateLifecycle);
+    try {
+      const binding = currentTaskBinding(fixture);
+      const branchPointId = fixture.sessionManager.getLeafId();
+      if (!branchPointId) {
+        throw new Error('Fixture session did not expose a branch point');
+      }
+      const accepted = taskStateLifecycle.append(binding, {
+        requestId: 'request-tree-branch',
+        runtimeId: 'runtime-tree',
+        state: 'accepted',
+        updatedAt: UPDATED_AT,
+        expiresAt: FUTURE_EXPIRY,
+      });
+      expect(taskStateLifecycle.recovered.map((task) => task.requestId)).toEqual([
+        'request-tree-branch',
+      ]);
+
+      await fixture.session.navigateTree(branchPointId);
+      expect(taskStateLifecycle.binding).toBe(binding);
+      expect(taskStateLifecycle.recovered).toEqual([]);
+
+      await fixture.session.navigateTree(accepted.entryId);
+      expect(taskStateLifecycle.binding).toBe(binding);
+      expect(taskStateLifecycle.recovered.map((task) => task.requestId)).toEqual([
+        'request-tree-branch',
+      ]);
+    } finally {
+      await fixture.dispose();
+    }
+  });
 });
 
 describe('p2p.task fork and clone lifecycle supersession', () => {
@@ -566,6 +599,7 @@ describe('p2p.task fork and clone lifecycle supersession', () => {
       const inheritedBefore = foldLatestTaskMetadata(clone.sessionManager).get('request-clone');
       expect(inheritedBefore?.sessionId).toBe(sourceSessionId);
       expect(inheritedBefore?.ownerSessionId).toBe(sourceSessionId);
+      expect(inheritedBefore?.runtimeId).toBe('runtime-source');
       const cloneLifecycle = lifecycle('runtime-clone');
       cloneRuntime = await clone.createRuntime({ taskStateLifecycle: cloneLifecycle });
       const inheritedAfter = foldLatestTaskMetadata(cloneRuntime.sessionManager).get(
@@ -578,10 +612,48 @@ describe('p2p.task fork and clone lifecycle supersession', () => {
       expect(superseded?.sessionId).toBe(sourceSessionId);
       expect(superseded?.ownerSessionId).toBe(cloneRuntime.sessionId);
       expect(superseded?.reason).toMatch(/startup replacement/u);
+      expect(superseded?.runtimeId).toBe('runtime-clone');
+      expect(superseded?.peerId).toBe(inheritedBefore?.peerId);
+      expect(superseded?.expiresAt).toBe(inheritedBefore?.expiresAt);
       expect(cloneLifecycle.recovered).toEqual([]);
       expect(foldLatestTaskMetadata(cloneRuntime.sessionManager).get('request-clone')?.state).toBe(
         'superseded',
       );
+      cloneRuntime.faux.setResponses([defaultFauxResponse('clone destination delivery')]);
+      await cloneRuntime.session.sendCustomMessage(
+        {
+          customType: 'p2p.clone-destination',
+          content: 'destination delivery body',
+          display: false,
+          details: { requestId: 'clone-destination' },
+        },
+        { triggerTurn: true },
+      );
+      const destinationStart = cloneRuntime.probe.latest('session_start');
+      const destinationDelivery = cloneRuntime.probe
+        .byType('custom_message_start')
+        .find(({ customType }) => customType === 'p2p.clone-destination');
+      expect(destinationDelivery?.sequence).toBeGreaterThan(destinationStart?.sequence ?? -1);
+      const deliveredTask = destinationDelivery?.entries?.find((entry) => {
+        if (entry.type !== 'custom' || entry.customType !== P2P_TASK_CUSTOM_TYPE) {
+          return false;
+        }
+        return (
+          typeof entry.data === 'object' &&
+          entry.data !== null &&
+          'requestId' in entry.data &&
+          entry.data.requestId === 'request-clone' &&
+          'state' in entry.data &&
+          entry.data.state === 'superseded'
+        );
+      });
+      expect(deliveredTask?.type).toBe('custom');
+      if (deliveredTask?.type === 'custom') {
+        expect((deliveredTask.data as { requestId?: string; state?: string }).requestId).toBe(
+          'request-clone',
+        );
+        expect((deliveredTask.data as { state?: string }).state).toBe('superseded');
+      }
       expect(() =>
         completeTaskMetadata(cloneRuntime!.sessionManager, 'request-clone', {
           runtimeId: 'runtime-clone',
@@ -600,12 +672,72 @@ describe('p2p.task fork and clone lifecycle supersession', () => {
       await fixture.dispose();
     }
   });
+  it('clones only the persisted active branch instead of the full session file', async () => {
+    const fixture = await persistedFixtureWithAssistant();
+    let clone: Awaited<ReturnType<typeof fixture.cloneSession>> | undefined;
+    try {
+      const branchPointId = fixture.sessionManager.getLeafId();
+      if (!branchPointId) {
+        throw new Error('Fixture session did not expose a branch point');
+      }
+      appendTaskMetadata(fixture.sessionManager, {
+        requestId: 'request-inactive-branch',
+        runtimeId: 'runtime-source',
+        peerId: 'peer-inactive',
+        state: 'accepted',
+        updatedAt: UPDATED_AT,
+        expiresAt: FUTURE_EXPIRY,
+        now: RECOVERY_AT,
+      });
+      fixture.sessionManager.branch(branchPointId);
+      appendTaskMetadata(fixture.sessionManager, {
+        requestId: 'request-active-branch',
+        runtimeId: 'runtime-source',
+        peerId: 'peer-active',
+        state: 'accepted',
+        updatedAt: UPDATED_AT,
+        expiresAt: FUTURE_EXPIRY,
+        now: RECOVERY_AT,
+      });
+      expect(
+        fixture.entries.some(
+          (entry) =>
+            entry.type === 'custom' &&
+            entry.customType === P2P_TASK_CUSTOM_TYPE &&
+            typeof entry.data === 'object' &&
+            entry.data !== null &&
+            'requestId' in entry.data &&
+            entry.data.requestId === 'request-inactive-branch',
+        ),
+      ).toBe(true);
+      clone = await fixture.cloneSession();
+      const clonedLatest = foldLatestTaskMetadata(clone.sessionManager);
+      expect(clonedLatest.get('request-active-branch')?.state).toBe('accepted');
+      expect(clonedLatest.has('request-inactive-branch')).toBe(false);
+      expect(
+        clone.sessionManager
+          .getEntries()
+          .some(
+            (entry) =>
+              entry.type === 'custom' &&
+              entry.customType === P2P_TASK_CUSTOM_TYPE &&
+              typeof entry.data === 'object' &&
+              entry.data !== null &&
+              'requestId' in entry.data &&
+              entry.data.requestId === 'request-inactive-branch',
+          ),
+      ).toBe(false);
+    } finally {
+      await clone?.cleanup();
+      await fixture.dispose();
+    }
+  });
 
   it('supersedes inherited fork records before destination delivery', async () => {
     const taskStateLifecycle = lifecycle('runtime-fork');
     const fixture = await persistedFixtureWithAssistant(taskStateLifecycle);
     try {
-      taskStateLifecycle.append(currentTaskBinding(fixture), {
+      const accepted = taskStateLifecycle.append(currentTaskBinding(fixture), {
         requestId: 'request-fork',
         runtimeId: 'runtime-source',
         peerId: 'peer-a',
@@ -613,6 +745,7 @@ describe('p2p.task fork and clone lifecycle supersession', () => {
         updatedAt: UPDATED_AT,
         expiresAt: FUTURE_EXPIRY,
       });
+      expect(accepted.runtimeId).toBe('runtime-source');
       const sourceSessionId = fixture.sessionId;
       const sourceSessionFile = fixture.sessionFile;
       const acceptedEntryId = taskEntryId(fixture.sessionManager, 'request-fork');
@@ -626,8 +759,40 @@ describe('p2p.task fork and clone lifecycle supersession', () => {
       expect(superseded?.state).toBe('superseded');
       expect(superseded?.sessionId).toBe(sourceSessionId);
       expect(superseded?.ownerSessionId).toBe(fixture.sessionId);
+      expect(superseded?.runtimeId).toBe('runtime-fork');
+      expect(superseded?.peerId).toBe(accepted.peerId);
+      expect(superseded?.expiresAt).toBe(accepted.expiresAt);
       expect(recoverTaskMetadata(fixture.sessionManager, RECOVERY_AT)).toEqual([]);
 
+      fixture.faux.setResponses([defaultFauxResponse('fork destination delivery')]);
+      await fixture.session.sendCustomMessage(
+        {
+          customType: 'p2p.fork-destination',
+          content: 'destination delivery body',
+          display: false,
+          details: { requestId: 'fork-destination' },
+        },
+        { triggerTurn: true },
+      );
+      const destinationStart = fixture.probe.latest('session_start');
+      const destinationDelivery = fixture.probe
+        .byType('custom_message_start')
+        .find(({ customType }) => customType === 'p2p.fork-destination');
+      expect(destinationDelivery?.sequence).toBeGreaterThan(destinationStart?.sequence ?? -1);
+      const deliveredTask = destinationDelivery?.entries?.find((entry) => {
+        if (entry.type !== 'custom' || entry.customType !== P2P_TASK_CUSTOM_TYPE) {
+          return false;
+        }
+        return (
+          typeof entry.data === 'object' &&
+          entry.data !== null &&
+          'requestId' in entry.data &&
+          entry.data.requestId === 'request-fork' &&
+          'state' in entry.data &&
+          entry.data.state === 'superseded'
+        );
+      });
+      expect(deliveredTask?.type).toBe('custom');
       const source = fixture.openSession(sourceSessionFile!);
       expect(recoverTaskMetadata(source, RECOVERY_AT).map((task) => task.requestId)).toEqual([
         'request-fork',

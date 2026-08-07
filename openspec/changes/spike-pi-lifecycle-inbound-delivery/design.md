@@ -76,13 +76,17 @@ version-1, body-free fields `version`, `requestId`, `sessionId`,
 and `reason`. `sessionId` is the immutable origin session identity captured
 when the request is accepted. `ownerSessionId` is the current session identity
 that wrote the latest record. For `superseded`, destination `ownerSessionId` is
-audit-only and does not grant live ownership or completion authority. In this
-fixture, `runtimeId` is a non-empty, caller-supplied provenance label from the
-fixture option or transition call. The fixture does not derive or validate it
-against the bound `AgentSessionRuntime`, enforce its uniqueness, or authenticate
-the writer; it is not evidence of actual runtime identity. A production adapter
-must define and enforce runtime-identity provenance separately. `peerId` is the
-known peer identity or `null`; peer identity and expiry remain immutable across
+audit-only and does not grant live ownership or completion authority. In this fixture,
+`runtimeId` is an adapter-assigned opaque writer identity; the Pi SDK does not
+expose or mint a runtime identifier. It is a non-empty, caller-supplied provenance
+label from the fixture option or transition call. It is not derived from or
+validated against the bound runtime object; uniqueness and writer authenticity are
+not enforced, so it is not evidence of actual runtime identity. The lifecycle
+binding checks exact runtime, session, and manager object identity; a replacement
+writer uses a distinct ID for supersession, and a stale binding cannot write after
+shutdown even if a manager object is reused. A production adapter must define and
+enforce runtime-identity provenance separately. `peerId` is the known
+peer identity or `null`; peer identity and expiry remain immutable across
 transitions. `reason` is `null` except on a `superseded` record, where it is
 required.
 
@@ -133,6 +137,12 @@ therefore produces only `superseded` history rather than reopening copied work.
 The lifecycle binding clears the outgoing active task scope at
 `session_shutdown`, and Pi emits that boundary before the replacement
 `session_start`. It does not migrate outgoing delivery queues or task state.
+`session_tree` navigation within one runtime re-folds the selected branch and
+replaces the in-memory recoverable scope without changing the runtime/session
+binding. Direct calls to `SessionManager.branch()` do not emit `session_tree`; the
+persisted clone helper therefore accepts `sourceLeafId` and otherwise selects the
+last persisted entry. It uses `createBranchedSession`, not `forkFrom`, because
+`forkFrom` copies inactive JSONL branches as well.
 
 ### Synchronize names through bootstrap plus change events
 
@@ -155,7 +165,9 @@ and clone even when no rename event is emitted during the load.
   migrating to the destination.
 - **[Risk] Fork and clone copy extension entries along the selected branch.**
   → **Mitigation:** Include immutable `sessionId` and assert inherited
-  non-terminal records become `superseded`.
+  non-terminal records become `superseded`. The persisted-session fixture clones
+  only the selected branch; because Pi's JSONL has no persisted leaf pointer, a
+  live branch selected by `session_tree` must be supplied as `sourceLeafId`.
 - **[Limitation] Task-state lifecycle is fixture-only in this spike.**
   → The fixture validates the schema and in-process session boundaries, but it
   appends every metadata transition without pruning terminal entries or bounding
