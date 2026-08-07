@@ -5,8 +5,8 @@
  * one bounded response on each path-based local endpoint, then closes the
  * connection. It does not import production transport or Pi protocol modules.
  */
-import { promises as fs } from 'node:fs';
-import { basename } from 'node:path';
+import { lstatSync, promises as fs, unlinkSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
 import { createConnection, createServer } from 'node:net';
 import type { Server, Socket } from 'node:net';
 import { TextDecoder } from 'node:util';
@@ -29,6 +29,11 @@ import {
   normalizeMaxPayloadBytes,
 } from './frame-codec.js';
 import type { FrameCodecErrorCode } from './frame-codec.js';
+import {
+  createIpcEndpoint,
+  POSIX_ENDPOINT_PREFIX,
+  POSIX_ENDPOINT_SUFFIX,
+} from '../local-ipc/endpoint.js';
 
 export const DEFAULT_RAW_NET_CONNECT_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_WRITE_TIMEOUT_MS = 1_000;
@@ -36,7 +41,12 @@ export const DEFAULT_RAW_NET_READ_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_SHUTDOWN_TIMEOUT_MS = 1_000;
 export const DEFAULT_RAW_NET_STALE_PROBE_TIMEOUT_MS = 250;
 
-const GENERATED_POSIX_ENDPOINT = /^p2p-[a-z0-9_-]+\.sock$/;
+interface PosixSocketIdentity {
+  readonly dev: number;
+  readonly ino: number;
+  readonly ctimeMs: number;
+}
+
 export type RawNetErrorCode =
   | FrameCodecErrorCode
   | 'connect-error'
@@ -206,35 +216,63 @@ function isRefusedOrMissing(error: unknown): boolean {
   return code === 'ECONNREFUSED' || code === 'ENOENT' || code === 'ENOTDIR';
 }
 
-async function lstatSocket(endpoint: string): Promise<boolean> {
+function socketIdentity(stats: { dev: number; ino: number; ctimeMs: number }): PosixSocketIdentity {
+  return { dev: stats.dev, ino: stats.ino, ctimeMs: stats.ctimeMs };
+}
+
+function sameSocketIdentity(left: PosixSocketIdentity, right: PosixSocketIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.ctimeMs === right.ctimeMs;
+}
+
+async function lstatSocket(endpoint: string): Promise<PosixSocketIdentity | undefined> {
   try {
     const stats = await fs.lstat(endpoint);
-    return stats.isSocket();
+    return stats.isSocket() ? socketIdentity(stats) : undefined;
+  } catch (error: unknown) {
+    if (errorCode(error) === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Remove only the exact socket inode observed by the caller.
+ *
+ * The identity check is repeated synchronously immediately before unlink so an
+ * endpoint replaced while an asynchronous stale probe was running is never
+ * treated as owned. `server.close()` normally removes a live endpoint itself;
+ * this fallback is limited to a path that still has the bound inode.
+ */
+function unlinkOwnedSocket(endpoint: string, expected?: PosixSocketIdentity): boolean {
+  if (!isPosixRuntime()) {
+    return false;
+  }
+  let stats: ReturnType<typeof lstatSync>;
+  try {
+    stats = lstatSync(endpoint);
   } catch (error: unknown) {
     if (errorCode(error) === 'ENOENT') {
       return false;
     }
     throw error;
   }
-}
-
-async function unlinkOwnedSocket(endpoint: string): Promise<void> {
-  if (!isPosixRuntime()) {
-    return;
+  if (!stats.isSocket()) {
+    throw new RawNetError(
+      'endpoint-not-owned',
+      `Refusing to remove non-socket endpoint path ${endpoint}`,
+    );
   }
-
+  const current = socketIdentity(stats);
+  if (expected !== undefined && !sameSocketIdentity(current, expected)) {
+    return false;
+  }
   try {
-    const stats = await fs.lstat(endpoint);
-    if (!stats.isSocket()) {
-      throw new RawNetError(
-        'endpoint-not-owned',
-        `Refusing to remove non-socket endpoint path ${endpoint}`,
-      );
-    }
-    await fs.unlink(endpoint);
+    unlinkSync(endpoint);
+    return true;
   } catch (error: unknown) {
     if (errorCode(error) === 'ENOENT') {
-      return;
+      return false;
     }
     throw error;
   }
@@ -437,7 +475,7 @@ function readResponse(
     const decoder = new FrameDecoder({ maxPayloadBytes });
     let settled = false;
     let settling = false;
-    let response: Buffer | undefined;
+    let complete = false;
     let removeAbort = (): void => undefined;
 
     const cleanup = (): void => {
@@ -458,23 +496,11 @@ function readResponse(
     const fail = (error: Error): void => settle(() => reject(error));
     const onError = (error: Error): void =>
       fail(new RawNetError('read-error', error.message, error));
-    const onData = (chunk: Buffer): void => {
-      if (settled || settling) {
-        return;
-      }
-      try {
-        const payload = decoder.push(chunk);
-        if (payload !== undefined) {
-          response = payload;
-        }
-      } catch (error: unknown) {
-        fail(protocolError(error));
-      }
-    };
     const finish = (payload: Buffer): void => {
       if (settled || settling) {
         return;
       }
+      complete = true;
       settling = true;
       let validation: void | PromiseLike<void>;
       try {
@@ -490,27 +516,35 @@ function readResponse(
         )
         .catch((error: unknown) => fail(protocolError(error)));
     };
-    const onEnd = (): void => {
-      if (settled || settling) {
+    const onData = (chunk: Buffer): void => {
+      if (settled) {
         return;
       }
       try {
-        const payload = decoder.finish();
-        response = payload;
-        finish(payload);
+        const payload = decoder.push(chunk);
+        if (payload !== undefined) {
+          // A complete frame is sufficient; EOF is not part of response validity.
+          finish(payload);
+        }
+      } catch (error: unknown) {
+        fail(protocolError(error));
+      }
+    };
+    const onEnd = (): void => {
+      if (settled || settling || complete) {
+        return;
+      }
+      try {
+        finish(decoder.finish());
       } catch (error: unknown) {
         fail(new RawNetError('premature-close', asError(error).message, error));
       }
     };
     const onClose = (): void => {
-      if (settled || settling) {
+      if (settled || settling || complete) {
         return;
       }
-      if (response === undefined) {
-        fail(new RawNetError('premature-close', 'Socket closed before a complete response'));
-        return;
-      }
-      finish(response);
+      fail(new RawNetError('premature-close', 'Socket closed before a complete response'));
     };
 
     socket.on('data', onData);
@@ -571,6 +605,28 @@ async function probePosixEndpoint(endpoint: string, timeoutMs: number): Promise<
   }
 }
 
+function isGeneratedPosixEndpoint(endpoint: string): boolean {
+  const name = basename(endpoint);
+  if (!name.startsWith(POSIX_ENDPOINT_PREFIX) || !name.endsWith(POSIX_ENDPOINT_SUFFIX)) {
+    return false;
+  }
+  const runtimeId = name.slice(
+    POSIX_ENDPOINT_PREFIX.length,
+    name.length - POSIX_ENDPOINT_SUFFIX.length,
+  );
+  try {
+    return (
+      createIpcEndpoint({
+        platform: 'linux',
+        posixRoot: dirname(endpoint),
+        runtimeId,
+      }) === endpoint
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Probe and remove a generated POSIX endpoint only after verifying it is a
  * socket path with no live listener. Windows named pipes are managed by the OS
@@ -583,13 +639,14 @@ export async function removeStalePosixEndpoint(
   if (!isPosixRuntime()) {
     return false;
   }
-  if (!GENERATED_POSIX_ENDPOINT.test(basename(endpoint))) {
+  if (!isGeneratedPosixEndpoint(endpoint)) {
     throw new RawNetError(
       'endpoint-not-owned',
       `Refusing stale cleanup for an unowned endpoint path ${endpoint}`,
     );
   }
-  if (!(await lstatSocket(endpoint))) {
+  const observed = await lstatSocket(endpoint);
+  if (observed === undefined) {
     return false;
   }
 
@@ -598,20 +655,39 @@ export async function removeStalePosixEndpoint(
     throw new RawNetError('endpoint-in-use', `A live listener owns endpoint ${endpoint}`);
   }
 
-  await fs.unlink(endpoint);
-  return true;
+  return unlinkOwnedSocket(endpoint, observed);
 }
 
+function waitForSocketClosure(socket: Socket): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const settle = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.off('close', settle);
+      resolve();
+    };
+    socket.once('close', settle);
+    if (socket.destroyed) {
+      setImmediate(settle);
+    }
+  });
+}
 export class RawNetTransport {
   readonly maxPayloadBytes: number;
 
   private readonly options: NormalizedRawNetOptions;
   private readonly serverSockets = new Set<Socket>();
   private readonly clientSockets = new Set<Socket>();
+  private lifecycleTail: Promise<void> = Promise.resolve();
   private server: Server | undefined;
   private boundEndpoint: string | undefined;
+  private ownedEndpoint: { endpoint: string; identity?: PosixSocketIdentity } | undefined;
   private handler: RawNetHandler | undefined;
   private closing = false;
+  private closed = false;
   private closePromise: Promise<void> | undefined;
 
   constructor(options: RawNetTransportOptions = {}) {
@@ -621,7 +697,20 @@ export class RawNetTransport {
 
   /** Bind exactly one local endpoint and install one byte-oriented handler. */
   async bind(endpoint: string, handler: RawNetHandler): Promise<RawNetBoundServer> {
-    if (this.closing) {
+    return this.enqueueLifecycle(() => this.bindInternal(endpoint, handler));
+  }
+
+  private enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTail;
+    let release!: () => void;
+    this.lifecycleTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return previous.then(operation).finally(release);
+  }
+
+  private async bindInternal(endpoint: string, handler: RawNetHandler): Promise<RawNetBoundServer> {
+    if (this.closing || this.closed) {
       throw new RawNetError('shutdown-error', 'Transport is shutting down');
     }
     if (this.server !== undefined || this.boundEndpoint !== undefined) {
@@ -634,47 +723,69 @@ export class RawNetTransport {
     this.handler = handler;
     let server = this.createServer();
     this.server = server;
+    const discard = async (clearHandler = true): Promise<void> => {
+      if (this.server === server) {
+        this.server = undefined;
+        this.boundEndpoint = undefined;
+        this.ownedEndpoint = undefined;
+        if (clearHandler) {
+          this.handler = undefined;
+        }
+      }
+      await closeServer(server);
+    };
+    const publish = async (): Promise<RawNetBoundServer> => {
+      if (this.closing || this.closed) {
+        await discard();
+        throw new RawNetError('shutdown-error', 'Transport is shutting down');
+      }
+      const identity = isPosixRuntime() ? await lstatSocket(endpoint) : undefined;
+      if (isPosixRuntime() && identity === undefined) {
+        await discard();
+        throw new RawNetError('endpoint-not-owned', `Bound endpoint disappeared: ${endpoint}`);
+      }
+      if (this.closing || this.closed) {
+        await discard();
+        throw new RawNetError('shutdown-error', 'Transport is shutting down');
+      }
+      this.ownedEndpoint = { endpoint, identity };
+      this.boundEndpoint = endpoint;
+      return {
+        endpoint,
+        close: () => this.close(),
+      };
+    };
 
     try {
       await listenServer(server, endpoint);
+      return await publish();
     } catch (error: unknown) {
-      if (!isAddressInUse(error) || !isPosixRuntime()) {
-        this.server = undefined;
-        this.handler = undefined;
-        await closeServer(server);
+      if (!isAddressInUse(error) || !isPosixRuntime() || this.closing || this.closed) {
+        await discard();
         throw error;
       }
 
       try {
         await removeStalePosixEndpoint(endpoint, this.options.staleProbeTimeoutMs);
       } catch (staleError: unknown) {
-        this.server = undefined;
-        this.handler = undefined;
-        await closeServer(server);
+        await discard();
         if (staleError instanceof RawNetError && staleError.code === 'endpoint-in-use') {
           throw staleError;
         }
         throw error;
       }
 
-      await closeServer(server);
+      await discard(false);
       server = this.createServer();
       this.server = server;
       try {
         await listenServer(server, endpoint);
+        return await publish();
       } catch (retryError: unknown) {
-        this.server = undefined;
-        this.handler = undefined;
-        await closeServer(server);
+        await discard();
         throw retryError;
       }
     }
-
-    this.boundEndpoint = endpoint;
-    return {
-      endpoint,
-      close: () => this.close(),
-    };
   }
 
   /** Request one response frame and release the socket after that exchange. */
@@ -683,11 +794,21 @@ export class RawNetTransport {
     payload: Uint8Array,
     options: RawNetRequestOptions = {},
   ): Promise<Buffer> {
+    if (this.closing || this.closed) {
+      throw new RawNetError('shutdown-error', 'Transport is shutting down');
+    }
     const bytes = payloadBytes(payload);
     const frame = encodeFrame(bytes, { maxPayloadBytes: this.maxPayloadBytes });
     throwIfAborted(options.signal);
+    if (this.closing || this.closed) {
+      throw new RawNetError('shutdown-error', 'Transport is shutting down');
+    }
 
     const socket = this.options.socketFactory(endpoint);
+    if (this.closing || this.closed) {
+      destroySocket(socket);
+      throw new RawNetError('shutdown-error', 'Transport is shutting down');
+    }
     this.clientSockets.add(socket);
     try {
       const connectDeadline = phaseDeadline(
@@ -731,8 +852,9 @@ export class RawNetTransport {
         { signal: options.signal, onTimeout: () => destroySocket(socket) },
       );
     } finally {
-      this.clientSockets.delete(socket);
       destroySocket(socket);
+      await waitForSocketClosure(socket);
+      this.clientSockets.delete(socket);
     }
   }
 
@@ -741,13 +863,15 @@ export class RawNetTransport {
     if (this.closePromise !== undefined) {
       return this.closePromise;
     }
-
-    this.closePromise = this.closeInternal();
-    try {
-      await this.closePromise;
-    } finally {
-      this.closePromise = undefined;
+    if (this.closed) {
+      return;
     }
+    this.closed = true;
+    this.closing = true;
+    this.closePromise = this.enqueueLifecycle(() => this.closeInternal()).finally(() => {
+      this.closing = false;
+    });
+    return this.closePromise;
   }
 
   private createServer(): Server {
@@ -761,13 +885,15 @@ export class RawNetTransport {
   private handleConnection(socket: Socket): void {
     this.serverSockets.add(socket);
     const handler = this.handler;
-    if (handler === undefined) {
+    if (handler === undefined || this.closing || this.closed) {
+      socket.once('close', () => this.serverSockets.delete(socket));
       destroySocket(socket);
       return;
     }
 
     const decoder = new FrameDecoder({ maxPayloadBytes: this.maxPayloadBytes });
     let settled = false;
+    let requestComplete = false;
     let handlerStarted = false;
     let readTimer: NodeJS.Timeout | undefined;
 
@@ -799,43 +925,29 @@ export class RawNetTransport {
       cleanup();
     };
     const onError = (): void => fail();
-    const onData = (chunk: Buffer): void => {
+    const processRequest = async (request: Buffer): Promise<void> => {
       if (settled || handlerStarted) {
         return;
       }
-      try {
-        decoder.push(chunk);
-      } catch {
-        fail();
-      }
-    };
-    const onEnd = (): void => {
-      void processRequest();
-    };
-    const processRequest = async (): Promise<void> => {
-      if (settled || handlerStarted) {
-        return;
-      }
-      let request: Buffer;
-      try {
-        request = decoder.finish();
-      } catch {
-        fail();
-        return;
-      }
+      handlerStarted = true;
       if (readTimer !== undefined) {
         clearTimeout(readTimer);
         readTimer = undefined;
       }
+      if (this.closing || this.closed) {
+        fail();
+        return;
+      }
       try {
         await this.options.validatePayload?.(request);
-        if (settled) {
+        if (settled || this.closing || this.closed) {
+          fail();
           return;
         }
-        handlerStarted = true;
         const response = payloadBytes(await handler(request));
         await this.options.validatePayload?.(response);
-        if (settled) {
+        if (settled || this.closing || this.closed) {
+          fail();
           return;
         }
         const frame = encodeFrame(response, { maxPayloadBytes: this.maxPayloadBytes });
@@ -858,6 +970,32 @@ export class RawNetTransport {
         fail();
       }
     };
+    const onData = (chunk: Buffer): void => {
+      if (settled) {
+        return;
+      }
+      try {
+        const request = decoder.push(chunk);
+        if (request !== undefined) {
+          requestComplete = true;
+          void processRequest(request);
+        }
+      } catch {
+        fail();
+      }
+    };
+    const onEnd = (): void => {
+      if (settled || requestComplete) {
+        return;
+      }
+      try {
+        const request = decoder.finish();
+        requestComplete = true;
+        void processRequest(request);
+      } catch {
+        fail();
+      }
+    };
 
     socket.on('data', onData);
     socket.once('end', onEnd);
@@ -871,55 +1009,55 @@ export class RawNetTransport {
   }
 
   private async closeInternal(): Promise<void> {
-    this.closing = true;
     const server = this.server;
-    const endpoint = this.boundEndpoint;
+    const ownedEndpoint = this.ownedEndpoint;
     this.server = undefined;
     this.boundEndpoint = undefined;
+    this.ownedEndpoint = undefined;
     this.handler = undefined;
 
-    for (const socket of this.clientSockets) {
-      destroySocket(socket);
-    }
-    for (const socket of this.serverSockets) {
+    const sockets = new Set([...this.clientSockets, ...this.serverSockets]);
+    const socketClosures = [...sockets].map((socket) => waitForSocketClosure(socket));
+    for (const socket of sockets) {
       destroySocket(socket);
     }
 
     let closeError: unknown;
-    if (server !== undefined) {
-      const deadline = createPhaseDeadline('shutdown', this.options.shutdownTimeoutMs);
-      try {
-        await withDeadline(closeServer(server), deadline, {
+    const deadline = createPhaseDeadline('shutdown', this.options.shutdownTimeoutMs);
+    try {
+      await withDeadline(
+        Promise.all([
+          server === undefined ? Promise.resolve() : closeServer(server),
+          ...socketClosures,
+        ]),
+        deadline,
+        {
           onTimeout: () => {
-            for (const socket of this.serverSockets) {
+            for (const socket of sockets) {
               destroySocket(socket);
             }
-            (server as Server & { closeAllConnections?: () => void }).closeAllConnections?.();
+            (
+              server as (Server & { closeAllConnections?: () => void }) | undefined
+            )?.closeAllConnections?.();
           },
-        });
-      } catch (error: unknown) {
-        if (!(error instanceof PhaseDeadlineExceededError)) {
-          closeError = error;
-        }
-      }
+        },
+      );
+    } catch (error: unknown) {
+      closeError = error;
     }
 
-    for (const socket of this.serverSockets) {
-      destroySocket(socket);
-    }
-    for (const socket of this.clientSockets) {
-      destroySocket(socket);
-    }
-
-    if (endpoint !== undefined && isPosixRuntime()) {
+    if (
+      ownedEndpoint !== undefined &&
+      isPosixRuntime() &&
+      (server === undefined || !server.listening)
+    ) {
       try {
-        await unlinkOwnedSocket(endpoint);
+        unlinkOwnedSocket(ownedEndpoint.endpoint, ownedEndpoint.identity);
       } catch (error: unknown) {
         closeError ??= error;
       }
     }
 
-    this.closing = false;
     if (closeError !== undefined) {
       throw new RawNetError('shutdown-error', asError(closeError).message, closeError);
     }

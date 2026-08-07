@@ -203,6 +203,31 @@ async function expectRejectedFrame(
   // bounded declaration it sent, even though the server owns the decoder.
   expect(maxPayloadBytes).toBeGreaterThanOrEqual(0);
 }
+interface ResponseServer {
+  readonly server: Server;
+  readonly sockets: Set<Socket>;
+}
+
+async function listenResponseServer(
+  endpoint: string,
+  response: Buffer,
+  endAfterResponse = true,
+): Promise<ResponseServer> {
+  const sockets = new Set<Socket>();
+  const server = createServer({ allowHalfOpen: true }, (socket) => {
+    sockets.add(socket);
+    socket.on('error', () => undefined);
+    socket.once('close', () => sockets.delete(socket));
+    socket.once('data', () => {
+      socket.write(response);
+      if (endAfterResponse) {
+        socket.end();
+      }
+    });
+  });
+  await listenServer(server, endpoint);
+  return { server, sockets };
+}
 
 class FakeSocket extends EventEmitter {
   destroyed = false;
@@ -357,6 +382,7 @@ describe('raw node:net local IPC candidate', () => {
 
     try {
       await expectRejectedFrame(endpoint, encodeFrame(Buffer.from([0xff, 0xfe])), maxPayloadBytes);
+      await expectRejectedFrame(endpoint, encodeFrame(Buffer.from('{not-json}')), maxPayloadBytes);
       await expectRejectedFrame(endpoint, Buffer.from([0, 0, 0, 4, 0x7b]), maxPayloadBytes);
       await expectRejectedFrame(
         endpoint,
@@ -367,6 +393,53 @@ describe('raw node:net local IPC candidate', () => {
       expect(handlerCalls).toBe(0);
     } finally {
       await transport.close();
+    }
+  });
+  it('resolves a complete response before the peer half-closes', async () => {
+    const endpoint = createIpcEndpoint();
+    const fixture = await listenResponseServer(endpoint, encodeFrame(Buffer.from('{}')), false);
+    const transport = new RawNetTransport({ validatePayload: validateUtf8JsonPayload });
+
+    try {
+      await expect(transport.request(endpoint, Buffer.from('{"request":true}'))).resolves.toEqual(
+        Buffer.from('{}'),
+      );
+    } finally {
+      await transport.close();
+      await closeServer(fixture.server, fixture.sockets);
+    }
+  });
+
+  it('rejects malformed, truncated, trailing, and oversized responses', async () => {
+    const cases: readonly { response: Buffer; code: string; maxPayloadBytes?: number }[] = [
+      { response: encodeFrame(Buffer.from('{not-json}')), code: 'malformed-payload' },
+      { response: Buffer.from([0, 0, 0, 4, 0x7b]), code: 'premature-close' },
+      {
+        response: Buffer.concat([encodeFrame(Buffer.from('{}')), Buffer.from([0])]),
+        code: 'trailing-data',
+      },
+      {
+        response: Buffer.from([0, 0, 0, 33]),
+        code: 'oversized-frame',
+        maxPayloadBytes: 32,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const endpoint = createIpcEndpoint();
+      const fixture = await listenResponseServer(endpoint, testCase.response);
+      const transport = new RawNetTransport({
+        maxPayloadBytes: testCase.maxPayloadBytes,
+        validatePayload: validateUtf8JsonPayload,
+      });
+      try {
+        await expect(transport.request(endpoint, Buffer.from('{}'))).rejects.toMatchObject({
+          code: testCase.code,
+        });
+      } finally {
+        await transport.close();
+        await closeServer(fixture.server, fixture.sockets);
+      }
     }
   });
 
@@ -542,6 +615,22 @@ describe('raw node:net local IPC candidate', () => {
       await transport.close();
     }
   });
+  it('serializes bind with close and rejects requests after shutdown', async () => {
+    const endpoint = createIpcEndpoint();
+    const transport = new RawNetTransport();
+    const binding = transport.bind(endpoint, (payload) => payload);
+    const closing = transport.close();
+
+    await expect(binding).rejects.toMatchObject({ code: 'shutdown-error' });
+    await expect(closing).resolves.toBeUndefined();
+    await expect(transport.close()).resolves.toBeUndefined();
+    await expect(transport.request(endpoint, Buffer.from('after-close'))).rejects.toMatchObject({
+      code: 'shutdown-error',
+    });
+    if (process.platform !== 'win32') {
+      expect(await endpointExists(endpoint)).toBe(false);
+    }
+  });
 
   it('stops accepting and releases active sockets on clean shutdown', async () => {
     const endpoint = createIpcEndpoint();
@@ -558,8 +647,16 @@ describe('raw node:net local IPC candidate', () => {
         client.once('error', reject);
       }),
     );
+    const clientClosed = new Promise<void>((resolve) => {
+      if (client.destroyed) {
+        resolve();
+      } else {
+        client.once('close', () => resolve());
+      }
+    });
 
     await transport.close();
+    await withPhaseDeadline('client-close', TEST_TIMEOUT_MS, clientClosed);
     expect(client.destroyed).toBe(true);
     if (process.platform !== 'win32') {
       expect(await endpointExists(endpoint)).toBe(false);

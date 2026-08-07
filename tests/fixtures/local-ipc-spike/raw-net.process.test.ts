@@ -14,7 +14,7 @@ import {
   waitForChildExit,
   withDeadline,
 } from './test-helpers.js';
-import { RawNetTransport } from './raw-net.js';
+import { RawNetTransport, removeStalePosixEndpoint } from './raw-net.js';
 
 const CHILD_SCRIPT = fileURLToPath(new URL('./raw-net-child.mjs', import.meta.url));
 const PROCESS_TIMEOUT_MS = 3_000;
@@ -98,37 +98,58 @@ describe('raw node:net process lifecycle evidence', () => {
         });
         return;
       }
-
       const endpoint = createIpcEndpoint();
-      const child = spawn(process.execPath, [CHILD_SCRIPT, endpoint], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      const diagnostics = captureChildDiagnostics(child);
-      const transport = new RawNetTransport({ staleProbeTimeoutMs: 500 });
+      let child: ChildProcess | undefined;
+      let diagnostics: ReturnType<typeof captureChildDiagnostics> | undefined;
+      let transport: RawNetTransport | undefined;
 
       try {
+        child = spawn(process.execPath, [CHILD_SCRIPT, endpoint], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        diagnostics = captureChildDiagnostics(child);
+        transport = new RawNetTransport({ staleProbeTimeoutMs: 500 });
+        const runningChild = child;
+        const runningDiagnostics = diagnostics;
+        const runningTransport = transport;
+
         try {
-          await waitForReady(child);
+          await waitForReady(runningChild);
         } catch (error: unknown) {
-          throw diagnosticError(error, diagnostics.snapshot());
+          throw diagnosticError(error, runningDiagnostics.snapshot());
         }
         expect(await endpointExists(endpoint)).toBe(true);
 
-        child.kill('SIGKILL');
+        runningChild.kill('SIGKILL');
         const exit = await waitForChildExit(
-          child,
+          runningChild,
           createPhaseDeadline('abrupt-child-exit', PROCESS_TIMEOUT_MS),
         );
         expect(exit.signal).toBe('SIGKILL');
         expect(await endpointExists(endpoint)).toBe(true);
 
-        await transport.bind(endpoint, (payload) => payload);
-        await transport.close();
+        await runningTransport.bind(endpoint, (payload) => payload);
+        await runningTransport.close();
         expect(await endpointExists(endpoint)).toBe(false);
       } finally {
-        diagnostics.dispose();
-        await stopChild(child);
-        await transport.close();
+        diagnostics?.dispose();
+        try {
+          if (child !== undefined) {
+            await stopChild(child);
+          }
+        } finally {
+          try {
+            if (transport !== undefined) {
+              await transport.close();
+            }
+          } finally {
+            try {
+              await removeStalePosixEndpoint(endpoint, 500);
+            } catch {
+              // Cleanup must not hide the test failure or remove a replacement.
+            }
+          }
+        }
       }
     },
     PROCESS_TIMEOUT_MS * 2,
