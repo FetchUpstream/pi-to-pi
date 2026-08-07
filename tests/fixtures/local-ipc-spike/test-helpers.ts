@@ -248,11 +248,14 @@ export function raceWithAbort<T>(
   operation: PromiseLike<T> | T,
   signal: AbortSignal | undefined,
 ): Promise<T> {
+  const operationPromise: Promise<T> = Promise.resolve(operation);
+
   if (signal === undefined) {
-    return Promise.resolve(operation);
+    return operationPromise;
   }
 
   if (signal.aborted) {
+    void operationPromise.catch(() => undefined);
     return Promise.reject(abortErrorFromReason(signal.reason));
   }
   return new Promise<T>((resolve, reject) => {
@@ -264,7 +267,7 @@ export function raceWithAbort<T>(
       }
     });
 
-    Promise.resolve(operation).then(
+    operationPromise.then(
       (value) => {
         if (!settled) {
           settled = true;
@@ -297,10 +300,14 @@ export function withDeadline<T>(
   deadline: Deadline,
   options: DeadlineOptions = {},
 ): Promise<T> {
+  const nonFunctionOperation: Promise<T> | undefined =
+    typeof operation === 'function' ? undefined : Promise.resolve(operation);
+  if (nonFunctionOperation !== undefined) {
+    void nonFunctionOperation.catch(() => undefined);
+  }
   const resolvedDeadline = resolveDeadline(deadline);
   const timeoutMs = remainingMs(resolvedDeadline);
   const controller = new AbortController();
-
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     let cancelTimer = (): void => undefined;
@@ -354,11 +361,11 @@ export function withDeadline<T>(
     }
     let operationResult: Promise<T>;
     try {
-      const result =
-        typeof operation === 'function'
-          ? (operation as (signal: AbortSignal) => PromiseLike<T> | T)(controller.signal)
-          : operation;
-      operationResult = Promise.resolve(result);
+      operationResult =
+        nonFunctionOperation ??
+        Promise.resolve(
+          (operation as (signal: AbortSignal) => PromiseLike<T> | T)(controller.signal),
+        );
     } catch (error: unknown) {
       settle(() => reject(error));
       return;
@@ -428,14 +435,19 @@ export function waitForChildExit(
 
   let onClose: ((code: number | null, closeSignal: NodeJS.Signals | null) => void) | undefined;
   let onError: ((error: Error) => void) | undefined;
+  let pendingError: Error | undefined;
   const completion = new Promise<ChildExit>((resolve, reject) => {
     onClose = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
       const result = { code, signal: closeSignal };
       childCloseStates.set(child, result);
-      resolve(result);
+      if (pendingError !== undefined) {
+        reject(pendingError);
+      } else {
+        resolve(result);
+      }
     };
     onError = (error: Error): void => {
-      reject(error);
+      pendingError = error;
     };
 
     child.once('close', onClose);

@@ -15,6 +15,7 @@ import {
   raceWithAbort,
   remainingMs,
   waitForChildExit,
+  waitForChildWithDiagnostics,
   withDeadline,
   withPhaseDeadline,
 } from './test-helpers.js';
@@ -135,6 +136,54 @@ describe('local IPC spike test helpers', () => {
       code: 'ABORT_ERR',
     });
   });
+  it('drains an already-rejected operation when abort is already observed', async () => {
+    const controller = new AbortController();
+    controller.abort('already cancelled');
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const operation = Promise.reject(new Error('operation failed after abort'));
+      await expect(raceWithAbort(operation, controller.signal)).rejects.toMatchObject({
+        name: 'AbortError',
+        code: 'ABORT_ERR',
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+  it('drains rejected non-function operations on early abort and deadline', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const abortController = new AbortController();
+      abortController.abort('already cancelled');
+      const abortedOperation = Promise.reject(new Error('operation failed on abort'));
+      await expect(
+        withDeadline(abortedOperation, createPhaseDeadline('connect', 100), {
+          signal: abortController.signal,
+        }),
+      ).rejects.toMatchObject({
+        name: 'AbortError',
+        code: 'ABORT_ERR',
+      });
+      const deadlineOperation = Promise.reject(new Error('operation failed on deadline'));
+      await expect(
+        withDeadline(deadlineOperation, createPhaseDeadline('read', 0)),
+      ).rejects.toBeInstanceOf(PhaseDeadlineExceededError);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 
   it('cleans up a child process with a bounded escalation wait', async () => {
     const child = spawn(
@@ -179,6 +228,32 @@ describe('local IPC spike test helpers', () => {
     child.emit('close', 3, null);
     expect(capture.snapshot().exit).toEqual({ code: 3, signal: null });
     capture.dispose();
+  });
+  it('defers child errors until close so diagnostics include close state', async () => {
+    const child = new NullStdioExitedChild();
+    const pending = waitForChildWithDiagnostics(
+      child as unknown as ChildProcess,
+      createPhaseDeadline('child-diagnostics', 100),
+    );
+    let settled = false;
+    pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    child.emit('error', new Error('child failed before close'));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    child.emit('close', 3, null);
+    await expect(pending).rejects.toMatchObject({
+      name: 'ChildDiagnosticError',
+      message: expect.stringContaining('code: 3'),
+    });
   });
   it('waits for close after exit before cleanup returns', async () => {
     const child = new HangingChild();
