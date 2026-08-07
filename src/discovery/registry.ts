@@ -1524,9 +1524,7 @@ export class RuntimeRegistry {
   private currentNetworkName: RegistryNetworkName;
   private readonly cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
-  private pendingRenewal: Promise<void> = Promise.resolve();
-  /** Serialize name changes so each queued publication commits its own staged name. */
-  private pendingNetworkNameUpdate: Promise<void> = Promise.resolve();
+  private pendingPublication: Promise<void> = Promise.resolve();
   private shutdownRequested = false;
   private shutdownPromise: Promise<boolean> | undefined;
 
@@ -1595,34 +1593,39 @@ export class RuntimeRegistry {
     return this.currentRecord;
   }
 
+  private enqueuePublication(operation: () => Promise<void>): Promise<void> {
+    const queued = this.pendingPublication.then(operation);
+    this.pendingPublication = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  /** Publish the currently staged name; subclasses may inject deterministic failures. */
+  protected async publishCurrentName(): Promise<void> {
+    if (this.shutdownRequested || this.lease.stopped) {
+      throw new LeaseConfigurationError('cannot renew a stopped runtime registry');
+    }
+    const record = createRuntimeRecord({
+      runtimeId: this.runtimeId,
+      sessionId: this.sessionId,
+      roomId: this.roomId,
+      networkName: this.networkName,
+      endpoint: this.endpoint,
+      now: this.clock(),
+      ttlMs: this.ttlMs,
+    });
+    await publishRuntimeRecordAtomically(record, this.pathOptions);
+    this.currentRecord = record;
+  }
+
   /** Publish one owner record with a fresh lease. */
   public renew(): Promise<void> {
     if (this.shutdownRequested || this.lease.stopped) {
       return Promise.reject(new LeaseConfigurationError('cannot renew a stopped runtime registry'));
     }
-
-    const operation = this.pendingRenewal.then(async () => {
-      if (this.shutdownRequested || this.lease.stopped) {
-        throw new LeaseConfigurationError('cannot renew a stopped runtime registry');
-      }
-      const record = createRuntimeRecord({
-        runtimeId: this.runtimeId,
-        sessionId: this.sessionId,
-        roomId: this.roomId,
-        networkName: this.networkName,
-        endpoint: this.endpoint,
-        now: this.clock(),
-        ttlMs: this.ttlMs,
-      });
-      await publishRuntimeRecordAtomically(record, this.pathOptions);
-      this.currentRecord = record;
-    });
-
-    this.pendingRenewal = operation.then(
-      () => undefined,
-      () => undefined,
-    );
-    return operation;
+    return this.enqueuePublication(() => this.publishCurrentName());
   }
 
   public publish(): Promise<void> {
@@ -1640,21 +1643,16 @@ export class RuntimeRegistry {
       );
     }
 
-    const operation = this.pendingNetworkNameUpdate.then(async () => {
+    return this.enqueuePublication(async () => {
       const previousNetworkName = this.networkName;
       this.currentNetworkName = canonical;
       try {
-        await this.renew();
+        await this.publishCurrentName();
       } catch (error) {
         this.currentNetworkName = previousNetworkName;
         throw error;
       }
     });
-    this.pendingNetworkNameUpdate = operation.then(
-      () => undefined,
-      () => undefined,
-    );
-    return operation;
   }
 
   /** Alias for lifecycle callers that describe the operation as a rename. */
@@ -1685,8 +1683,7 @@ export class RuntimeRegistry {
       this.shutdownRequested = true;
       this.shutdownPromise = (async () => {
         await this.lease.stop();
-        await this.pendingNetworkNameUpdate;
-        await this.pendingRenewal;
+        await this.pendingPublication;
         // A rename stages the mutable name before its queued publication commits;
         // remove the exact record that was last committed to disk instead.
         const committedRecord = this.currentRecord;
