@@ -123,12 +123,28 @@ const defaultScheduler: LeaseScheduler = {
   clearInterval: (timer) => clearInterval(timer),
 };
 
+/** Maximum delay accepted by Node's timer APIs without 32-bit overflow. */
+export const MAX_LEASE_TIMER_DELAY_MS = 2_147_483_647;
+
+const MAX_ENDPOINT_KEYS = 4;
+const MAX_ENDPOINT_BYTES = 64 * 1024;
+const MAX_SNAPSHOT_DEPTH = 32;
+const MAX_SNAPSHOT_NODES = 4_096;
+const MAX_SNAPSHOT_ENTRIES = 256;
+const MAX_SNAPSHOT_STRING_LENGTH = 2_048;
+
 function duration(value: number | undefined, fallback: number, label: string): number {
   const result = value ?? fallback;
   if (!Number.isSafeInteger(result) || result <= 0) {
     throw new LeaseConfigurationError(`${label} must be a positive safe integer`);
   }
   return result;
+}
+
+function validateRenewalTiming(ttlMs: number, renewalIntervalMs: number): void {
+  if (renewalIntervalMs >= ttlMs) {
+    throw new LeaseConfigurationError('renewalIntervalMs must be less than ttlMs');
+  }
 }
 
 function clockValue(clock: LeaseClock): number {
@@ -152,6 +168,7 @@ function sameIdentity(left: LeaseOwnerIdentity, right: LeaseOwnerIdentity): bool
 }
 
 const MAX_ENDPOINT_LENGTH = 16_384;
+
 const FORBIDDEN_ENDPOINT_KEYS = new Set([
   'apiKey',
   'apiToken',
@@ -190,6 +207,86 @@ function isRenewalResult(value: unknown): value is LeaseRenewalResult {
   return (
     typeof value === 'object' && value !== null && ('endpoint' in value || 'identity' in value)
   );
+}
+
+interface SnapshotBudget {
+  nodes: number;
+}
+
+/** Clone lease diagnostics into bounded, JSON-like immutable data. */
+function sanitizeSnapshotValue(
+  value: unknown,
+  depth = 0,
+  seen = new Set<object>(),
+  budget: SnapshotBudget = { nodes: 0 },
+): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return value.length > MAX_SNAPSHOT_STRING_LENGTH
+      ? `${value.slice(0, MAX_SNAPSHOT_STRING_LENGTH)}…`
+      : value;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : String(value);
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (typeof value === 'function' || typeof value === 'symbol') {
+    return `[unsupported ${typeof value}]`;
+  }
+  if (depth >= MAX_SNAPSHOT_DEPTH || budget.nodes >= MAX_SNAPSHOT_NODES) {
+    return '[truncated]';
+  }
+  if (seen.has(value)) {
+    return '[circular]';
+  }
+  budget.nodes += 1;
+  seen.add(value);
+  try {
+    if (value instanceof Error) {
+      return Object.freeze({
+        name: sanitizeSnapshotValue(value.name, depth + 1, seen, budget),
+        message: sanitizeSnapshotValue(value.message, depth + 1, seen, budget),
+      });
+    }
+    if (value instanceof Date) {
+      return Number.isFinite(value.getTime()) ? value.toISOString() : '[invalid date]';
+    }
+    if (Array.isArray(value)) {
+      const copy = value
+        .slice(0, MAX_SNAPSHOT_ENTRIES)
+        .map((entry) => sanitizeSnapshotValue(entry, depth + 1, seen, budget));
+      if (value.length > MAX_SNAPSHOT_ENTRIES) {
+        copy.push('[truncated]');
+      }
+      return Object.freeze(copy);
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return `[${Object.prototype.toString.call(value)}]`;
+    }
+    const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    const keys = Object.keys(value);
+    for (const key of keys.slice(0, MAX_SNAPSHOT_ENTRIES)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !('value' in descriptor)) {
+        continue;
+      }
+      copy[key] = sanitizeSnapshotValue(descriptor.value, depth + 1, seen, budget);
+    }
+    if (keys.length > MAX_SNAPSHOT_ENTRIES) {
+      copy['[truncated]'] = true;
+    }
+    return Object.freeze(copy);
+  } finally {
+    seen.delete(value);
+  }
 }
 
 /**
@@ -247,6 +344,7 @@ export class SerializedLease {
       DEFAULT_LEASE_RENEWAL_INTERVAL_MS,
       'renewalIntervalMs',
     );
+    validateRenewalTiming(this.ttlMs, this.renewalIntervalMs);
     this.onError = options.onError;
     this.onStop = options.onStop;
     this.onEndpointUpdate = options.onEndpointUpdate;
@@ -332,10 +430,17 @@ export class SerializedLease {
         if (!sameIdentity(this.ownerIdentity, ownerAtStart)) {
           throw new LeaseConfigurationError('lease owner identity changed during renewal');
         }
+      } else if (this.ownerIdentity !== ownerAtStart) {
+        throw new LeaseConfigurationError('lease owner identity changed during renewal');
       }
       if (nextIdentity !== undefined) {
         if (this.ownerIdentity !== undefined && !sameIdentity(this.ownerIdentity, nextIdentity)) {
           throw new LeaseConfigurationError('lease owner identity cannot be replaced');
+        }
+        // An endpoint supplied before the callback revealed its identity is
+        // still untrusted until it is checked against that identity.
+        if (this.currentEndpoint !== undefined) {
+          cloneEndpoint(this.currentEndpoint, nextIdentity.runtimeId);
         }
         this.ownerIdentity ??= nextIdentity;
       }
@@ -384,12 +489,15 @@ export class SerializedLease {
     }
 
     this.state = 'active';
-    this.timer = this.scheduler.setInterval(() => {
-      void this.renew().catch((error: unknown) => {
-        this.lastError = error;
-        this.onError?.(error);
-      });
-    }, this.renewalIntervalMs);
+    this.timer = this.scheduler.setInterval(
+      () => {
+        void this.renew().catch((error: unknown) => {
+          this.lastError = error;
+          this.onError?.(error);
+        });
+      },
+      Math.min(this.renewalIntervalMs, MAX_LEASE_TIMER_DELAY_MS),
+    );
     const timer = this.timer as LeaseTimer & { unref?: () => void };
     timer.unref?.();
 
@@ -445,20 +553,38 @@ export class SerializedLease {
     if (this.state === 'stopped' || this.state === 'expired') {
       throw new LeaseExpiredError();
     }
+    const lifecycleGeneration = this.lifecycleGeneration;
+    const endpointGeneration = this.endpointGeneration;
+    const ownerAtStart = this.ownerIdentity;
     const now = clockValue(this.now);
     if (this.expiresAt !== null && now >= this.expiresAt) {
       this.markExpired();
       throw new LeaseExpiredError();
     }
-    const endpointCopy = cloneEndpoint(endpoint, this.ownerIdentity?.runtimeId);
+    const endpointCopy = cloneEndpoint(endpoint, ownerAtStart?.runtimeId);
     // Persist through the owning registry before changing this lease's local
     // snapshot.  A failed publication therefore cannot create divergent state.
     this.onEndpointUpdate?.(endpointCopy);
+    const stateAfterCallback = this.lifecycle;
+    if (stateAfterCallback === 'stopped') {
+      throw new LeaseStoppedError();
+    }
+    if (stateAfterCallback === 'expired') {
+      throw new LeaseExpiredError();
+    }
+    if (this.lifecycleGeneration !== lifecycleGeneration) {
+      throw new LeaseStoppedError();
+    }
+    if (this.endpointGeneration !== endpointGeneration) {
+      throw new LeaseConfigurationError('endpoint update became stale during callback');
+    }
+    if (this.ownerIdentity !== ownerAtStart) {
+      throw new LeaseConfigurationError('lease owner changed during endpoint update');
+    }
+    // Recheck ownership after the callback before committing the endpoint.
+    const committedEndpoint = cloneEndpoint(endpointCopy, this.ownerIdentity?.runtimeId);
     this.endpointGeneration += 1;
-    // Publish the defensive copy immediately for callers that need the current
-    // endpoint synchronously.  The generation check prevents an in-flight
-    // callback from overwriting this newer endpoint.
-    this.currentEndpoint = endpointCopy;
+    this.currentEndpoint = committedEndpoint;
   }
 
   public get running(): boolean {
@@ -494,7 +620,7 @@ export class SerializedLease {
     if (this.state !== 'stopped' && this.expiresAt !== null && now >= this.expiresAt) {
       this.markExpired();
     }
-    return {
+    const snapshot: LeaseSnapshot = {
       state: this.state,
       running: this.running,
       stopped: this.stopped,
@@ -509,8 +635,9 @@ export class SerializedLease {
       lastRenewedAt: this.lastRenewedAt,
       expiresAt: this.expiresAt,
       leaseExpiresAt: this.expiresAt === null ? null : asTimestamp(this.expiresAt),
-      lastError: this.lastError,
+      lastError: this.lastError === null ? null : sanitizeSnapshotValue(this.lastError),
     };
+    return Object.freeze(snapshot);
   }
 
   /** Lifecycle-friendly aliases. */
@@ -558,6 +685,7 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
     if (
       endpoint.trim().length === 0 ||
       endpoint.length > MAX_ENDPOINT_LENGTH ||
+      Buffer.byteLength(endpoint, 'utf8') > MAX_ENDPOINT_BYTES ||
       CONTROL_CHARACTER_PATTERN.test(endpoint)
     ) {
       throw new LeaseConfigurationError('routing endpoint must be bounded non-empty text');
@@ -567,51 +695,88 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
   if (typeof endpoint !== 'object' || endpoint === null || Array.isArray(endpoint)) {
     throw new LeaseConfigurationError('routing endpoint must be an opaque string or descriptor');
   }
+  const prototype = Object.getPrototypeOf(endpoint);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new LeaseConfigurationError('routing endpoint descriptor must be a plain object');
+  }
+  const keys = Reflect.ownKeys(endpoint);
+  if (keys.length > MAX_ENDPOINT_KEYS) {
+    throw new LeaseConfigurationError('routing endpoint descriptor has too many fields');
+  }
+  for (const key of keys) {
+    if (typeof key !== 'string') {
+      throw new LeaseConfigurationError('routing endpoint descriptor cannot contain symbols');
+    }
+    if (!['address', 'kind', 'transport', 'runtimeId'].includes(key)) {
+      throw new LeaseConfigurationError(
+        FORBIDDEN_ENDPOINT_KEYS.has(key)
+          ? 'routing endpoint cannot carry credentials'
+          : 'routing endpoint contains an unknown field',
+      );
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    if (descriptor === undefined || !('value' in descriptor)) {
+      throw new LeaseConfigurationError('routing endpoint descriptor cannot contain accessors');
+    }
+  }
+  const ownValue = (key: string): unknown => Object.getOwnPropertyDescriptor(endpoint, key)?.value;
+  const address = ownValue('address');
   if (
-    typeof endpoint.address !== 'string' ||
-    endpoint.address.trim().length === 0 ||
-    endpoint.address.length > MAX_ENDPOINT_LENGTH ||
-    CONTROL_CHARACTER_PATTERN.test(endpoint.address)
+    typeof address !== 'string' ||
+    address.trim().length === 0 ||
+    address.length > MAX_ENDPOINT_LENGTH ||
+    Buffer.byteLength(address, 'utf8') > MAX_ENDPOINT_BYTES ||
+    CONTROL_CHARACTER_PATTERN.test(address)
   ) {
     throw new LeaseConfigurationError('routing endpoint address must be bounded non-empty text');
   }
+  const kind = ownValue('kind');
   if (
-    endpoint.kind !== undefined &&
-    (typeof endpoint.kind !== 'string' ||
-      endpoint.kind.trim().length === 0 ||
-      endpoint.kind.length > MAX_ENDPOINT_LENGTH ||
-      CONTROL_CHARACTER_PATTERN.test(endpoint.kind))
+    kind !== undefined &&
+    (typeof kind !== 'string' ||
+      kind.trim().length === 0 ||
+      kind.length > MAX_ENDPOINT_LENGTH ||
+      Buffer.byteLength(kind, 'utf8') > MAX_ENDPOINT_BYTES ||
+      CONTROL_CHARACTER_PATTERN.test(kind))
   ) {
     throw new LeaseConfigurationError('routing endpoint kind must be bounded non-empty text');
   }
+  const transport = ownValue('transport');
   if (
-    endpoint.transport !== undefined &&
-    (typeof endpoint.transport !== 'string' ||
-      endpoint.transport.trim().length === 0 ||
-      endpoint.transport.length > MAX_ENDPOINT_LENGTH ||
-      CONTROL_CHARACTER_PATTERN.test(endpoint.transport))
+    transport !== undefined &&
+    (typeof transport !== 'string' ||
+      transport.trim().length === 0 ||
+      transport.length > MAX_ENDPOINT_LENGTH ||
+      Buffer.byteLength(transport, 'utf8') > MAX_ENDPOINT_BYTES ||
+      CONTROL_CHARACTER_PATTERN.test(transport))
   ) {
     throw new LeaseConfigurationError('routing endpoint transport must be bounded non-empty text');
   }
-  if (
-    endpoint.kind !== undefined &&
-    endpoint.transport !== undefined &&
-    endpoint.kind !== endpoint.transport
-  ) {
+  if (kind !== undefined && transport !== undefined && kind !== transport) {
     throw new LeaseConfigurationError('routing endpoint kind and transport must agree');
   }
-  if (endpoint.runtimeId !== undefined) {
-    if (!isUuidV4(endpoint.runtimeId)) {
+  const endpointRuntimeId = ownValue('runtimeId');
+  if (endpointRuntimeId !== undefined) {
+    if (!isUuidV4(endpointRuntimeId)) {
       throw new LeaseConfigurationError('routing endpoint runtimeId must be canonical');
     }
-    if (runtimeId !== undefined && endpoint.runtimeId !== runtimeId) {
+    if (runtimeId !== undefined && endpointRuntimeId !== runtimeId) {
       throw new LeaseConfigurationError('routing endpoint is not owned by the lease runtime');
     }
   }
-  for (const key of Object.keys(endpoint)) {
-    if (FORBIDDEN_ENDPOINT_KEYS.has(key)) {
-      throw new LeaseConfigurationError('routing endpoint cannot carry credentials');
-    }
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify({
+      address,
+      ...(kind === undefined ? {} : { kind }),
+      ...(transport === undefined ? {} : { transport }),
+      ...(endpointRuntimeId === undefined ? {} : { runtimeId: endpointRuntimeId }),
+    });
+  } catch {
+    throw new LeaseConfigurationError('routing endpoint is not JSON serializable');
+  }
+  if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > MAX_ENDPOINT_BYTES) {
+    throw new LeaseConfigurationError('routing endpoint exceeds its size limit');
   }
 }
 /** Options for calculating or renewing a lease expiry. */

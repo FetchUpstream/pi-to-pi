@@ -242,17 +242,13 @@ export interface BindingAuthenticator<Metadata extends BindingMetadata = Binding
 }
 export type BindingAuth = BindingAuthenticator;
 
-export interface TargetedOperation {
-  readonly sender: SenderIdentity;
-  readonly recipientRuntimeId: RuntimeId;
-  readonly roomId: RoomId;
-}
+export type TargetedOperation = Pick<ProtocolEnvelope, 'sender' | 'recipientRuntimeId' | 'roomId'>;
 
 const AUTHENTICATED_OPERATION_BRAND: unique symbol = Symbol('authenticated-operation');
 const trustedAuthenticatedOperations = new WeakSet<object>();
 
-/** A trusted envelope plus binding-only metadata kept outside application data. */
-export interface AuthenticatedOperation<Envelope extends TargetedOperation = TargetedOperation> {
+/** A validated protocol envelope plus binding-only metadata kept outside application data. */
+export interface AuthenticatedOperation<Envelope extends ProtocolEnvelope = ProtocolEnvelope> {
   readonly envelope: Envelope;
   readonly bindingMetadata?: BindingMetadata;
   /** Alias accepted at the binding boundary; never retained in a registry record. */
@@ -261,35 +257,30 @@ export interface AuthenticatedOperation<Envelope extends TargetedOperation = Tar
 }
 
 /** Construct the only wrapper form accepted as a binding-authenticated input. */
-export function createAuthenticatedOperation<Envelope extends TargetedOperation>(
+export function createAuthenticatedOperation<Envelope extends ProtocolEnvelope>(
   envelope: Envelope,
   bindingMetadata?: BindingMetadata,
 ): AuthenticatedOperation<Envelope> {
-  if (!isTargetedOperation(envelope)) {
-    throw new AgentCardRegistryError('malformed', 'authenticated envelope is not targeted');
-  }
+  const validatedEnvelope = validateAuthenticatedEnvelope(envelope);
   if (bindingMetadata !== undefined && !isRecord(bindingMetadata)) {
     throw new AgentCardRegistryError('malformed', 'binding metadata must be an object');
   }
-  const envelopeSnapshot = cloneFrozenSnapshot(envelope);
+  const envelopeSnapshot = cloneFrozenSnapshot(validatedEnvelope);
   const metadataSnapshot =
     bindingMetadata === undefined ? undefined : cloneFrozenSnapshot(bindingMetadata);
-  if (!isTargetedOperation(envelopeSnapshot)) {
-    throw new AgentCardRegistryError('malformed', 'authenticated envelope is not targeted');
-  }
   const wrapper = Object.freeze({
     [AUTHENTICATED_OPERATION_BRAND]: true as const,
     envelope: envelopeSnapshot,
     ...(metadataSnapshot === undefined ? {} : { bindingMetadata: metadataSnapshot }),
   });
   trustedAuthenticatedOperations.add(wrapper);
-  return wrapper;
+  return wrapper as AuthenticatedOperation<Envelope>;
 }
 
-export type InboundOperation<Envelope extends TargetedOperation = TargetedOperation> =
+export type InboundOperation<Envelope extends ProtocolEnvelope = ProtocolEnvelope> =
   AuthenticatedOperation<Envelope>;
 
-export interface AuthorizedTarget<Envelope extends TargetedOperation = TargetedOperation> {
+export interface AuthorizedTarget<Envelope extends ProtocolEnvelope = ProtocolEnvelope> {
   readonly ok: true;
   readonly envelope: Envelope;
   readonly sender: SessionRuntimeIdentity;
@@ -302,9 +293,8 @@ export interface TargetVerificationFailure {
   readonly error: ProtocolError;
 }
 
-export type TargetVerificationResult<Envelope extends TargetedOperation = TargetedOperation> =
+export type TargetVerificationResult<Envelope extends ProtocolEnvelope = ProtocolEnvelope> =
   AuthorizedTarget<Envelope> | TargetVerificationFailure;
-
 export class TargetAuthorizationError extends Error {
   public readonly error: ProtocolError;
 
@@ -338,6 +328,10 @@ interface PublicationParts {
 }
 
 const MAX_ENDPOINT_LENGTH = 16_384;
+const MAX_ENDPOINT_KEYS = 4;
+const MAX_ENDPOINT_BYTES = 64 * 1024;
+const MAX_RETIRED_RUNTIME_IDENTITIES = 1_024;
+const RETIRED_RUNTIME_GRACE_MS = 10 * 60 * 1000;
 const MAX_NAME_LENGTH = 256;
 const MAX_DESCRIPTION_LENGTH = 1_024;
 const MAX_SUPPORTED_PROTOCOL_VERSIONS = 1;
@@ -359,6 +353,20 @@ const FORBIDDEN_METADATA_KEYS = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validateAuthenticatedEnvelope(value: unknown): ProtocolEnvelope {
+  const result = validateEnvelope(value, {
+    maxEnvelopeBytes: DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes,
+  });
+  if (!result.ok) {
+    const code = result.error.code === 'expired' ? 'expired' : 'malformed';
+    throw new AgentCardRegistryError(
+      code,
+      `authenticated envelope is invalid: ${result.error.message}`,
+    );
+  }
+  return result.value;
 }
 
 /** Clone and recursively freeze values crossing the authenticated binding boundary. */
@@ -467,11 +475,17 @@ function canonicalIdentity(
 }
 
 function resolveRoom(options: AgentCardRegistryOptions): RoomId {
-  const supplied = options.roomIdentity?.roomId ?? options.room?.roomId ?? options.roomId;
-  if (supplied === undefined) {
+  const aliases = [options.roomIdentity?.roomId, options.room?.roomId, options.roomId].filter(
+    (value): value is RoomId => value !== undefined,
+  );
+  if (aliases.length === 0) {
     throw new AgentCardRegistryError('malformed', 'a canonical room identity is required');
   }
-  return roomValue(supplied, 'roomId');
+  const roomIds = aliases.map((value) => roomValue(value, 'roomId'));
+  if (roomIds.some((value) => value !== roomIds[0])) {
+    throw new AgentCardRegistryError('malformed', 'room aliases must agree');
+  }
+  return roomIds[0];
 }
 
 function resolveIdentity(options: AgentCardRegistryOptions): SessionRuntimeIdentity | undefined {
@@ -510,6 +524,15 @@ function resolveDuration(value: number | undefined, fallback: number, label: str
     throw new AgentCardRegistryError('malformed', `${label} must be a positive safe integer`);
   }
   return result;
+}
+
+function validateLeaseTiming(ttlMs: number, renewalIntervalMs: number): void {
+  if (renewalIntervalMs >= ttlMs) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'leaseRenewalIntervalMs must be less than leaseTtlMs',
+    );
+  }
 }
 
 function resolveNow(value: number | Date | undefined, clock: LeaseClock): number {
@@ -580,6 +603,7 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
     if (
       endpoint.trim().length === 0 ||
       endpoint.length > MAX_ENDPOINT_LENGTH ||
+      Buffer.byteLength(endpoint, 'utf8') > MAX_ENDPOINT_BYTES ||
       CONTROL_CHARACTER_PATTERN.test(endpoint)
     ) {
       throw new AgentCardRegistryError(
@@ -592,61 +616,114 @@ function validateEndpoint(endpoint: RoutingEndpoint, runtimeId?: RuntimeId): voi
   if (!isRecord(endpoint)) {
     throw new AgentCardRegistryError('malformed', 'routing endpoint must be an opaque descriptor');
   }
+  const prototype = Object.getPrototypeOf(endpoint);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'routing endpoint descriptor must be a plain object',
+    );
+  }
+  const keys = Reflect.ownKeys(endpoint);
+  if (keys.length > MAX_ENDPOINT_KEYS) {
+    throw new AgentCardRegistryError(
+      'malformed',
+      'routing endpoint descriptor has too many fields',
+    );
+  }
+  for (const key of keys) {
+    if (typeof key !== 'string') {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'routing endpoint descriptor cannot contain symbols',
+      );
+    }
+    if (!['address', 'kind', 'transport', 'runtimeId'].includes(key)) {
+      throw new AgentCardRegistryError(
+        'malformed',
+        FORBIDDEN_METADATA_KEYS.has(key)
+          ? 'routing endpoint cannot carry credentials'
+          : 'routing endpoint contains an unknown field',
+      );
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(endpoint, key);
+    if (descriptor === undefined || !('value' in descriptor)) {
+      throw new AgentCardRegistryError(
+        'malformed',
+        'routing endpoint descriptor cannot contain accessors',
+      );
+    }
+  }
+  const ownValue = (key: string): unknown => Object.getOwnPropertyDescriptor(endpoint, key)?.value;
+  const address = ownValue('address');
   if (
-    typeof endpoint.address !== 'string' ||
-    endpoint.address.trim().length === 0 ||
-    endpoint.address.length > MAX_ENDPOINT_LENGTH ||
-    CONTROL_CHARACTER_PATTERN.test(endpoint.address)
+    typeof address !== 'string' ||
+    address.trim().length === 0 ||
+    address.length > MAX_ENDPOINT_LENGTH ||
+    Buffer.byteLength(address, 'utf8') > MAX_ENDPOINT_BYTES ||
+    CONTROL_CHARACTER_PATTERN.test(address)
   ) {
     throw new AgentCardRegistryError(
       'malformed',
       'routing endpoint address must be bounded non-empty text',
     );
   }
+  const kind = ownValue('kind');
   if (
-    endpoint.kind !== undefined &&
-    (typeof endpoint.kind !== 'string' ||
-      endpoint.kind.trim().length === 0 ||
-      endpoint.kind.length > MAX_ENDPOINT_LENGTH ||
-      CONTROL_CHARACTER_PATTERN.test(endpoint.kind))
+    kind !== undefined &&
+    (typeof kind !== 'string' ||
+      kind.trim().length === 0 ||
+      kind.length > MAX_ENDPOINT_LENGTH ||
+      Buffer.byteLength(kind, 'utf8') > MAX_ENDPOINT_BYTES ||
+      CONTROL_CHARACTER_PATTERN.test(kind))
   ) {
     throw new AgentCardRegistryError(
       'malformed',
       'routing endpoint kind must be bounded non-empty text',
     );
   }
+  const transport = ownValue('transport');
   if (
-    endpoint.transport !== undefined &&
-    (typeof endpoint.transport !== 'string' ||
-      endpoint.transport.trim().length === 0 ||
-      endpoint.transport.length > MAX_ENDPOINT_LENGTH ||
-      CONTROL_CHARACTER_PATTERN.test(endpoint.transport))
+    transport !== undefined &&
+    (typeof transport !== 'string' ||
+      transport.trim().length === 0 ||
+      transport.length > MAX_ENDPOINT_LENGTH ||
+      Buffer.byteLength(transport, 'utf8') > MAX_ENDPOINT_BYTES ||
+      CONTROL_CHARACTER_PATTERN.test(transport))
   ) {
     throw new AgentCardRegistryError(
       'malformed',
       'routing endpoint transport must be bounded non-empty text',
     );
   }
-  if (
-    endpoint.kind !== undefined &&
-    endpoint.transport !== undefined &&
-    endpoint.kind !== endpoint.transport
-  ) {
+  if (kind !== undefined && transport !== undefined && kind !== transport) {
     throw new AgentCardRegistryError('malformed', 'routing endpoint kind and transport must agree');
   }
-  if (endpoint.runtimeId !== undefined) {
-    const endpointRuntimeId = runtimeValue(endpoint.runtimeId, 'routing endpoint runtimeId');
-    if (runtimeId !== undefined && endpointRuntimeId !== runtimeId) {
+  const endpointRuntimeId = ownValue('runtimeId');
+  if (endpointRuntimeId !== undefined) {
+    const canonicalEndpointRuntimeId = runtimeValue(
+      endpointRuntimeId,
+      'routing endpoint runtimeId',
+    );
+    if (runtimeId !== undefined && canonicalEndpointRuntimeId !== runtimeId) {
       throw new AgentCardRegistryError(
         'unauthorized',
         'routing endpoint is not owned by the runtime',
       );
     }
   }
-  for (const key of Object.keys(endpoint)) {
-    if (FORBIDDEN_METADATA_KEYS.has(key)) {
-      throw new AgentCardRegistryError('malformed', 'routing endpoint cannot carry credentials');
-    }
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify({
+      address,
+      ...(kind === undefined ? {} : { kind }),
+      ...(transport === undefined ? {} : { transport }),
+      ...(endpointRuntimeId === undefined ? {} : { runtimeId: endpointRuntimeId }),
+    });
+  } catch {
+    throw new AgentCardRegistryError('malformed', 'routing endpoint is not JSON serializable');
+  }
+  if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > MAX_ENDPOINT_BYTES) {
+    throw new AgentCardRegistryError('malformed', 'routing endpoint exceeds its size limit');
   }
 }
 
@@ -851,7 +928,14 @@ function extractPublication(input: AgentCardPublication | AgentCard): Publicatio
   const raw = input as Record<string, unknown>;
   const nestedCard = isRecord(raw.card) ? raw.card : undefined;
   const card = (nestedCard ?? raw) as unknown as AgentCard;
-  const roomId = (raw.roomId ?? nestedCard?.roomId) as RoomId | undefined;
+  const roomAliases = [raw.roomId, nestedCard?.roomId].filter(
+    (value): value is RoomId => value !== undefined,
+  );
+  const roomValues = roomAliases.map((value) => roomValue(value, 'roomId'));
+  if (roomValues.length > 1 && roomValues.some((value) => value !== roomValues[0])) {
+    throw new AgentCardRegistryError('malformed', 'room aliases must agree');
+  }
+  const roomId = roomValues[0];
   const endpoint = (raw.endpoint ?? nestedCard?.endpoint) as RoutingEndpoint | undefined;
   if (endpoint === undefined) {
     throw new AgentCardRegistryError('malformed', 'current routing endpoint is required');
@@ -914,7 +998,8 @@ function cardWithDiscoveryFields(
 function leaseSnapshot(
   identity: SessionRuntimeIdentity,
   endpoint: RoutingEndpoint,
-  now: number,
+  issuedAt: number,
+  lastRenewedAt: number,
   expiresAt: number,
   ttlMs: number,
   renewalIntervalMs: number,
@@ -928,8 +1013,8 @@ function leaseSnapshot(
     endpoint,
     ttlMs,
     renewalIntervalMs,
-    issuedAt: now,
-    lastRenewedAt: now,
+    issuedAt,
+    lastRenewedAt,
     expiresAt,
     leaseExpiresAt: isoTimestamp(expiresAt),
     lastError: null,
@@ -958,7 +1043,7 @@ function safeError(code: 'unauthorized' | 'cross_room'): ProtocolError {
   );
 }
 
-function isTargetedOperation(value: unknown): value is TargetedOperation {
+function isTargetedOperation(value: unknown): value is ProtocolEnvelope {
   if (!isRecord(value) || !isRecord(value.sender)) {
     return false;
   }
@@ -969,18 +1054,20 @@ function isTargetedOperation(value: unknown): value is TargetedOperation {
   );
 }
 
-function unwrapInbound<Envelope extends TargetedOperation>(
-  input: AuthenticatedOperation<Envelope> | Envelope,
+function unwrapInbound<Envelope extends ProtocolEnvelope>(
+  input: AuthenticatedOperation<Envelope>,
 ): { envelope: Envelope; metadata: BindingMetadata | undefined } | undefined {
-  if (
-    !isRecord(input) ||
-    !trustedAuthenticatedOperations.has(input) ||
-    !isTargetedOperation(input.envelope)
-  ) {
+  if (!isRecord(input) || !trustedAuthenticatedOperations.has(input)) {
+    return undefined;
+  }
+  const validated = validateEnvelope(input.envelope, {
+    maxEnvelopeBytes: DEFAULT_PROTOCOL_LIMITS.maxEnvelopeBytes,
+  });
+  if (!validated.ok || !isTargetedOperation(validated.value)) {
     return undefined;
   }
   const metadata = (input.bindingMetadata ?? input.metadata) as BindingMetadata | undefined;
-  return { envelope: input.envelope as Envelope, metadata };
+  return { envelope: validated.value as Envelope, metadata };
 }
 
 function authenticatedIdentity(value: unknown): SessionRuntimeIdentity | undefined {
@@ -1035,37 +1122,12 @@ function crossRoomResult(): TargetVerificationFailure {
  * is checked last.  A caller can therefore safely invoke task/dedupe lookup
  * only after receiving an `ok: true` result.
  */
-export function verifyAuthenticatedTarget<Envelope extends TargetedOperation>(
-  input: AuthenticatedOperation<Envelope> | Envelope,
+export async function verifyAuthenticatedTarget<Envelope extends ProtocolEnvelope>(
+  input: AuthenticatedOperation<Envelope>,
   authenticator: BindingAuthenticator,
   target: VerificationTarget,
-): Promise<TargetVerificationResult<Envelope>>;
-export function verifyAuthenticatedTarget<Envelope extends TargetedOperation>(
-  input: Envelope,
-  metadata: BindingMetadata | undefined,
-  authenticator: BindingAuthenticator,
-  target: VerificationTarget,
-): Promise<TargetVerificationResult<Envelope>>;
-export async function verifyAuthenticatedTarget<Envelope extends TargetedOperation>(
-  input: AuthenticatedOperation<Envelope> | Envelope,
-  authenticatorOrMetadata: BindingAuthenticator | BindingMetadata | undefined,
-  targetOrAuthenticator: VerificationTarget | BindingAuthenticator,
-  maybeTarget?: VerificationTarget,
 ): Promise<TargetVerificationResult<Envelope>> {
-  const authenticator = (
-    maybeTarget === undefined ? authenticatorOrMetadata : targetOrAuthenticator
-  ) as BindingAuthenticator;
-  const target = (
-    maybeTarget === undefined ? targetOrAuthenticator : maybeTarget
-  ) as VerificationTarget;
-  const verificationInput =
-    maybeTarget === undefined
-      ? input
-      : createAuthenticatedOperation(
-          input as Envelope,
-          authenticatorOrMetadata as BindingMetadata | undefined,
-        );
-  const unwrapped = unwrapInbound(verificationInput);
+  const unwrapped = unwrapInbound(input);
   if (unwrapped === undefined) {
     return unauthorizedResult();
   }
@@ -1073,7 +1135,6 @@ export async function verifyAuthenticatedTarget<Envelope extends TargetedOperati
   if (!isTargetedOperation(envelope) || !isUuidV4(target.runtimeId) || !isRoomId(target.roomId)) {
     return unauthorizedResult();
   }
-
   const context: BindingAuthenticationContext = Object.freeze({
     claimedSender: envelope.sender,
     recipientRuntimeId: envelope.recipientRuntimeId,
@@ -1112,8 +1173,8 @@ export const verifyRecipientTarget = verifyAuthenticatedTarget;
 export const authorizeInbound = verifyAuthenticatedTarget;
 
 /** Run a caller-supplied lookup only after target verification succeeds. */
-export async function authorizeBeforeLookup<Envelope extends TargetedOperation, Result>(
-  input: AuthenticatedOperation<Envelope> | Envelope,
+export async function authorizeBeforeLookup<Envelope extends ProtocolEnvelope, Result>(
+  input: AuthenticatedOperation<Envelope>,
   authenticator: BindingAuthenticator,
   target: VerificationTarget,
   lookup: (authorized: AuthorizedTarget<Envelope>) => Result | PromiseLike<Result>,
@@ -1126,8 +1187,8 @@ export async function authorizeBeforeLookup<Envelope extends TargetedOperation, 
 }
 
 /** Throwing form for routers that use exceptions at their binding boundary. */
-export async function assertAuthenticatedTarget<Envelope extends TargetedOperation>(
-  input: AuthenticatedOperation<Envelope> | Envelope,
+export async function assertAuthenticatedTarget<Envelope extends ProtocolEnvelope>(
+  input: AuthenticatedOperation<Envelope>,
   authenticator: BindingAuthenticator,
   target: VerificationTarget,
 ): Promise<AuthorizedTarget<Envelope>> {
@@ -1196,6 +1257,7 @@ export class AgentCardRegistry {
       DEFAULT_LEASE_RENEWAL_INTERVAL_MS,
       'leaseRenewalIntervalMs',
     );
+    validateLeaseTiming(this.leaseTtlMs, this.leaseRenewalIntervalMs);
     this.now = options.now ?? Date.now;
     this.scheduler = options.scheduler;
   }
@@ -1212,68 +1274,12 @@ export class AgentCardRegistry {
     endpoint?: RoutingEndpoint,
     options: Omit<AgentCardPublication, 'card' | 'endpoint'> = {},
   ): RuntimeAdvertisement {
+    this.assertMutationIdentity();
     const publication =
       endpoint === undefined
         ? extractPublication(publicationOrCard)
         : extractPublication({ ...options, card: publicationOrCard as AgentCard, endpoint });
-    const parts = this.validatePublication(publication);
-    const now = this.clock();
-    const ttlMs = resolveDuration(parts.leaseTtlMs, this.leaseTtlMs, 'leaseTtlMs');
-    const expiresAtMs =
-      parts.leaseExpiresAt === undefined
-        ? now + ttlMs
-        : parseExpiry(parts.leaseExpiresAt, 'leaseExpiresAt');
-    if (expiresAtMs <= now) {
-      throw new AgentCardRegistryError('expired', 'Agent Card lease has expired');
-    }
-
-    const identity = canonicalIdentity(
-      parts.card.sessionId,
-      parts.card.runtimeId,
-      'Agent Card identity',
-    );
-    if (this.retiredIds.has(identity.runtimeId)) {
-      throw new AgentCardRegistryError(
-        'expired',
-        'a retired runtime identity cannot be reused; register a replacement runtime identity',
-      );
-    }
-    const existing = this.records.get(identity.runtimeId);
-    if (existing !== undefined) {
-      if (!isLive(existing, now)) {
-        this.retireRecord(existing, now);
-        throw new AgentCardRegistryError(
-          'expired',
-          'an expired runtime cannot be revived; register a replacement runtime identity',
-        );
-      }
-      throw new AgentCardRegistryConflictError(
-        'runtime identity is already registered; renew the exact existing owner instead',
-      );
-    }
-
-    const endpointCopy = cloneEndpoint(parts.endpoint, identity.runtimeId);
-    const baseCard = cloneCard(parts.card, identity);
-    const leaseExpiry = isoTimestamp(expiresAtMs);
-    const card = cardWithDiscoveryFields(baseCard, this.roomId, endpointCopy, leaseExpiry);
-    const lease = leaseSnapshot(
-      identity,
-      endpointCopy,
-      now,
-      expiresAtMs,
-      ttlMs,
-      this.leaseRenewalIntervalMs,
-    );
-    const record = makeRuntimeAdvertisement(identity, this.roomId, card, endpointCopy, lease);
-    const generation = ++this.nextGeneration;
-    this.records.set(identity.runtimeId, {
-      record,
-      owner: identity,
-      expiresAtMs,
-      ttlMs,
-      generation,
-    });
-    return record;
+    return this.registerParts(this.validatePublication(publication));
   }
 
   public publish(publication: AgentCardPublication | AgentCard): RuntimeAdvertisement;
@@ -1305,7 +1311,9 @@ export class AgentCardRegistry {
     publication?: AgentCardPublication | AgentCard,
     options: RegistryRenewalOptions = {},
   ): RuntimeAdvertisement {
+    this.assertMutationIdentity();
     const ownerIdentity = this.requireOwnerIdentity(owner);
+    this.assertLocalOwner(ownerIdentity);
     const runtimeId = ownerIdentity.runtimeId;
     const existing = this.records.get(runtimeId);
     if (existing === undefined) {
@@ -1317,9 +1325,6 @@ export class AgentCardRegistry {
       throw new AgentCardRegistryError('expired', 'runtime advertisement lease has expired');
     }
     if (!runtimeIdentitiesEqual(ownerIdentity, existing.owner)) {
-      throw new AgentCardRegistryAuthorizationError();
-    }
-    if (this.identity !== undefined && !runtimeIdentitiesEqual(ownerIdentity, this.identity)) {
       throw new AgentCardRegistryAuthorizationError();
     }
 
@@ -1336,8 +1341,17 @@ export class AgentCardRegistry {
       throw new AgentCardRegistryAuthorizationError();
     }
     const ttlMs = resolveDuration(options.ttlMs, existing.ttlMs, 'leaseTtlMs');
+    const renewalIntervalMs = existing.record.lease.renewalIntervalMs;
+    validateLeaseTiming(ttlMs, renewalIntervalMs);
     const expiresAtMs = resolveNow(options.now, this.now) + ttlMs;
-    return this.renewExact(ownerIdentity, existing.generation, parsed, ttlMs, expiresAtMs);
+    return this.renewExact(
+      ownerIdentity,
+      existing.generation,
+      parsed,
+      ttlMs,
+      expiresAtMs,
+      renewalIntervalMs,
+    );
   }
 
   public renewRuntime(
@@ -1357,10 +1371,19 @@ export class AgentCardRegistry {
   }
   /** Remove only an exact runtime record; an old runtime cannot remove its replacement. */
   public unregister(owner: RuntimeId | SessionRuntimeIdentity): boolean {
+    this.assertMutationIdentity();
+    if (
+      typeof owner === 'string' &&
+      this.identity !== undefined &&
+      owner !== this.identity.runtimeId
+    ) {
+      throw new AgentCardRegistryAuthorizationError();
+    }
     const ownerIdentity = this.resolveUnregisterOwner(owner);
     if (ownerIdentity === undefined) {
       return false;
     }
+    this.assertLocalOwner(ownerIdentity);
     const existing = this.records.get(ownerIdentity.runtimeId);
     if (existing === undefined) {
       return false;
@@ -1383,11 +1406,12 @@ export class AgentCardRegistry {
     options: RegistryListOptions = {},
   ): RuntimeAdvertisement | undefined {
     const canonicalRuntimeId = runtimeValue(runtimeId, 'runtimeId');
+    const now = resolveNow(options.now, this.now);
+    this.pruneRetired(now);
     const record = this.records.get(canonicalRuntimeId);
     if (record === undefined) {
       return undefined;
     }
-    const now = resolveNow(options.now, this.now);
     if (!isLive(record, now)) {
       this.retireRecord(record, now);
       return undefined;
@@ -1405,6 +1429,7 @@ export class AgentCardRegistry {
   /** List only live advertisements in this exact room. */
   public list(options: RegistryListOptions = {}): RuntimeAdvertisement[] {
     const now = resolveNow(options.now, this.now);
+    this.pruneRetired(now);
     const records: RuntimeAdvertisement[] = [];
     for (const record of this.records.values()) {
       if (!isLive(record, now)) {
@@ -1415,7 +1440,9 @@ export class AgentCardRegistry {
         records.push(record.record);
       }
     }
-    return records.sort((left, right) => left.runtimeId.localeCompare(right.runtimeId));
+    return Object.freeze(
+      records.sort((left, right) => left.runtimeId.localeCompare(right.runtimeId)),
+    ) as unknown as RuntimeAdvertisement[];
   }
 
   public discover(options: RegistryListOptions = {}): RuntimeAdvertisement[] {
@@ -1442,6 +1469,7 @@ export class AgentCardRegistry {
   /** Remove records only after expiry plus two TTLs. */
   public cleanup(options: RegistryCleanupOptions = {}): number {
     const now = resolveNow(options.now, this.now);
+    this.pruneRetired(now);
     const ttlMs = resolveDuration(options.ttlMs, this.leaseTtlMs, 'ttlMs');
     let removed = 0;
     for (const [runtimeId, record] of this.records) {
@@ -1466,6 +1494,14 @@ export class AgentCardRegistry {
 
   /** Create an owner lease that publishes/renews only the source runtime. */
   public createLease(source: AgentCardSource, options: RegistryLeaseOptions = {}): SerializedLease {
+    this.assertMutationIdentity();
+    const effectiveTtlMs = resolveDuration(options.ttlMs, this.leaseTtlMs, 'ttlMs');
+    const effectiveRenewalIntervalMs = resolveDuration(
+      options.renewalIntervalMs,
+      this.leaseRenewalIntervalMs,
+      'renewalIntervalMs',
+    );
+    validateLeaseTiming(effectiveTtlMs, effectiveRenewalIntervalMs);
     let owner: SessionRuntimeIdentity | undefined;
     let committedOwner: SessionRuntimeIdentity | undefined;
     let registrationGeneration: number | undefined;
@@ -1476,6 +1512,7 @@ export class AgentCardRegistry {
     if (typeof source !== 'function') {
       const parts = extractPublication(source);
       owner = canonicalIdentity(parts.card.sessionId, parts.card.runtimeId, 'lease owner');
+      this.assertLocalOwner(owner);
     }
     const resolveSource = async (): Promise<AgentCardPublication | AgentCard> =>
       typeof source === 'function' ? await source() : source;
@@ -1522,6 +1559,7 @@ export class AgentCardRegistry {
       );
       if (owner === undefined) {
         owner = publicationOwner;
+        this.assertLocalOwner(publicationOwner);
       } else if (!runtimeIdentitiesEqual(owner, publicationOwner)) {
         throw new AgentCardRegistryAuthorizationError('lease source changed its runtime identity');
       }
@@ -1538,18 +1576,19 @@ export class AgentCardRegistry {
             'lease owner record was removed before renewal',
           );
         }
+        const registrationNow = this.clock();
+        const freshExpiry = registrationNow + effectiveTtlMs;
         const publicationForRegistration: AgentCardPublication = {
           card: effectiveParts.card,
           endpoint: effectiveParts.endpoint,
           ...(effectiveParts.roomId === undefined ? {} : { roomId: effectiveParts.roomId }),
-          ...(effectiveParts.leaseExpiresAt === undefined
-            ? {}
-            : { leaseExpiresAt: effectiveParts.leaseExpiresAt }),
-          ...(effectiveParts.leaseTtlMs === undefined
-            ? {}
-            : { leaseTtlMs: effectiveParts.leaseTtlMs }),
         };
-        record = this.register(publicationForRegistration);
+        record = this.registerParts(this.validatePublication(publicationForRegistration), {
+          ttlMs: effectiveTtlMs,
+          renewalIntervalMs: effectiveRenewalIntervalMs,
+          now: registrationNow,
+          expiresAtMs: freshExpiry,
+        });
         committedOwner = owner;
       } else {
         const expectedGeneration = committedGenerationAtStart;
@@ -1558,13 +1597,15 @@ export class AgentCardRegistry {
             'runtime identity was registered by another owner before this lease renewal',
           );
         }
-        const ttlMs = resolveDuration(options.ttlMs, current.ttlMs, 'leaseTtlMs');
+        const ttlMs = effectiveTtlMs;
+        const renewalNow = this.clock();
         record = this.renewExact(
           owner,
           expectedGeneration,
           effectiveParts,
           ttlMs,
-          this.clock() + ttlMs,
+          renewalNow + ttlMs,
+          effectiveRenewalIntervalMs,
         );
       }
       const currentAfterRenewal = this.records.get(owner.runtimeId);
@@ -1645,8 +1686,8 @@ export class AgentCardRegistry {
     const lease = new SerializedLeaseImplementation({
       ...options,
       identity: owner,
-      ttlMs: options.ttlMs ?? this.leaseTtlMs,
-      renewalIntervalMs: options.renewalIntervalMs ?? this.leaseRenewalIntervalMs,
+      ttlMs: effectiveTtlMs,
+      renewalIntervalMs: effectiveRenewalIntervalMs,
       scheduler: options.scheduler ?? this.scheduler,
       now: options.now ?? this.now,
       onStop,
@@ -1667,8 +1708,8 @@ export class AgentCardRegistry {
   }
 
   /** Verify an inbound operation against this registry's local room/runtime. */
-  public verifyAuthenticatedTarget<Envelope extends TargetedOperation>(
-    input: AuthenticatedOperation<Envelope> | Envelope,
+  public verifyAuthenticatedTarget<Envelope extends ProtocolEnvelope>(
+    input: AuthenticatedOperation<Envelope>,
     authenticator: BindingAuthenticator,
   ): Promise<TargetVerificationResult<Envelope>> {
     if (this.runtimeId === undefined) {
@@ -1680,22 +1721,22 @@ export class AgentCardRegistry {
     });
   }
 
-  public verifyAuthenticatedSender<Envelope extends TargetedOperation>(
-    input: AuthenticatedOperation<Envelope> | Envelope,
+  public verifyAuthenticatedSender<Envelope extends ProtocolEnvelope>(
+    input: AuthenticatedOperation<Envelope>,
     authenticator: BindingAuthenticator,
   ): Promise<TargetVerificationResult<Envelope>> {
     return this.verifyAuthenticatedTarget(input, authenticator);
   }
 
-  public verifyInboundTarget<Envelope extends TargetedOperation>(
-    input: AuthenticatedOperation<Envelope> | Envelope,
+  public verifyInboundTarget<Envelope extends ProtocolEnvelope>(
+    input: AuthenticatedOperation<Envelope>,
     authenticator: BindingAuthenticator,
   ): Promise<TargetVerificationResult<Envelope>> {
     return this.verifyAuthenticatedTarget(input, authenticator);
   }
 
-  public authorizeBeforeLookup<Envelope extends TargetedOperation, Result>(
-    input: AuthenticatedOperation<Envelope> | Envelope,
+  public authorizeBeforeLookup<Envelope extends ProtocolEnvelope, Result>(
+    input: AuthenticatedOperation<Envelope>,
     authenticator: BindingAuthenticator,
     lookup: (authorized: AuthorizedTarget<Envelope>) => Result | PromiseLike<Result>,
   ): Promise<TargetVerificationFailure | Result> {
@@ -1712,6 +1753,22 @@ export class AgentCardRegistry {
       lookup,
     );
   }
+  private assertMutationIdentity(): void {
+    if (this.runtimeId !== undefined && this.identity === undefined) {
+      throw new AgentCardRegistryAuthorizationError(
+        'a full local session/runtime identity is required for mutation',
+      );
+    }
+  }
+
+  private assertLocalOwner(owner: SessionRuntimeIdentity): void {
+    if (this.identity !== undefined && !runtimeIdentitiesEqual(owner, this.identity)) {
+      throw new AgentCardRegistryAuthorizationError(
+        'mutation owner does not match the local runtime identity',
+      );
+    }
+  }
+
   private requireOwnerIdentity(owner: RuntimeId | SessionRuntimeIdentity): SessionRuntimeIdentity {
     if (typeof owner === 'string') {
       throw new AgentCardRegistryAuthorizationError(
@@ -1733,6 +1790,83 @@ export class AgentCardRegistry {
       return undefined;
     }
   }
+  private registerParts(
+    parts: PublicationParts,
+    overrides: {
+      readonly ttlMs?: number;
+      readonly renewalIntervalMs?: number;
+      readonly now?: number;
+      readonly expiresAtMs?: number;
+    } = {},
+  ): RuntimeAdvertisement {
+    const now = overrides.now ?? this.clock();
+    const publicationTtlMs = resolveDuration(parts.leaseTtlMs, this.leaseTtlMs, 'leaseTtlMs');
+    const ttlMs = resolveDuration(overrides.ttlMs, publicationTtlMs, 'leaseTtlMs');
+    const renewalIntervalMs = resolveDuration(
+      overrides.renewalIntervalMs,
+      this.leaseRenewalIntervalMs,
+      'leaseRenewalIntervalMs',
+    );
+    validateLeaseTiming(ttlMs, renewalIntervalMs);
+    const expiresAtMs =
+      overrides.expiresAtMs ??
+      (parts.leaseExpiresAt === undefined
+        ? now + ttlMs
+        : parseExpiry(parts.leaseExpiresAt, 'leaseExpiresAt'));
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now) {
+      throw new AgentCardRegistryError('expired', 'Agent Card lease has expired');
+    }
+    this.pruneRetired(now);
+
+    const identity = canonicalIdentity(
+      parts.card.sessionId,
+      parts.card.runtimeId,
+      'Agent Card identity',
+    );
+    if (this.retiredIds.has(identity.runtimeId)) {
+      throw new AgentCardRegistryError(
+        'expired',
+        'a retired runtime identity cannot be reused; register a replacement runtime identity',
+      );
+    }
+    const existing = this.records.get(identity.runtimeId);
+    if (existing !== undefined) {
+      if (!isLive(existing, now)) {
+        this.retireRecord(existing, now);
+        throw new AgentCardRegistryError(
+          'expired',
+          'an expired runtime cannot be revived; register a replacement runtime identity',
+        );
+      }
+      throw new AgentCardRegistryConflictError(
+        'runtime identity is already registered; renew the exact existing owner instead',
+      );
+    }
+
+    const endpointCopy = cloneEndpoint(parts.endpoint, identity.runtimeId);
+    const baseCard = cloneCard(parts.card, identity);
+    const leaseExpiry = isoTimestamp(expiresAtMs);
+    const card = cardWithDiscoveryFields(baseCard, this.roomId, endpointCopy, leaseExpiry);
+    const lease = leaseSnapshot(
+      identity,
+      endpointCopy,
+      now,
+      now,
+      expiresAtMs,
+      ttlMs,
+      renewalIntervalMs,
+    );
+    const record = makeRuntimeAdvertisement(identity, this.roomId, card, endpointCopy, lease);
+    const generation = ++this.nextGeneration;
+    this.records.set(identity.runtimeId, {
+      record,
+      owner: identity,
+      expiresAtMs,
+      ttlMs,
+      generation,
+    });
+    return record;
+  }
 
   private retireRecord(record: StoredRuntimeAdvertisement, now: number): void {
     const current = this.records.get(record.record.runtimeId);
@@ -1748,6 +1882,29 @@ export class AgentCardRegistry {
     if (previous === undefined || previous.generation <= record.generation) {
       this.retiredIds.set(record.record.runtimeId, retired);
     }
+    this.pruneRetired(now);
+  }
+
+  private pruneRetired(now: number): void {
+    for (const [runtimeId, retired] of this.retiredIds) {
+      if (now >= retired.retiredAtMs + RETIRED_RUNTIME_GRACE_MS) {
+        this.retiredIds.delete(runtimeId);
+      }
+    }
+    while (this.retiredIds.size > MAX_RETIRED_RUNTIME_IDENTITIES) {
+      let oldestRuntimeId: RuntimeId | undefined;
+      let oldestTime = Number.POSITIVE_INFINITY;
+      for (const [runtimeId, retired] of this.retiredIds) {
+        if (retired.retiredAtMs < oldestTime) {
+          oldestRuntimeId = runtimeId;
+          oldestTime = retired.retiredAtMs;
+        }
+      }
+      if (oldestRuntimeId === undefined) {
+        break;
+      }
+      this.retiredIds.delete(oldestRuntimeId);
+    }
   }
 
   private unregisterExact(owner: SessionRuntimeIdentity, generation: number): boolean {
@@ -1759,12 +1916,14 @@ export class AgentCardRegistry {
     ) {
       return false;
     }
+    const retiredAtMs = this.clock();
     this.retiredIds.set(owner.runtimeId, {
       owner: current.owner,
       generation: current.generation,
-      retiredAtMs: this.clock(),
+      retiredAtMs,
     });
     this.records.delete(owner.runtimeId);
+    this.pruneRetired(retiredAtMs);
     return true;
   }
 
@@ -1774,12 +1933,19 @@ export class AgentCardRegistry {
     publication: PublicationParts,
     ttlMs: number,
     expiresAtMs: number,
+    renewalIntervalMs?: number,
   ): RuntimeAdvertisement {
     const current = this.records.get(owner.runtimeId);
     const now = this.clock();
     if (current === undefined) {
       throw new AgentCardRegistryError('not_found', 'runtime advertisement is not registered');
     }
+    const effectiveRenewalIntervalMs = resolveDuration(
+      renewalIntervalMs,
+      current.record.lease.renewalIntervalMs,
+      'leaseRenewalIntervalMs',
+    );
+    validateLeaseTiming(ttlMs, effectiveRenewalIntervalMs);
     if (current.generation !== generation || !runtimeIdentitiesEqual(current.owner, owner)) {
       throw new AgentCardRegistryAuthorizationError(
         'runtime advertisement owner generation is stale',
@@ -1809,9 +1975,10 @@ export class AgentCardRegistry {
       owner,
       endpointCopy,
       current.record.lease.issuedAt ?? now,
+      now,
       expiresAtMs,
       ttlMs,
-      this.leaseRenewalIntervalMs,
+      effectiveRenewalIntervalMs,
     );
     const record = makeRuntimeAdvertisement(owner, this.roomId, card, endpointCopy, lease);
     const nextGeneration = ++this.nextGeneration;
