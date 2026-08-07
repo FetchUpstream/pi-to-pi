@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { getRegistryPaths, getRuntimeRecordPath } from '../../src/discovery/registry.js';
 
 const CHILD_TIMEOUT_MS = 8_000;
+const PUBLICATION_READY_TIMEOUT_MS = 2_000;
+const PUBLICATION_POLL_INTERVAL_MS = 25;
 const ROOM_A = `r1-${'a'.repeat(32)}`;
 const ROOM_B = `r1-${'b'.repeat(32)}`;
 const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
@@ -190,6 +192,37 @@ async function discover(
 ): Promise<DiscoveryResponse> {
   return (await runWorker('discover', { root, room, ...overrides })) as DiscoveryResponse;
 }
+async function waitForPublishedRecords(
+  root: string,
+  room: string,
+  runtimeIds: readonly string[],
+  overrides: Readonly<Record<string, unknown>> = {},
+): Promise<readonly PublishedRecord[]> {
+  const deadline = Date.now() + PUBLICATION_READY_TIMEOUT_MS;
+  let latestRecords: readonly PublishedRecord[] = [];
+
+  while (true) {
+    latestRecords = (await discover(root, room, overrides)).records;
+    const discoveredRuntimeIds = new Set(latestRecords.map((record) => record.runtimeId));
+    if (runtimeIds.every((runtimeId) => discoveredRuntimeIds.has(runtimeId))) {
+      return latestRecords;
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      break;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.min(PUBLICATION_POLL_INTERVAL_MS, remainingMs));
+    });
+  }
+
+  throw new Error(
+    `timed out waiting for runtime publication: expected=${runtimeIds.join(',')} discovered=${latestRecords
+      .map((record) => record.runtimeId)
+      .join(',')}`,
+  );
+}
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -257,12 +290,13 @@ describe('multi-process registry publication and discovery', () => {
     const records = await Promise.all(indexes.map((index) => startRuntime(root, ROOM_A, index)));
 
     const result = await discover(root, ROOM_A, { query: 'planner' });
-    expect(result.records.map((record) => record.runtimeId).sort()).toEqual(
-      records.map((record) => record.runtimeId).sort(),
+    const sortedRecords = [...records].sort((left, right) =>
+      left.runtimeId.localeCompare(right.runtimeId),
     );
-    expect(result.records.every((record) => record.endpoint.startsWith('process-endpoint-'))).toBe(
-      true,
+    const sortedDiscoveredRecords = [...result.records].sort((left, right) =>
+      left.runtimeId.localeCompare(right.runtimeId),
     );
+    expect(sortedDiscoveredRecords).toEqual(sortedRecords);
     expect(result.lookup?.kind).toBe('ambiguous');
     expect(result.lookup?.addresses).toHaveLength(indexes.length);
 
@@ -288,18 +322,28 @@ describe('multi-process registry publication and discovery', () => {
     const root = await temporaryRoot();
     const old = await startRuntime(root, ROOM_A, 40, { now: 20_000 });
 
-    const [replacement, cleanup] = await Promise.all([
-      startRuntime(root, ROOM_A, 41, { now: 20_000, holdMs: 75 }),
-      runWorker('cleanup', {
-        root,
-        room: ROOM_A,
-        runtimeId: old.runtimeId,
-        expectedSessionId: old.sessionId,
-        expectedEndpoint: old.endpoint,
-        expectedNetworkName: old.networkName,
-        delayMs: 20,
-      }),
-    ]);
+    const replacementRuntimeId = runtimeId(41);
+    const replacementStart = startRuntime(root, ROOM_A, 41, { now: 20_000, holdMs: 75 });
+    const publishedRecords = await waitForPublishedRecords(
+      root,
+      ROOM_A,
+      [old.runtimeId, replacementRuntimeId],
+      { now: 20_000 },
+    );
+    expect(publishedRecords.map((record) => record.runtimeId).sort()).toEqual(
+      [old.runtimeId, replacementRuntimeId].sort(),
+    );
+
+    const cleanupPromise = runWorker('cleanup', {
+      root,
+      room: ROOM_A,
+      runtimeId: old.runtimeId,
+      expectedSessionId: old.sessionId,
+      expectedEndpoint: old.endpoint,
+      expectedNetworkName: old.networkName,
+      delayMs: 20,
+    });
+    const [replacement, cleanup] = await Promise.all([replacementStart, cleanupPromise]);
 
     expect((cleanup as CleanupResponse).removed).toBe(true);
     const result = await discover(root, ROOM_A, { now: 20_000 });
