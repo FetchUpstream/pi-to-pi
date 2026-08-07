@@ -1,9 +1,9 @@
 ## 1. Build the isolated spike harness
 
-- [ ] 1.1 Add an isolated spike fixture area and scripts that do not import or modify the production `src/` transport boundary.
-- [ ] 1.2 Implement platform-aware endpoint generation for POSIX socket paths and Windows named pipes, including a UTF-8 byte-length guard and unique runtime identifiers.
-- [ ] 1.3 Implement the four-byte big-endian frame encoder and bounded incremental decoder used by the raw `node:net` candidate.
-- [ ] 1.4 Add bounded test helpers for absolute phase deadlines, abort signals, child-process cleanup, and diagnostic error capture.
+- [x] 1.1 Add an isolated spike fixture area and scripts that do not import or modify the production `src/` transport boundary.
+- [x] 1.2 Implement platform-aware endpoint generation for POSIX socket paths and Windows named pipes, including a UTF-8 byte-length guard and unique runtime identifiers.
+- [x] 1.3 Implement the four-byte big-endian frame encoder and bounded incremental decoder used by the raw `node:net` candidate.
+- [x] 1.4 Add bounded test helpers for absolute phase deadlines, abort signals, child-process cleanup, and diagnostic error capture.
 
 ## 2. Exercise the `node:net` candidate
 
