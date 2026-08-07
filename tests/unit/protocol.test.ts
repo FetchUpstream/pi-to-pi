@@ -127,6 +127,15 @@ const validDescribe = withoutField(
   'requestId',
 );
 
+const validTaskSnapshot = {
+  requestId: REQUEST_ID,
+  state: 'accepted',
+  createdAt: CREATED_AT,
+  updatedAt: CREATED_AT,
+  expiresAt: REQUEST_EXPIRES_AT,
+  cancellationRequested: false,
+} as const;
+
 function asRecord(value: object): TestRecord {
   return { ...(value as TestRecord) };
 }
@@ -215,30 +224,101 @@ describe('protocol envelope foundations', () => {
     expectFailure(validateEnvelope(withoutField(validRequest, field), { now: NOW }), 'malformed');
   });
 
-  it('rejects an initial request whose requestId does not equal operationId', () => {
-    const candidate = { ...asRecord(validRequest), requestId: OTHER_ID };
-
+  it.each([
+    ['protocolVersion wrong type', { ...asRecord(validRequest), protocolVersion: 1 }],
+    ['operation wrong type', { ...asRecord(validRequest), operation: 1 }],
+    ['operationId wrong type', { ...asRecord(validRequest), operationId: 1 }],
+    ['sender wrong type', { ...asRecord(validRequest), sender: 'runtime-a' }],
+    [
+      'sender.sessionId missing',
+      { ...asRecord(validRequest), sender: withoutField(validRequest.sender, 'sessionId') },
+    ],
+    [
+      'sender.sessionId wrong type',
+      {
+        ...asRecord(validRequest),
+        sender: { ...validRequest.sender, sessionId: 42 },
+      },
+    ],
+    [
+      'sender.runtimeId missing',
+      { ...asRecord(validRequest), sender: withoutField(validRequest.sender, 'runtimeId') },
+    ],
+    [
+      'sender.runtimeId wrong type',
+      {
+        ...asRecord(validRequest),
+        sender: { ...validRequest.sender, runtimeId: 42 },
+      },
+    ],
+    ['recipientRuntimeId wrong type', { ...asRecord(validRequest), recipientRuntimeId: 42 }],
+    ['roomId wrong type', { ...asRecord(validRequest), roomId: 42 }],
+    ['createdAt wrong type', { ...asRecord(validRequest), createdAt: 42 }],
+    ['expiresAt wrong type', { ...asRecord(validRequest), expiresAt: 42 }],
+    ['traceId wrong type', { ...asRecord(validRequest), traceId: 42 }],
+    ['payload wrong type', { ...asRecord(validRequest), payload: 'request' }],
+  ] as const)('rejects %s as malformed before admission', (_label, candidate) => {
     expectFailure(validateEnvelope(candidate, { now: NOW }), 'malformed');
   });
 
-  it('requires a requestId for target operations and requires a new operationId', () => {
-    for (const envelope of [validReply, validStatus, validCancel]) {
-      expectFailure(
-        validateEnvelope(withoutField(envelope, 'requestId'), { now: NOW }),
-        'malformed',
-      );
-    }
+  it.each([
+    ['message.request missing requestId', withoutField(validRequest, 'requestId')],
+    ['message.request non-UUID requestId', { ...asRecord(validRequest), requestId: 'not-a-uuid' }],
+    ['message.request wrong-type requestId', { ...asRecord(validRequest), requestId: 42 }],
+    ['message.request mismatched requestId', { ...asRecord(validRequest), requestId: OTHER_ID }],
+    ['message.reply missing target requestId', withoutField(validReply, 'requestId')],
+    [
+      'message.reply non-UUID target requestId',
+      { ...asRecord(validReply), requestId: 'not-a-uuid' },
+    ],
+    [
+      'message.reply same-ID target requestId',
+      { ...asRecord(validReply), requestId: REPLY_OPERATION_ID },
+    ],
+    ['task.status missing target requestId', withoutField(validStatus, 'requestId')],
+    [
+      'task.status non-UUID target requestId',
+      { ...asRecord(validStatus), requestId: 'not-a-uuid' },
+    ],
+    [
+      'task.status same-ID target requestId',
+      { ...asRecord(validStatus), requestId: STATUS_OPERATION_ID },
+    ],
+    ['task.cancel missing target requestId', withoutField(validCancel, 'requestId')],
+    [
+      'task.cancel non-UUID target requestId',
+      { ...asRecord(validCancel), requestId: 'not-a-uuid' },
+    ],
+    [
+      'task.cancel same-ID target requestId',
+      { ...asRecord(validCancel), requestId: CANCEL_OPERATION_ID },
+    ],
+  ] as const)('rejects %s as malformed before admission', (_label, candidate) => {
+    expectFailure(validateEnvelope(candidate, { now: NOW }), 'malformed');
+  });
 
+  it.each([
+    ['message.request', validRequest],
+    ['message.reply', validReply],
+    ['task.status', validStatus],
+    ['task.cancel', validCancel],
+  ] as const)('rejects a non-UUID operationId for %s before admission', (_operation, envelope) => {
     expectFailure(
-      validateEnvelope(
-        { ...asRecord(validReply), requestId: REPLY_OPERATION_ID },
-        { now: '2026-08-07T10:01:00.000Z' },
-      ),
+      validateEnvelope({ ...asRecord(envelope), operationId: 'not-a-uuid' }, { now: NOW }),
       'malformed',
     );
-
-    expect(validateEnvelope(validReply, { now: '2026-08-07T10:01:00.000Z' }).ok).toBe(true);
   });
+
+  it.each([
+    ['message.reply', validReply],
+    ['task.status', validStatus],
+    ['task.cancel', validCancel],
+  ] as const)(
+    'accepts a distinct operationId for %s target correlation',
+    (_operation, envelope) => {
+      expect(validateEnvelope(envelope, { now: NOW }).ok).toBe(true);
+    },
+  );
 
   it('omits requestId for peer.describe and message.notify, rejecting unexpected IDs', () => {
     expect(validateEnvelope(validDescribe, { now: NOW }).ok).toBe(true);
@@ -384,6 +464,75 @@ describe('typed content and schema validation', () => {
     expectFailure(unresolved, 'malformed');
   });
 
+  it.each([
+    ['remote schema reference', { $ref: 'https://example.test/schema.json' }, 'incompatible'],
+    ['unresolved local schema reference', { $ref: '#/$defs/missing' }, 'malformed'],
+    ['oversized schema', { description: 'x'.repeat(MAX_SCHEMA_BYTES) }, 'oversized'],
+    [
+      'required format assertion vocabulary',
+      {
+        $schema: JSON_SCHEMA_DRAFT_2020_12,
+        $vocabulary: {
+          'https://json-schema.org/draft/2020-12/vocab/format-assertion': true,
+        },
+        type: 'string',
+        format: 'date-time',
+      },
+      'incompatible',
+    ],
+  ] as const)('rejects %s at message.request envelope admission', (_label, schema, code) => {
+    expectFailure(
+      validateEnvelope(
+        {
+          ...asRecord(validRequest),
+          payload: {
+            ...validRequest.payload,
+            expectedResponse: { contentType: 'json', schema },
+          },
+        },
+        { now: NOW },
+      ),
+      code,
+    );
+  });
+
+  it.each([
+    ['notify missing content', { ...asRecord(validNotify), payload: {} }, 'invalid_content'],
+    [
+      'notify invalid content discriminant',
+      {
+        ...asRecord(validNotify),
+        payload: { content: { type: 'xml', value: '<event />' } },
+      },
+      'invalid_content',
+    ],
+    [
+      'reply completed missing content',
+      { ...asRecord(validReply), payload: { outcome: 'completed' } },
+      'invalid_content',
+    ],
+    [
+      'reply completed invalid content',
+      {
+        ...asRecord(validReply),
+        payload: { outcome: 'completed', content: { type: 'xml', value: '<reply />' } },
+      },
+      'invalid_content',
+    ],
+    [
+      'reply failed missing wire error',
+      { ...asRecord(validReply), payload: { outcome: 'failed' } },
+      'malformed',
+    ],
+    [
+      'reply unsupported outcome',
+      { ...asRecord(validReply), payload: { outcome: 'working' } },
+      'malformed',
+    ],
+  ] as const)('rejects %s at envelope admission', (_label, envelope, code) => {
+    expectFailure(validateEnvelope(envelope, { now: NOW }), code);
+  });
+
   it('enforces the schema-size limit and leaves format as annotation-only', () => {
     const tooLarge = validateJsonSchema({ description: 'x'.repeat(MAX_SCHEMA_BYTES) });
     const formatOnly = validateJsonValueAgainstSchema('not-a-date', {
@@ -427,6 +576,111 @@ describe('operation responses, versions, and limits', () => {
     result: { requestId: REQUEST_ID, state: 'accepted' },
   } as const;
 
+  const validOperationResponses = [
+    [
+      'peer.describe',
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'peer.describe',
+        operationId: DESCRIBE_OPERATION_ID,
+        traceId: TRACE_ID,
+        result: { agentCard: validAgentCard },
+      },
+    ],
+    ['message.request', validRequestResponse],
+    [
+      'message.reply',
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'message.reply',
+        operationId: REPLY_OPERATION_ID,
+        traceId: TRACE_ID,
+        result: { requestId: REQUEST_ID, outcome: 'completed', delivered: true },
+      },
+    ],
+    [
+      'message.notify',
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'message.notify',
+        operationId: OTHER_ID,
+        traceId: TRACE_ID,
+        result: { delivered: true },
+      },
+    ],
+    [
+      'task.status',
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'task.status',
+        operationId: STATUS_OPERATION_ID,
+        traceId: TRACE_ID,
+        result: { snapshot: validTaskSnapshot },
+      },
+    ],
+    [
+      'task.cancel',
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        operation: 'task.cancel',
+        operationId: CANCEL_OPERATION_ID,
+        traceId: TRACE_ID,
+        result: { snapshot: validTaskSnapshot },
+      },
+    ],
+  ] as const;
+
+  it.each(validOperationResponses)(
+    'accepts a valid %s operation result',
+    (_operation, response) => {
+      expect(validateOperationResponse(response, { now: NOW }).ok).toBe(true);
+    },
+  );
+
+  it.each([
+    ['peer.describe missing agent card', validOperationResponses[0][1], {}],
+    [
+      'message.request invalid admission state',
+      validRequestResponse,
+      { requestId: REQUEST_ID, state: 'working' },
+    ],
+    [
+      'message.reply missing delivery acknowledgment',
+      validOperationResponses[2][1],
+      { requestId: REQUEST_ID, outcome: 'completed' },
+    ],
+    ['message.notify not acknowledged', validOperationResponses[3][1], { delivered: false }],
+    ['task.status missing snapshot', validOperationResponses[4][1], {}],
+    [
+      'task.cancel invalid snapshot',
+      validOperationResponses[5][1],
+      { snapshot: { ...validTaskSnapshot, state: 'unknown' } },
+    ],
+  ] as const)('rejects %s with malformed result data', (_label, response, result) => {
+    expectFailure(
+      validateOperationResponse({ ...asRecord(response), result }, { now: NOW }),
+      'malformed',
+    );
+  });
+
+  it.each([
+    ['missing operation', withoutField(validRequestResponse, 'operation')],
+    ['wrong-type operation', { ...asRecord(validRequestResponse), operation: 42 }],
+    ['missing operationId', withoutField(validRequestResponse, 'operationId')],
+    ['non-UUID operationId', { ...asRecord(validRequestResponse), operationId: 'not-a-uuid' }],
+    ['missing traceId', withoutField(validRequestResponse, 'traceId')],
+    ['wrong-type traceId', { ...asRecord(validRequestResponse), traceId: 42 }],
+    ['malformed traceId', { ...asRecord(validRequestResponse), traceId: TRACE_ID.slice(1) }],
+  ] as const)('rejects %s response envelope field as malformed', (_label, response) => {
+    expectFailure(validateOperationResponse(response, { now: NOW }), 'malformed');
+  });
+
+  it('rejects an oversized operation response before result validation', () => {
+    expectFailure(
+      validateOperationResponse(validRequestResponse, { now: NOW, maxEnvelopeBytes: 64 }),
+      'oversized',
+    );
+  });
   it('requires exactly one operation response result or error and preserves correlation', () => {
     expect(validateOperationResponse(validRequestResponse).ok).toBe(true);
 
@@ -448,6 +702,39 @@ describe('operation responses, versions, and limits', () => {
       }),
       'malformed',
     );
+  });
+
+  it('rejects malformed wire-error fields with malformed mapping', () => {
+    const validWireError = createProtocolError('busy', 'queue is full', { retryAfterMs: 250 });
+    const validWireErrorResponse = {
+      ...withoutField(validRequestResponse, 'result'),
+      error: validWireError,
+    };
+    const malformedErrors = [
+      ['error is not an object', null],
+      ['missing code', withoutField(validWireError, 'code')],
+      ['unknown code', { ...asRecord(validWireError), code: 'unknown' }],
+      ['wrong-type code', { ...asRecord(validWireError), code: 42 }],
+      ['missing message', withoutField(validWireError, 'message')],
+      ['wrong-type message', { ...asRecord(validWireError), message: 42 }],
+      ['missing retryable', withoutField(validWireError, 'retryable')],
+      ['wrong-type retryable', { ...asRecord(validWireError), retryable: 'yes' }],
+      ['retryability mismatch', { ...asRecord(validWireError), retryable: false }],
+      ['retryAfterMs zero', { ...asRecord(validWireError), retryAfterMs: 0 }],
+      ['retryAfterMs negative', { ...asRecord(validWireError), retryAfterMs: -1 }],
+      ['retryAfterMs non-finite', { ...asRecord(validWireError), retryAfterMs: Number.NaN }],
+      [
+        'retryAfterMs on permanent code',
+        { code: 'malformed', message: 'bad envelope', retryable: false, retryAfterMs: 100 },
+      ],
+      ['details is not an object', { ...asRecord(validWireError), details: [] }],
+    ] as const;
+    for (const [, error] of malformedErrors) {
+      expectFailure(
+        validateOperationResponse({ ...asRecord(validWireErrorResponse), error }, { now: NOW }),
+        'malformed',
+      );
+    }
   });
 
   it('maps unsupported versions and operations to incompatible', () => {
@@ -513,16 +800,6 @@ describe('operation responses, versions, and limits', () => {
       ),
       'malformed',
     );
-    expectFailure(
-      validateEnvelope(
-        {
-          ...asRecord(validDescribe),
-          expiresAt: '2026-08-07T10:00:31.000Z',
-        },
-        { now: NOW },
-      ),
-      'malformed',
-    );
     expectFailure(validateEnvelope(validRequest, { now: NOW, maxEnvelopeBytes: 64 }), 'oversized');
     expectFailure(
       validateJsonSchema({ description: 'bounded fixture' }, { maxSchemaBytes: 8 }),
@@ -542,6 +819,25 @@ describe('operation responses, versions, and limits', () => {
       RangeError,
     );
   });
+  it.each([
+    ['peer.describe', validDescribe],
+    ['task.status', validStatus],
+    ['task.cancel', validCancel],
+  ] as const)(
+    'enforces the 30-second control limit for %s at its exact boundary',
+    (_operation, envelope) => {
+      expect(
+        validateEnvelope({ ...asRecord(envelope), expiresAt: CONTROL_EXPIRES_AT }, { now: NOW }).ok,
+      ).toBe(true);
+      expectFailure(
+        validateEnvelope(
+          { ...asRecord(envelope), expiresAt: '2026-08-07T10:00:31.000Z' },
+          { now: NOW },
+        ),
+        'malformed',
+      );
+    },
+  );
 });
 
 describe('canonical request fingerprints', () => {
@@ -549,7 +845,7 @@ describe('canonical request fingerprints', () => {
     expect(canonicalizeJson({ z: 1, a: [true, null] })).toBe('{"a":[true,null],"z":1}');
   });
 
-  it('excludes binding credential metadata while covering immutable operation data', () => {
+  it('excludes binding credentials but fingerprints application metadata named token', () => {
     const withCredentials = {
       ...asRecord(validRequest),
       bindingCredentials: { token: 'fixture-secret-a' },
@@ -557,6 +853,24 @@ describe('canonical request fingerprints', () => {
     const withDifferentCredentials = {
       ...asRecord(validRequest),
       bindingCredentials: { token: 'fixture-secret-b' },
+    };
+    const withApplicationToken = {
+      ...asRecord(validRequest),
+      payload: { ...validRequest.payload, metadata: { token: 'application-token-a' } },
+    };
+    const withDifferentApplicationToken = {
+      ...asRecord(validRequest),
+      payload: { ...validRequest.payload, metadata: { token: 'application-token-b' } },
+    };
+    const withBindingCredentialToken = {
+      ...asRecord(withApplicationToken),
+      bindingCredentials: { token: 'binding-token-a' },
+      bindingToken: 'binding-token-a',
+    };
+    const withDifferentBindingCredentialToken = {
+      ...asRecord(withApplicationToken),
+      bindingCredentials: { token: 'binding-token-b' },
+      bindingToken: 'binding-token-b',
     };
     const reordered = {
       payload: validRequest.payload,
@@ -576,6 +890,21 @@ describe('canonical request fingerprints', () => {
     expect(fingerprint).toBe(canonicalRequestFingerprint(withDifferentCredentials, { now: NOW }));
     expect(fingerprint).toBe(canonicalRequestFingerprint(reordered, { now: NOW }));
     expect(canonicalRequestData(withCredentials, { now: NOW })).not.toContain('fixture-secret-a');
+
+    const applicationFingerprint = canonicalRequestFingerprint(withApplicationToken, { now: NOW });
+    expect(applicationFingerprint).not.toBe(fingerprint);
+    expect(applicationFingerprint).not.toBe(
+      canonicalRequestFingerprint(withDifferentApplicationToken, { now: NOW }),
+    );
+    expect(canonicalRequestData(withApplicationToken, { now: NOW })).toContain(
+      'application-token-a',
+    );
+    expect(canonicalRequestFingerprint(withBindingCredentialToken, { now: NOW })).toBe(
+      canonicalRequestFingerprint(withDifferentBindingCredentialToken, { now: NOW }),
+    );
+    expect(canonicalRequestData(withBindingCredentialToken, { now: NOW })).not.toContain(
+      'binding-token-a',
+    );
     expect(
       canonicalRequestFingerprint(
         { ...asRecord(validRequest), recipientRuntimeId: 'runtime-c' },
@@ -613,23 +942,26 @@ describe('stable protocol errors and retryability', () => {
     ]);
   });
 
-  it.each([
-    ['busy', true],
-    ['unreachable', true],
-    ['malformed', false],
-    ['incompatible', false],
-    ['expired', false],
-    ['cross_room', false],
-    ['unauthorized', false],
-    ['oversized', false],
-    ['duplicate', false],
-    ['invalid_reply', false],
-    ['not_cancelable', false],
-  ] as const)('derives retryability for %s errors', (code, retryable) => {
+  it.each(
+    PROTOCOL_ERROR_CODES.map((code) => [code, code === 'busy' || code === 'unreachable'] as const),
+  )('validates %s retryability on the wire for every canonical error', (code, retryable) => {
     const error = createProtocolError(code, 'stable fixture message');
-
+    const response = {
+      protocolVersion: PROTOCOL_VERSION,
+      operation: 'message.request',
+      operationId: REQUEST_ID,
+      traceId: TRACE_ID,
+      error,
+    };
+    const result = validateOperationResponse(response, { now: NOW });
     expect(error.code).toBe(code);
     expect(error.retryable).toBe(retryable);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const validatedError = (result.value as { error: ProtocolError }).error;
+      expect(validatedError.code).toBe(code);
+      expect(validatedError.retryable).toBe(retryable);
+    }
   });
 
   it('preserves retry delay only for retryable errors and rejects conflicting metadata', () => {
@@ -659,6 +991,47 @@ describe('stable protocol errors and retryability', () => {
         ...response,
         error: { ...busy, retryable: false },
       }),
+      'malformed',
+    );
+  });
+
+  it.each([
+    [
+      'busy retryAfterMs zero',
+      { ...createProtocolError('busy', 'queue is full'), retryAfterMs: 0 },
+    ],
+    [
+      'busy retryAfterMs negative',
+      { ...createProtocolError('busy', 'queue is full'), retryAfterMs: -1 },
+    ],
+    [
+      'busy retryAfterMs non-finite',
+      { ...createProtocolError('busy', 'queue is full'), retryAfterMs: Number.NaN },
+    ],
+    [
+      'busy retryAfterMs wrong type',
+      { ...createProtocolError('busy', 'queue is full'), retryAfterMs: '250' },
+    ],
+    [
+      'permanent retryable mismatch',
+      { ...createProtocolError('malformed', 'bad envelope'), retryable: true },
+    ],
+    [
+      'permanent retryAfterMs',
+      { code: 'malformed', message: 'bad envelope', retryable: false, retryAfterMs: 100 },
+    ],
+  ] as const)('rejects %s retry metadata on a wire error', (_label, error) => {
+    expectFailure(
+      validateOperationResponse(
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          operation: 'message.request',
+          operationId: REQUEST_ID,
+          traceId: TRACE_ID,
+          error,
+        },
+        { now: NOW },
+      ),
       'malformed',
     );
   });
