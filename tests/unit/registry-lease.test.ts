@@ -85,6 +85,51 @@ class OrderedPublicationRegistry extends RuntimeRegistry {
   }
 }
 
+class FailedPublicationThenRenewalRegistry extends RuntimeRegistry {
+  private publicationCount = 0;
+  private resolveRenameCommitted: (() => void) | undefined;
+  private releaseRenameFailure: (() => void) | undefined;
+  private resolveRenewalStarted: (() => void) | undefined;
+  private releaseRenewal: (() => void) | undefined;
+  public readonly renameCommitted = new Promise<void>((resolve) => {
+    this.resolveRenameCommitted = resolve;
+  });
+  public readonly renewalStarted = new Promise<void>((resolve) => {
+    this.resolveRenewalStarted = resolve;
+  });
+  public readonly observedNames: string[] = [];
+
+  public releaseRenameFailureNow(): void {
+    this.releaseRenameFailure?.();
+    this.releaseRenameFailure = undefined;
+  }
+
+  public releaseRenewalNow(): void {
+    this.releaseRenewal?.();
+    this.releaseRenewal = undefined;
+  }
+
+  protected override async publishCurrentName(): Promise<void> {
+    this.publicationCount += 1;
+    const publicationNumber = this.publicationCount;
+    if (publicationNumber === 3) {
+      this.resolveRenewalStarted?.();
+      await new Promise<void>((resolve) => {
+        this.releaseRenewal = resolve;
+      });
+    }
+    this.observedNames.push(this.networkName);
+    await super.publishCurrentName();
+    if (publicationNumber === 2) {
+      this.resolveRenameCommitted?.();
+      await new Promise<void>((resolve) => {
+        this.releaseRenameFailure = resolve;
+      });
+      throw new Error('rename publication fails after commit');
+    }
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories
@@ -487,6 +532,47 @@ describe('serialized lease and lifecycle cleanup', () => {
     await expect(renewal).resolves.toBeUndefined();
     await expect(rename).rejects.toThrow('rename publication fails');
     expect(registry.observedNames).toEqual(['planner', 'planner', 'renamed']);
+    expect(registry.networkName).toBe('planner');
+    expect(registry.current()?.networkName).toBe('planner');
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toEqual(registry.current());
+
+    await registry.shutdown();
+  });
+
+  it('reconciles a failed rename before a queued renewal can observe it', async () => {
+    const root = await temporaryRoot();
+    const registry = new FailedPublicationThenRenewalRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+
+    await registry.start();
+    const rename = registry.updateNetworkName('renamed');
+    await registry.renameCommitted;
+    const renewal = registry.renew();
+    registry.releaseRenameFailureNow();
+    await registry.renewalStarted;
+
+    try {
+      expect(registry.networkName).toBe('planner');
+      expect(registry.current()?.networkName).toBe('planner');
+      expect(
+        await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+      ).toEqual(registry.current());
+    } finally {
+      registry.releaseRenewalNow();
+    }
+
+    await expect(rename).rejects.toThrow('rename publication fails after commit');
+    await expect(renewal).resolves.toBeUndefined();
+    expect(registry.observedNames).toEqual(['planner', 'renamed', 'planner']);
     expect(registry.networkName).toBe('planner');
     expect(registry.current()?.networkName).toBe('planner');
     expect(

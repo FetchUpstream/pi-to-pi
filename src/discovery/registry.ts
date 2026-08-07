@@ -1620,6 +1620,23 @@ export class RuntimeRegistry {
     this.currentRecord = record;
   }
 
+  private async restoreCommittedRecord(
+    previousRecord: RuntimeRecord | undefined,
+    failedRecord: RuntimeRecord | undefined,
+  ): Promise<void> {
+    if (previousRecord !== undefined) {
+      await publishRuntimeRecordAtomically(previousRecord, this.pathOptions);
+    } else if (failedRecord !== undefined) {
+      await removeRuntimeRecord(this.roomId, this.runtimeId, {
+        ...this.pathOptions,
+        expectedSessionId: failedRecord.sessionId,
+        expectedEndpoint: failedRecord.endpoint,
+        expectedNetworkName: failedRecord.networkName,
+      });
+    }
+    this.currentRecord = previousRecord;
+  }
+
   /** Publish one owner record with a fresh lease. */
   public renew(): Promise<void> {
     if (this.shutdownRequested || this.lease.stopped) {
@@ -1633,23 +1650,28 @@ export class RuntimeRegistry {
   }
 
   /** Update the published name while retaining this runtime's exact ownership. */
-  public async updateNetworkName(networkName: RegistryNetworkName | string): Promise<void> {
+  public updateNetworkName(networkName: RegistryNetworkName | string): Promise<void> {
     let canonical: RegistryNetworkName;
     try {
       canonical = canonicalNetworkName(networkName, this.runtimeId);
     } catch {
-      throw new RuntimeRegistryError(
-        'networkName must be a canonical base or published network name',
+      return Promise.reject(
+        new RuntimeRegistryError('networkName must be a canonical base or published network name'),
       );
     }
 
     return this.enqueuePublication(async () => {
       const previousNetworkName = this.networkName;
+      const previousRecord = this.currentRecord;
       this.currentNetworkName = canonical;
       try {
         await this.publishCurrentName();
       } catch (error) {
         this.currentNetworkName = previousNetworkName;
+        const failedRecord = this.currentRecord;
+        if (failedRecord !== previousRecord) {
+          await this.restoreCommittedRecord(previousRecord, failedRecord);
+        }
         throw error;
       }
     });
