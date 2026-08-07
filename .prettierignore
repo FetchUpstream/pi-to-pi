@@ -1,4 +1,7 @@
 node_modules/
+.pi/prompts/
+.pi/skills/
+AGENTS.md
 dist/
 coverage/
 package-lock.json
