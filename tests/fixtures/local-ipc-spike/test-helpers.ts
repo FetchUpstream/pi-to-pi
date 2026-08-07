@@ -609,10 +609,16 @@ export async function cleanupChildProcess(
       if (!(closeError instanceof PhaseDeadlineExceededError)) {
         throw closeError;
       }
-      const observedExit = observedChildCloseState(child) ?? childExitState(child);
+      // A recorded close tuple is authoritative even when both fields are null;
+      // mutable ChildProcess metadata can change after close.
+      const observedExit = observedChildCloseState(child);
+      if (observedExit !== undefined) {
+        return { ...observedExit, timedOut: true };
+      }
+      const currentExit = childExitState(child);
       return {
-        code: observedExit?.code ?? child.exitCode,
-        signal: observedExit?.signal ?? child.signalCode,
+        code: currentExit?.code ?? child.exitCode,
+        signal: currentExit?.signal ?? child.signalCode,
         timedOut: true,
       };
     }

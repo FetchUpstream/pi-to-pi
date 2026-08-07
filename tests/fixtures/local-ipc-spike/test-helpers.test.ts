@@ -316,6 +316,30 @@ describe('local IPC spike test helpers', () => {
     ).resolves.toEqual({ code: null, signal: null });
     expect(child.signals).toEqual([]);
   });
+  it('preserves a null/null close tuple when metadata changes during timed-out cleanup', async () => {
+    const child = new NullCloseStateChild();
+    const timeout = new PhaseDeadlineExceededError('child-close', 0);
+    vi.spyOn(child, 'kill').mockImplementation((signal: NodeJS.Signals) => {
+      child.signals.push(signal);
+      child.emit('error', timeout);
+      child.emit('close', null, null);
+      child.exitCode = 7;
+      child.signalCode = 'SIGTERM';
+      return true;
+    });
+
+    await expect(
+      cleanupChildProcess(child as unknown as ChildProcess, {
+        timeoutMs: 100,
+        forceWaitMs: 10,
+      }),
+    ).resolves.toEqual({
+      code: null,
+      signal: null,
+      timedOut: true,
+    });
+    expect(child.signals).toEqual(['SIGTERM']);
+  });
   it('does not let a null/null close state skip a reused child generation', async () => {
     const child = new NullCloseStateChild();
     const observed = waitForChildExit(
