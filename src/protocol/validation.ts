@@ -4,6 +4,7 @@ import { isSafeIdentifier, isUuidV4 as canonicalIsUuidV4 } from '../identity.js'
 import { isRoomId } from '../room.js';
 import {
   createProtocolConfig,
+  DEFAULT_REQUEST_TTL_MS,
   DEFAULT_QUEUE_LIMIT,
   MAX_CONTROL_TTL_MS,
   MAX_ENVELOPE_BYTES,
@@ -212,6 +213,7 @@ interface MeasureContext {
 type MeasureResult =
   | { readonly kind: 'ok'; readonly bytes: number }
   | { readonly kind: 'too_large'; readonly bytes: number }
+  | { readonly kind: 'resource_limit'; readonly path: string; readonly reason: string }
   | { readonly kind: 'invalid'; readonly path: string; readonly reason: string };
 
 interface ResolvedLimits {
@@ -379,34 +381,102 @@ function resolveLimits(options: ValidationOptions): ResolvedLimits {
   };
 }
 
-const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
+interface DecimalValue {
+  readonly numerator: bigint;
+  readonly scale: number;
+}
+
+const DECIMAL_NUMBER_PATTERN = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/u;
+
+function exactDecimalValue(value: number): DecimalValue {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new RangeError('value must be a finite JSON number');
+  }
+  const match = DECIMAL_NUMBER_PATTERN.exec(serialized);
+  if (match === null) {
+    throw new RangeError('value must use a decimal JSON representation');
+  }
+  const [, sign, integerPart, fractionPart = '', exponentText] = match;
+  const exponent = exponentText === undefined ? 0 : Number(exponentText);
+  if (!Number.isSafeInteger(exponent)) {
+    throw new RangeError('decimal exponent is outside the supported range');
+  }
+  const digits = `${integerPart}${fractionPart}`;
+  let numerator = BigInt(digits);
+  if (sign === '-') {
+    numerator = -numerator;
+  }
+  const scale = fractionPart.length - exponent;
+  if (scale >= 0) {
+    return { numerator, scale };
+  }
+  return { numerator: numerator * 10n ** BigInt(-scale), scale: 0 };
+}
+
+function isExactMultiple(value: number, multipleOf: number): boolean {
+  const valueDecimal = exactDecimalValue(value);
+  const multipleDecimal = exactDecimalValue(multipleOf);
+  const scale = Math.max(valueDecimal.scale, multipleDecimal.scale);
+  const valueNumerator = valueDecimal.numerator * 10n ** BigInt(scale - valueDecimal.scale);
+  const multipleNumerator =
+    multipleDecimal.numerator * 10n ** BigInt(scale - multipleDecimal.scale);
+  return multipleNumerator !== 0n && valueNumerator % multipleNumerator === 0n;
+}
+
+interface ExactTimestamp {
+  readonly numerator: bigint;
+  /** Number of decimal places in the seconds representation. */
+  readonly scale: number;
+}
+
 interface ParsedUtcTimestamp {
-  readonly epochNanoseconds: bigint;
+  readonly exact: ExactTimestamp;
+  /** Millisecond precision retained for the public timestamp helper. */
   readonly epochMilliseconds: number;
 }
+
 function timestampFromMilliseconds(value: number): ParsedUtcTimestamp {
   if (!Number.isFinite(value) || !Number.isSafeInteger(Math.trunc(value))) {
     throw new RangeError('now must be a finite safe number');
   }
-  let wholeMilliseconds = Math.trunc(value);
-  let fractionalNanoseconds = Math.round(
-    (value - wholeMilliseconds) * Number(NANOSECONDS_PER_MILLISECOND),
-  );
-  if (fractionalNanoseconds >= Number(NANOSECONDS_PER_MILLISECOND)) {
-    wholeMilliseconds += 1;
-    fractionalNanoseconds -= Number(NANOSECONDS_PER_MILLISECOND);
-  } else if (fractionalNanoseconds <= -Number(NANOSECONDS_PER_MILLISECOND)) {
-    wholeMilliseconds -= 1;
-    fractionalNanoseconds += Number(NANOSECONDS_PER_MILLISECOND);
-  }
-  const epochNanoseconds =
-    BigInt(wholeMilliseconds) * NANOSECONDS_PER_MILLISECOND + BigInt(fractionalNanoseconds);
+  const milliseconds = exactDecimalValue(value);
   return {
-    epochNanoseconds,
-    epochMilliseconds:
-      wholeMilliseconds + fractionalNanoseconds / Number(NANOSECONDS_PER_MILLISECOND),
+    exact: { numerator: milliseconds.numerator, scale: milliseconds.scale + 3 },
+    epochMilliseconds: value,
   };
 }
+
+function alignTimestamp(timestamp: ExactTimestamp, scale: number): bigint {
+  return timestamp.numerator * 10n ** BigInt(scale - timestamp.scale);
+}
+
+function compareTimestamps(left: ParsedUtcTimestamp, right: ParsedUtcTimestamp): number {
+  const scale = Math.max(left.exact.scale, right.exact.scale);
+  const difference = alignTimestamp(left.exact, scale) - alignTimestamp(right.exact, scale);
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+}
+
+function addMilliseconds(timestamp: ParsedUtcTimestamp, milliseconds: number): ParsedUtcTimestamp {
+  const scale = Math.max(timestamp.exact.scale, 3);
+  return {
+    exact: {
+      numerator:
+        alignTimestamp(timestamp.exact, scale) + BigInt(milliseconds) * 10n ** BigInt(scale - 3),
+      scale,
+    },
+    epochMilliseconds: timestamp.epochMilliseconds + milliseconds,
+  };
+}
+
+function timestampExceedsLifetime(
+  later: ParsedUtcTimestamp,
+  earlier: ParsedUtcTimestamp,
+  maximumMilliseconds: number,
+): boolean {
+  return compareTimestamps(later, addMilliseconds(earlier, maximumMilliseconds)) > 0;
+}
+
 function resolveNowTimestamp(value: ValidationOptions['now']): ParsedUtcTimestamp {
   if (value === undefined) {
     return timestampFromMilliseconds(Date.now());
@@ -427,6 +497,7 @@ function resolveNowTimestamp(value: ValidationOptions['now']): ParsedUtcTimestam
   }
   return timestamp;
 }
+
 function isUuidV4Value(value: unknown): value is string {
   return canonicalIsUuidV4(value);
 }
@@ -444,12 +515,6 @@ function parseUtcTimestampExact(value: unknown): ParsedUtcTimestamp | undefined 
     return undefined;
   }
   const fraction = match[7] ?? '';
-  // JavaScript numbers cannot retain arbitrary RFC 3339 precision.  The v1
-  // validator supports nanosecond precision and rejects anything finer rather
-  // than silently changing the ordering or deadline of a valid timestamp.
-  if (fraction.length > 9) {
-    return undefined;
-  }
   const [, year, month, day, hour, minute, second] = match;
   const normalizedInput = `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
   const milliseconds = Date.parse(normalizedInput);
@@ -467,12 +532,23 @@ function parseUtcTimestampExact(value: unknown): ParsedUtcTimestamp | undefined 
   if (normalizedInput !== normalizedOutput) {
     return undefined;
   }
-  const fractionNanoseconds = BigInt(fraction.padEnd(9, '0') || '0');
-  const epochNanoseconds = BigInt(milliseconds) * NANOSECONDS_PER_MILLISECOND + fractionNanoseconds;
+  const significantFraction = fraction.replace(/0+$/u, '');
+  const scale = significantFraction.length;
+  const fractionNumerator = BigInt(significantFraction || '0');
+  const scaleFactor = 10n ** BigInt(scale);
+  const epochSeconds = BigInt(milliseconds) / 1000n;
+  const exact: ExactTimestamp = {
+    numerator: epochSeconds * scaleFactor + fractionNumerator,
+    scale,
+  };
+  const visibleFraction = fraction.slice(0, 15);
+  const fractionMilliseconds =
+    visibleFraction.length === 0
+      ? 0
+      : (Number(visibleFraction) / 10 ** visibleFraction.length) * 1000;
   return {
-    epochNanoseconds,
-    epochMilliseconds:
-      milliseconds + Number(fractionNanoseconds) / Number(NANOSECONDS_PER_MILLISECOND),
+    exact,
+    epochMilliseconds: milliseconds + fractionMilliseconds,
   };
 }
 
@@ -559,10 +635,18 @@ function measureJsonBytes(
   const measure = (candidate: unknown, path: string, depth: number): MeasureResult => {
     context.nodes += 1;
     if (context.nodes > context.maxNodes) {
-      return { kind: 'too_large', bytes: context.maxBytes + 1 };
+      return {
+        kind: 'resource_limit',
+        path,
+        reason: 'maximum JSON node count exceeded',
+      };
     }
     if (depth > context.maxDepth) {
-      return { kind: 'invalid', path, reason: 'maximum JSON nesting depth exceeded' };
+      return {
+        kind: 'resource_limit',
+        path,
+        reason: 'maximum JSON nesting depth exceeded',
+      };
     }
 
     if (candidate === null) {
@@ -681,6 +765,9 @@ function validateJsonValueInternal(
   if (measured.kind === 'invalid') {
     return issue('malformed', measured.path, measured.reason);
   }
+  if (measured.kind === 'resource_limit') {
+    return issue('oversized', measured.path, measured.reason);
+  }
   if (measured.kind === 'too_large') {
     return issue('oversized', path, 'JSON value exceeds the configured byte limit');
   }
@@ -699,6 +786,9 @@ function validateContentSizeInternal(
 ): InternalIssue | undefined {
   const limits = resolveLimits(options);
   const measured = measureJsonBytes(value, limits.maxEnvelopeBytes, options);
+  if (measured.kind === 'resource_limit') {
+    return issue('oversized', measured.path, measured.reason);
+  }
   if (measured.kind === 'too_large') {
     return issue('oversized', path, 'content exceeds the configured byte limit');
   }
@@ -804,7 +894,7 @@ function isFiniteNumber(value: unknown): value is number {
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
 function isSchemaValue(value: unknown): value is JsonSchema {
@@ -1601,6 +1691,14 @@ export function validateJsonSchema(
 ): ValidationResult<JsonSchema> {
   const limits = resolveLimits(options);
   const measured = measureJsonBytes(schema, limits.maxSchemaBytes, options);
+  if (measured.kind === 'resource_limit') {
+    return validationFailure(
+      'oversized',
+      'response schema exceeds the validation resource limit',
+      measured.path,
+      measured.reason,
+    );
+  }
   if (measured.kind === 'too_large') {
     return validationFailure(
       'oversized',
@@ -1990,6 +2088,14 @@ export function validateEnvelope(
 ): ValidationResult<ProtocolEnvelope> {
   const limits = resolveLimits(options);
   const measured = measureJsonBytes(value, limits.maxEnvelopeBytes, options);
+  if (measured.kind === 'resource_limit') {
+    return validationFailure(
+      'oversized',
+      'protocol envelope exceeds the validation resource limit',
+      measured.path,
+      measured.reason,
+    );
+  }
   if (measured.kind === 'too_large') {
     return validationFailure(
       'oversized',
@@ -2135,7 +2241,7 @@ export function validateEnvelope(
       'expiresAt must be an RFC 3339 UTC timestamp',
     );
   }
-  if (expiresAt.epochNanoseconds <= createdAt.epochNanoseconds) {
+  if (compareTimestamps(expiresAt, createdAt) <= 0) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -2148,10 +2254,7 @@ export function validateEnvelope(
     operation === 'peer.describe' || operation === 'task.status' || operation === 'task.cancel'
       ? limits.maxControlTtlMs
       : limits.maxRequestTtlMs;
-  if (
-    expiresAt.epochNanoseconds - createdAt.epochNanoseconds >
-    BigInt(deadlineLimit) * NANOSECONDS_PER_MILLISECOND
-  ) {
+  if (timestampExceedsLifetime(expiresAt, createdAt, deadlineLimit)) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -2161,10 +2264,7 @@ export function validateEnvelope(
   }
 
   const now = resolveNowTimestamp(options.now);
-  if (
-    createdAt.epochNanoseconds >
-    now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND
-  ) {
+  if (compareTimestamps(createdAt, addMilliseconds(now, MAX_CLOCK_SKEW_MS)) > 0) {
     return validationFailure(
       'malformed',
       'protocol envelope is malformed',
@@ -2172,7 +2272,7 @@ export function validateEnvelope(
       'createdAt is too far in the future',
     );
   }
-  if (expiresAt.epochNanoseconds <= now.epochNanoseconds) {
+  if (compareTimestamps(expiresAt, now) <= 0) {
     return validationFailure(
       'expired',
       'protocol operation has expired',
@@ -2229,13 +2329,14 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     !hasOwn(value, 'supportedProtocolVersions') ||
     !Array.isArray(value.supportedProtocolVersions) ||
     value.supportedProtocolVersions.length === 0 ||
-    !value.supportedProtocolVersions.includes(PROTOCOL_VERSION) ||
-    !value.supportedProtocolVersions.every((version) => version === PROTOCOL_VERSION)
+    !value.supportedProtocolVersions.every(
+      (version) => typeof version === 'string' && version.length > 0,
+    )
   ) {
     return issue(
-      'incompatible',
+      'malformed',
       `${path}.supportedProtocolVersions`,
-      'agent card must advertise exactly supported protocol versions',
+      'supportedProtocolVersions must be a non-empty array of non-empty strings',
       'supportedProtocolVersions',
     );
   }
@@ -2244,6 +2345,17 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
       'malformed',
       `${path}.supportedProtocolVersions`,
       'supportedProtocolVersions must not contain duplicates',
+      'supportedProtocolVersions',
+    );
+  }
+  if (
+    !value.supportedProtocolVersions.includes(PROTOCOL_VERSION) ||
+    value.supportedProtocolVersions.some((version) => version !== PROTOCOL_VERSION)
+  ) {
+    return issue(
+      'incompatible',
+      `${path}.supportedProtocolVersions`,
+      'agent card advertises unsupported protocol versions',
       'supportedProtocolVersions',
     );
   }
@@ -2360,7 +2472,7 @@ function validateAgentCardInternal(value: unknown, path: string): InternalIssue 
     return issue('malformed', `${path}.limits`, 'protocol limits are required', 'limits');
   }
   const limitCeilings: Record<string, number> = {
-    requestTtlMs: MAX_REQUEST_TTL_MS,
+    requestTtlMs: DEFAULT_REQUEST_TTL_MS,
     maxRequestTtlMs: MAX_REQUEST_TTL_MS,
     maxControlTtlMs: MAX_CONTROL_TTL_MS,
     maxEnvelopeBytes: MAX_ENVELOPE_BYTES,
@@ -2445,9 +2557,7 @@ function validateTaskSnapshotInternal(
     }
     timestamps.set(field, timestamp);
   }
-  if (
-    timestamps.get('updatedAt')!.epochNanoseconds < timestamps.get('createdAt')!.epochNanoseconds
-  ) {
+  if (compareTimestamps(timestamps.get('updatedAt')!, timestamps.get('createdAt')!) < 0) {
     return issue(
       'malformed',
       `${path}.updatedAt`,
@@ -2455,9 +2565,7 @@ function validateTaskSnapshotInternal(
       'updatedAt',
     );
   }
-  if (
-    timestamps.get('expiresAt')!.epochNanoseconds <= timestamps.get('createdAt')!.epochNanoseconds
-  ) {
+  if (compareTimestamps(timestamps.get('expiresAt')!, timestamps.get('createdAt')!) <= 0) {
     return issue(
       'malformed',
       `${path}.expiresAt`,
@@ -2470,10 +2578,7 @@ function validateTaskSnapshotInternal(
   const expiresAt = timestamps.get('expiresAt')!;
   const limits = resolveLimits(options);
   const now = resolveNowTimestamp(options.now);
-  if (
-    expiresAt.epochNanoseconds - createdAt.epochNanoseconds >
-    BigInt(limits.maxRequestTtlMs) * NANOSECONDS_PER_MILLISECOND
-  ) {
+  if (timestampExceedsLifetime(expiresAt, createdAt, limits.maxRequestTtlMs)) {
     return issue(
       'malformed',
       `${path}.expiresAt`,
@@ -2481,10 +2586,7 @@ function validateTaskSnapshotInternal(
       'expiresAt',
     );
   }
-  if (
-    createdAt.epochNanoseconds >
-    now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND
-  ) {
+  if (compareTimestamps(createdAt, addMilliseconds(now, MAX_CLOCK_SKEW_MS)) > 0) {
     return issue(
       'malformed',
       `${path}.createdAt`,
@@ -2492,10 +2594,7 @@ function validateTaskSnapshotInternal(
       'createdAt',
     );
   }
-  if (
-    updatedAt.epochNanoseconds >
-    now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND
-  ) {
+  if (compareTimestamps(updatedAt, addMilliseconds(now, MAX_CLOCK_SKEW_MS)) > 0) {
     return issue(
       'malformed',
       `${path}.updatedAt`,
@@ -2503,10 +2602,10 @@ function validateTaskSnapshotInternal(
       'updatedAt',
     );
   }
-  if (expiresAt.epochNanoseconds <= now.epochNanoseconds) {
+  if (!isTerminalTaskState(state) && compareTimestamps(expiresAt, now) <= 0) {
     return issue('expired', `${path}.expiresAt`, 'task snapshot deadline has passed', 'expiresAt');
   }
-  if (updatedAt.epochNanoseconds > expiresAt.epochNanoseconds && state !== 'expired') {
+  if (compareTimestamps(updatedAt, expiresAt) > 0 && state !== 'expired') {
     return issue(
       'malformed',
       `${path}.updatedAt`,
@@ -2560,10 +2659,9 @@ function validateTaskSnapshotInternal(
       : undefined;
     if (
       requestedAt !== undefined &&
-      (requestedAt.epochNanoseconds < createdAt.epochNanoseconds ||
-        requestedAt.epochNanoseconds >
-          now.epochNanoseconds + BigInt(MAX_CLOCK_SKEW_MS) * NANOSECONDS_PER_MILLISECOND ||
-        requestedAt.epochNanoseconds > expiresAt.epochNanoseconds)
+      (compareTimestamps(requestedAt, createdAt) < 0 ||
+        compareTimestamps(requestedAt, addMilliseconds(now, MAX_CLOCK_SKEW_MS)) > 0 ||
+        compareTimestamps(requestedAt, expiresAt) > 0)
     ) {
       return issue(
         'malformed',
@@ -2741,6 +2839,14 @@ export function validateOperationResponse(
 ): ValidationResult<OperationResponse> {
   const limits = resolveLimits(options);
   const measured = measureJsonBytes(value, limits.maxEnvelopeBytes, options);
+  if (measured.kind === 'resource_limit') {
+    return validationFailure(
+      'oversized',
+      'operation response exceeds the validation resource limit',
+      measured.path,
+      measured.reason,
+    );
+  }
   if (measured.kind === 'too_large') {
     return validationFailure(
       'oversized',
@@ -2914,7 +3020,7 @@ function schemaTypeMatches(value: JsonValue, type: string): boolean {
     case 'number':
       return typeof value === 'number' && Number.isFinite(value);
     case 'integer':
-      return typeof value === 'number' && Number.isSafeInteger(value);
+      return typeof value === 'number' && Number.isInteger(value);
     case 'string':
       return typeof value === 'string';
     default:
@@ -3004,8 +3110,7 @@ function matchesSchema(
 
   if (typeof value === 'number') {
     if (hasOwn(schema, 'multipleOf') && isFiniteNumber(schema.multipleOf)) {
-      const quotient = value / schema.multipleOf;
-      if (Math.abs(quotient - Math.round(quotient)) > 1e-12) {
+      if (!isExactMultiple(value, schema.multipleOf)) {
         return { valid: false, path, reason: 'number is not a multipleOf value' };
       }
     }
@@ -3619,7 +3724,18 @@ function canonicalizeValue(value: unknown, seen: Set<object>, budget?: Evaluatio
 }
 
 /** RFC 8785-style deterministic JSON serialization for protocol values. */
-export function canonicalizeJson(value: unknown): string {
+export function canonicalizeJson(value: unknown, options: ValidationOptions = {}): string {
+  const limits = resolveLimits(options);
+  const measured = measureJsonBytes(value, limits.maxEnvelopeBytes, options);
+  if (measured.kind !== 'ok') {
+    throw new TypeError(
+      measured.kind === 'invalid'
+        ? measured.reason
+        : measured.kind === 'resource_limit'
+          ? measured.reason
+          : 'canonical JSON exceeds the configured byte limit',
+    );
+  }
   return canonicalizeValue(value, new Set<object>());
 }
 
