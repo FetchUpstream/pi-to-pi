@@ -3,6 +3,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+const renameMock = vi.hoisted(() => vi.fn());
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  renameMock.mockImplementation(actual.rename);
+  return { ...actual, rename: renameMock };
+});
 
 import {
   DEFAULT_LEASE_RENEWAL_INTERVAL_MS,
@@ -456,6 +462,123 @@ describe('serialized lease and lifecycle cleanup', () => {
     await lease.stop();
     expect(cleared).toBe(1);
     expect(lease.stopped).toBe(true);
+  });
+
+  it('reconciles a post-rename publication failure before shutdown cleanup', async () => {
+    const root = await temporaryRoot();
+    const registry = new RuntimeRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+    const originalRename = renameMock.getMockImplementation()!;
+    let recordRenameCount = 0;
+    renameMock.mockImplementation(async (source, target, flags) => {
+      await originalRename(source, target, flags);
+      if (String(target).endsWith(`${RUNTIME_A}.json`)) {
+        recordRenameCount += 1;
+        if (recordRenameCount === 2) {
+          throw new Error('post-rename publication fails');
+        }
+      }
+    });
+
+    try {
+      await registry.start();
+      const committed = registry.current();
+      await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
+        'post-rename publication fails',
+      );
+      expect(registry.networkName).toBe('planner');
+      expect(registry.current()).toEqual(committed);
+      expect(
+        await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+      ).toEqual(committed);
+      await expect(registry.shutdown()).resolves.toBe(true);
+      expect(
+        await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+      ).toBeUndefined();
+    } finally {
+      renameMock.mockImplementation(originalRename);
+    }
+  });
+
+  it('rolls back a failed rename before exposing a stale record', async () => {
+    const root = await temporaryRoot();
+    const registry = new RuntimeRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+    const originalRename = renameMock.getMockImplementation()!;
+    let recordRenameCount = 0;
+    renameMock.mockImplementation(async (source, target, flags) => {
+      if (String(target).endsWith(`${RUNTIME_A}.json`)) {
+        recordRenameCount += 1;
+        if (recordRenameCount === 2) {
+          throw new Error('rename publication fails');
+        }
+      }
+      return originalRename(source, target, flags);
+    });
+
+    try {
+      await registry.start();
+      const committed = registry.current();
+      await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
+        'rename publication fails',
+      );
+      expect(registry.networkName).toBe('planner');
+      expect(registry.current()).toEqual(committed);
+      expect(
+        await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+      ).toEqual(committed);
+      await registry.shutdown();
+    } finally {
+      renameMock.mockImplementation(originalRename);
+    }
+  });
+
+  it('renames without a committed record by removing a failed post-rename candidate', async () => {
+    const root = await temporaryRoot();
+    const registry = new RuntimeRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      roomId: ROOM_ID,
+      networkName: 'planner',
+      endpoint: '/tmp/endpoint-a',
+      rootDirectory: root,
+      now: 1_000,
+    });
+    const originalRename = renameMock.getMockImplementation()!;
+    renameMock.mockImplementation(async (source, target, flags) => {
+      await originalRename(source, target, flags);
+      if (String(target).endsWith(`${RUNTIME_A}.json`)) {
+        throw new Error('initial post-rename publication fails');
+      }
+    });
+
+    try {
+      await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
+        'initial post-rename publication fails',
+      );
+      expect(registry.networkName).toBe('planner');
+      expect(registry.current()).toBeUndefined();
+      expect(
+        await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+      ).toBeUndefined();
+      await expect(registry.shutdown()).resolves.toBe(false);
+    } finally {
+      renameMock.mockImplementation(originalRename);
+    }
   });
 
   it('renews and removes only its exact record on idempotent shutdown', async () => {
