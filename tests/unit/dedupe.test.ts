@@ -540,8 +540,10 @@ describe('runtime-scoped deduplication', () => {
     });
     let taskState: CancelState = 'queued';
     let stateTransitions = 0;
+    let cancelProducerCalls = 0;
 
     const cancelTask = (operation: ProtocolEnvelope): CancelOutcome => {
+      cancelProducerCalls += 1;
       if (taskState === 'queued') {
         taskState = 'cancelled';
         stateTransitions += 1;
@@ -555,25 +557,38 @@ describe('runtime-scoped deduplication', () => {
     };
 
     const first = store.execute(cancellation, () => cancelTask(cancellation));
+    expect(first.kind).toBe('stored');
+    expect(cancelProducerCalls).toBe(1);
+
     const identicalRetry = store.execute(cancellation, () => cancelTask(cancellation));
-    const conflictingRetry = store.execute(conflictingCancellation, () => cancelTask(cancellation));
+    expect(identicalRetry.kind).toBe('replay');
+    expect(cancelProducerCalls).toBe(1);
+
+    const conflictingRetry = store.execute(conflictingCancellation, () =>
+      cancelTask(conflictingCancellation),
+    );
+    expect(conflictingRetry.kind).toBe('duplicate');
+    expect(conflictingRetry.error?.code).toBe('duplicate');
+    expect(cancelProducerCalls).toBe(1);
+
     const idempotentRetry = store.execute(retryAfterCancellation, () =>
       cancelTask(retryAfterCancellation),
     );
+    const repeatedIdempotentRetry = store.execute(retryAfterCancellation, () =>
+      cancelTask(retryAfterCancellation),
+    );
 
-    expect(first.kind).toBe('stored');
     expect(first.result?.snapshot).toEqual({
       requestId: REQUEST_OPERATION_ID,
       state: 'cancelled',
     });
-    expect(identicalRetry.kind).toBe('replay');
-    expect(conflictingRetry.kind).toBe('duplicate');
-    expect(conflictingRetry.error?.code).toBe('duplicate');
     expect(idempotentRetry.kind).toBe('stored');
     expect(idempotentRetry.result?.snapshot).toEqual({
       requestId: REQUEST_OPERATION_ID,
       state: 'cancelled',
     });
+    expect(repeatedIdempotentRetry.kind).toBe('replay');
+    expect(cancelProducerCalls).toBe(2);
     expect(taskState).toBe('cancelled');
     expect(stateTransitions).toBe(1);
 
@@ -582,9 +597,16 @@ describe('runtime-scoped deduplication', () => {
       requestId: SECOND_CANCEL_TARGET_ID,
       reason: 'stop working task',
     });
+    const workingConflictingCancellation = makeCancel({
+      operationId: WORKING_CANCEL_OPERATION_ID,
+      requestId: SECOND_CANCEL_TARGET_ID,
+      reason: 'different working reason',
+    });
     let workingState: CancelState = 'working';
     let workingTransitions = 0;
+    let workingHandlerCalls = 0;
     const transitionWorkingTask = (): CancelOutcome => {
+      workingHandlerCalls += 1;
       if (workingState === 'working') {
         workingState = 'cancelling';
         workingTransitions += 1;
@@ -594,11 +616,21 @@ describe('runtime-scoped deduplication', () => {
       };
     };
     const workingFirst = store.execute(workingCancellation, transitionWorkingTask);
-    const workingRetry = store.execute(workingCancellation, transitionWorkingTask);
-
     expect(workingFirst.kind).toBe('stored');
     expect(workingFirst.result?.snapshot.state).toBe('cancelling');
+    expect(workingHandlerCalls).toBe(1);
+
+    const workingRetry = store.execute(workingCancellation, transitionWorkingTask);
     expect(workingRetry.kind).toBe('replay');
+    expect(workingHandlerCalls).toBe(1);
+
+    const workingConflictingRetry = store.execute(
+      workingConflictingCancellation,
+      transitionWorkingTask,
+    );
+    expect(workingConflictingRetry.kind).toBe('duplicate');
+    expect(workingConflictingRetry.error?.code).toBe('duplicate');
+    expect(workingHandlerCalls).toBe(1);
     expect(workingTransitions).toBe(1);
     expect(workingState).toBe('cancelling');
     store.dispose();
