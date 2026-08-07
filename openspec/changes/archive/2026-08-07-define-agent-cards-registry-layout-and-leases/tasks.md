@@ -22,15 +22,15 @@
 
 ## 4. Pi lifecycle integration
 
-- [ ] 4.1 Create a fresh runtime instance identity at each `session_start` while retaining Pi's logical session ID across reloads.
-- [ ] 4.2 Populate and refresh card metadata from Pi session name, model selection, context usage, runtime state, and inbound queue depth.
-- [ ] 4.3 Start registry resources only from session lifecycle handlers and make `session_shutdown` cleanup idempotent across reload, new-session, resume, fork, and quit flows.
-- [ ] 4.4 Expose the registry through the existing discovery interfaces without coupling it to local IPC framing or message routing.
+- [x] 4.1 Create a fresh runtime instance identity at each `session_start` while retaining Pi's logical session ID across reloads.
+- [x] 4.2 Populate and refresh card metadata from Pi session name, model selection, context usage, runtime state, and inbound queue depth.
+- [x] 4.3 Start registry resources only from session lifecycle handlers and make `session_shutdown` cleanup idempotent across reload, new-session, resume, fork, and quit flows.
+- [x] 4.4 Expose the registry through the existing discovery interfaces without coupling it to local IPC framing or message routing.
 
 ## 5. Verification
 
-- [ ] 5.1 Add unit tests for Agent Card schema validation, nullability, identity matching, room/storage-key validation, and runtime-root selection.
-- [ ] 5.2 Add process-level tests for concurrent starts, duplicate display names, atomic publication, partial writes, and stale-runtime replacement safety.
-- [ ] 5.3 Add process-level lease tests for renewal, crash expiry, delayed cleanup, cleanup/renewal races, and idempotent shutdown.
-- [ ] 5.4 Add POSIX permission tests and Windows process/ACL coverage for runtime roots and card files.
-- [ ] 5.5 Run formatting, typechecking, unit tests, and the cross-platform process-test lane; verify malformed records never hide valid peers.
+- [x] 5.1 Add unit tests for Agent Card schema validation, nullability, identity matching, room/storage-key validation, and runtime-root selection.
+- [x] 5.2 Add process-level tests for concurrent starts, duplicate display names, atomic publication, partial writes, and stale-runtime replacement safety.
+- [x] 5.3 Add process-level lease tests for renewal, crash expiry, delayed cleanup, cleanup/renewal races, and idempotent shutdown.
+- [x] 5.4 Add POSIX permission tests and Windows process/ACL coverage for runtime roots and card files.
+- [x] 5.5 Run formatting, typechecking, unit tests, and the cross-platform process-test lane; verify malformed records never hide valid peers.
