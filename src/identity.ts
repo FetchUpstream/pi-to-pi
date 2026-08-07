@@ -46,10 +46,20 @@ export interface CanonicalPeerAddress {
 /** Alias used by protocol and discovery consumers. */
 export type PeerAddress = CanonicalPeerAddress;
 
-/** Brand a non-empty native session identifier. */
-export function asSessionId(value: string): SessionId {
-  assertIdentityText(value, 'session ID');
+/** Brand Pi's native session identifier grammar. */
+export function asSessionId(value: unknown): SessionId {
+  if (!isSessionId(value)) {
+    throw new Error('Invalid session ID: expected Pi native session ID grammar');
+  }
   return value as SessionId;
+}
+
+/** Mirrors Pi's installed `assertValidSessionId` grammar. */
+const PI_NATIVE_SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u;
+
+/** Return whether a value matches Pi's native session-ID grammar. */
+export function isSessionId(value: unknown): value is string {
+  return typeof value === 'string' && PI_NATIVE_SESSION_ID_PATTERN.test(value);
 }
 
 /** Brand a canonical lowercase full UUID runtime identifier. */
@@ -155,20 +165,4 @@ function createRuntimeLifecycleWithFactory(runtimeIdFactory: () => RuntimeId): R
       return active;
     },
   };
-}
-
-function assertIdentityText(value: string, label: string): void {
-  if (typeof value !== 'string' || value.length === 0 || hasControlCharacter(value)) {
-    throw new Error(`Invalid ${label}`);
-  }
-}
-
-function hasControlCharacter(value: string): boolean {
-  for (const character of value) {
-    const codePoint = character.codePointAt(0) ?? 0;
-    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) {
-      return true;
-    }
-  }
-  return false;
 }

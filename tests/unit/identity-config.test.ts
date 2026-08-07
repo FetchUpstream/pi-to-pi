@@ -11,8 +11,10 @@ import {
 import {
   asNormalizedName,
   asRuntimeId,
+  asSessionId,
   createRuntimeLifecycle,
   createRuntimeLifecycleForTesting,
+  isSessionId,
   isUuid,
 } from '../../src/identity.js';
 import { asRoomId, createResolvedRoom, isRoomId } from '../../src/room.js';
@@ -40,6 +42,20 @@ describe('P2P identity and configuration foundations', () => {
       'canonical lowercase',
     );
     expect(() => asRuntimeId(123)).toThrow('canonical lowercase');
+    expect(isSessionId('A_session.id-9')).toBe(true);
+    expect(asSessionId('A_session.id-9')).toBe('A_session.id-9');
+    for (const value of [
+      '',
+      ' leading',
+      'trailing ',
+      '-leading',
+      'trailing-',
+      'has space',
+      'has/slash',
+    ]) {
+      expect(isSessionId(value)).toBe(false);
+      expect(() => asSessionId(value)).toThrow('native session ID grammar');
+    }
     expect(asNormalizedName('  Ｐlanner / One  ')).toBe('planner-one');
     expect(() => asNormalizedName('planner\uFEFF')).toThrow();
   });

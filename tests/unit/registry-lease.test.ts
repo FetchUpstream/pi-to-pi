@@ -1,4 +1,4 @@
-import { readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,7 +28,7 @@ import {
   serializeRuntimeRecord,
   validateRuntimeRecord,
 } from '../../src/discovery/registry.js';
-
+import { buildNetworkName } from '../../src/discovery/naming.js';
 const ROOM_ID = `r1-${'a'.repeat(32)}`;
 const OTHER_ROOM_ID = `r1-${'b'.repeat(32)}`;
 const RUNTIME_A = '11111111-1111-4111-8111-111111111111';
@@ -74,6 +74,18 @@ describe('runtime record validation and atomic publication', () => {
 
     expect(validateRuntimeRecord({ ...valid, runtimeId: 'runtime-a' }).valid).toBe(false);
     expect(validateRuntimeRecord({ ...valid, networkName: 'Planner' }).valid).toBe(false);
+    expect(validateRuntimeRecord({ ...valid, sessionId: 'bad session' }).valid).toBe(false);
+    expect(validateRuntimeRecord({ ...valid, sessionId: 'session-' }).valid).toBe(false);
+    expect(
+      () =>
+        new RuntimeRegistry({
+          runtimeId: RUNTIME_A,
+          sessionId: 'bad session',
+          roomId: ROOM_ID,
+          networkName: 'planner',
+          endpoint: '/tmp/endpoint-a',
+        }),
+    ).toThrow('invalid');
     expect(validateRuntimeRecord({ ...valid, roomId: '../room' }).valid).toBe(false);
     expect(validateRuntimeRecord({ ...valid, endpoint: 'bad\nendpoint' }).valid).toBe(false);
     expect(validateRuntimeRecord({ ...valid, extra: true }).valid).toBe(false);
@@ -93,6 +105,38 @@ describe('runtime record validation and atomic publication', () => {
     expect(parseRuntimeRecordJson('{not-json').valid).toBe(false);
   });
 
+  it('persists canonical full published names at the maximum base length', async () => {
+    const root = await temporaryRoot();
+    const networkName = buildNetworkName('a'.repeat(48), RUNTIME_A);
+    const published = { ...record(RUNTIME_A), networkName };
+
+    expect(validateRuntimeRecord(published)).toMatchObject({ valid: true, record: published });
+    expect(parseRuntimeRecordJson(serializeRuntimeRecord(published))).toMatchObject({
+      valid: true,
+      record: published,
+    });
+    await publishRuntimeRecordAtomically(published, { rootDirectory: root });
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toEqual(published);
+
+    const registry = new RuntimeRegistry({
+      runtimeId: RUNTIME_A,
+      sessionId: published.sessionId,
+      roomId: ROOM_ID,
+      networkName,
+      endpoint: published.endpoint,
+      rootDirectory: root,
+      now: 1_000,
+    });
+    await registry.start();
+    expect(registry.current()?.networkName).toBe(networkName);
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toEqual(registry.current());
+    await registry.shutdown();
+  });
+
   it('publishes a complete record atomically under a full runtime UUID key', async () => {
     const root = await temporaryRoot();
     const published = record(RUNTIME_A);
@@ -108,9 +152,30 @@ describe('runtime record validation and atomic publication', () => {
     expect(
       (await readdir(paths.recordsDirectory)).filter((name) => name.includes('.tmp-')),
     ).toEqual([]);
-    expect((await stat(root)).mode & 0o777).toBe(PRIVATE_DIRECTORY_MODE);
-    expect((await stat(path)).mode & 0o777).toBe(PRIVATE_FILE_MODE);
+    expect((await stat(root)).mode & 0o7777).toBe(PRIVATE_DIRECTORY_MODE);
+    expect((await stat(path)).mode & 0o7777).toBe(PRIVATE_FILE_MODE);
     expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(published);
+  });
+
+  it('rejects POSIX special mode bits on registry directories and records', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+    const root = await temporaryRoot();
+    await publishRuntimeRecordAtomically(record(RUNTIME_A), { rootDirectory: root });
+    const paths = getRegistryPaths(ROOM_ID, { rootDirectory: root });
+    const modeWithSetgid = PRIVATE_DIRECTORY_MODE | 0o2000;
+    await chmod(paths.recordsDirectory, modeWithSetgid);
+    await expect(
+      publishRuntimeRecordAtomically(record(RUNTIME_B), { rootDirectory: root }),
+    ).rejects.toThrow('not private');
+    await chmod(paths.recordsDirectory, PRIVATE_DIRECTORY_MODE);
+
+    const recordPath = getRuntimeRecordPath(ROOM_ID, RUNTIME_A, { rootDirectory: root });
+    await chmod(recordPath, PRIVATE_FILE_MODE | 0o4000);
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toBeUndefined();
   });
 
   it('keeps concurrent runtime publications as separate complete records', async () => {
@@ -190,6 +255,10 @@ describe('lease expiry and stale-record handling', () => {
     ).toBe(false);
     expect(await readRuntimeRecord(ROOM_ID, RUNTIME_A, cleanup)).toBeDefined();
     expect(
+      await handleEndpointFailure(ROOM_ID, RUNTIME_A, { ...cleanup, failure: 'unavailable' }),
+    ).toBe(false);
+    expect(await readRuntimeRecord(ROOM_ID, RUNTIME_A, cleanup)).toBeDefined();
+    expect(
       await handleEndpointFailure(ROOM_ID, RUNTIME_A, { ...cleanup, failure: 'refused' }),
     ).toBe(true);
     expect(await readRuntimeRecord(ROOM_ID, RUNTIME_A, cleanup)).toBeUndefined();
@@ -212,7 +281,6 @@ describe('lease expiry and stale-record handling', () => {
     expect(
       await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
     ).toEqual(changed);
-
     await publishRuntimeRecordAtomically(record(RUNTIME_B), { rootDirectory: root });
     expect(
       await removeRuntimeRecord(ROOM_ID, RUNTIME_A, {
@@ -225,6 +293,27 @@ describe('lease expiry and stale-record handling', () => {
     expect(
       await readRuntimeRecord(ROOM_ID, RUNTIME_B, { rootDirectory: root, now: 1_000 }),
     ).toBeDefined();
+  });
+
+  it('keeps a replacement published during cleanup intact', async () => {
+    const root = await temporaryRoot();
+    const oldRecord = record(RUNTIME_A);
+    const replacement = { ...oldRecord, endpoint: '/tmp/replacement-race' };
+    await publishRuntimeRecordAtomically(oldRecord, { rootDirectory: root });
+
+    await Promise.all([
+      removeRuntimeRecord(ROOM_ID, RUNTIME_A, {
+        rootDirectory: root,
+        expectedSessionId: oldRecord.sessionId,
+        expectedEndpoint: oldRecord.endpoint,
+        expectedNetworkName: oldRecord.networkName,
+      }),
+      publishRuntimeRecordAtomically(replacement, { rootDirectory: root }),
+    ]);
+
+    expect(
+      await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
+    ).toEqual(replacement);
   });
 });
 

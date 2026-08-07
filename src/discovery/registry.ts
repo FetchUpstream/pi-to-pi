@@ -15,6 +15,11 @@ import {
 } from '../identity.js';
 import { asRoomId, type RoomId, type RoomLike } from '../room.js';
 import {
+  asPublishedNetworkName,
+  isPublishedNetworkName,
+  type PublishedNetworkName,
+} from './naming.js';
+import {
   DEFAULT_LEASE_RENEWAL_INTERVAL_MS,
   DEFAULT_LEASE_TTL_MS,
   LeaseConfigurationError,
@@ -57,17 +62,17 @@ function hasControlCharacter(value: string): boolean {
 const RUNTIME_RECORD_FILE_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/u;
 const MAX_ENDPOINT_LENGTH = 4096;
-
 export type RegistryClock = LeaseClock;
 export type LeaseExpiryInput = number | Date | string;
+export type RegistryNetworkName = NormalizedName | PublishedNetworkName;
 
 /** The validated, machine-actionable runtime registry record. */
 export interface RuntimeRecord {
   readonly runtimeId: RuntimeId;
   readonly sessionId: SessionId;
   readonly roomId: RoomId;
-  /** A canonical normalized network label, without filesystem interpretation. */
-  readonly networkName: NormalizedName;
+  /** A canonical base-only or full published network label. */
+  readonly networkName: RegistryNetworkName;
   /** Opaque local transport endpoint address. */
   readonly endpoint: string;
   /** Epoch milliseconds at which this record ceases to be live. */
@@ -281,6 +286,19 @@ function assertText(value: unknown, field: string, maxLength: number): string {
   return value;
 }
 
+function canonicalNetworkName(value: unknown): RegistryNetworkName {
+  if (typeof value !== 'string') {
+    throw new TypeError('network name must be text');
+  }
+  if (isPublishedNetworkName(value)) {
+    return asPublishedNetworkName(value);
+  }
+  const normalized = asNormalizedName(value);
+  if (normalized !== value) {
+    throw new TypeError('network name must already be normalized');
+  }
+  return normalized;
+}
 function validateRecordFields(
   value: unknown,
   options: RuntimeRecordValidationOptions,
@@ -307,7 +325,7 @@ function validateRecordFields(
   let runtimeId: RuntimeId;
   let sessionId: SessionId;
   let roomId: RoomId;
-  let networkName: NormalizedName;
+  let networkName: RegistryNetworkName;
   let endpoint = '';
   let leaseExpiresAt: number;
 
@@ -324,13 +342,13 @@ function validateRecordFields(
   }
 
   if (typeof value.sessionId !== 'string') {
-    errors.push({ field: 'sessionId', message: 'must be non-empty text without controls' });
+    errors.push({ field: 'sessionId', message: 'must be a valid Pi native session ID' });
     sessionId = '' as SessionId;
   } else {
     try {
       sessionId = asSessionId(value.sessionId);
     } catch {
-      errors.push({ field: 'sessionId', message: 'must be non-empty text without controls' });
+      errors.push({ field: 'sessionId', message: 'must be a valid Pi native session ID' });
       sessionId = '' as SessionId;
     }
   }
@@ -348,17 +366,14 @@ function validateRecordFields(
   }
 
   if (typeof value.networkName !== 'string') {
-    errors.push({ field: 'networkName', message: 'must be a non-empty normalized name' });
-    networkName = '' as NormalizedName;
+    errors.push({ field: 'networkName', message: 'must be a canonical network name' });
+    networkName = '' as RegistryNetworkName;
   } else {
     try {
-      networkName = asNormalizedName(value.networkName);
-      if (networkName !== value.networkName) {
-        errors.push({ field: 'networkName', message: 'must already be normalized' });
-      }
+      networkName = canonicalNetworkName(value.networkName);
     } catch {
-      errors.push({ field: 'networkName', message: 'must be a non-empty normalized name' });
-      networkName = '' as NormalizedName;
+      errors.push({ field: 'networkName', message: 'must be a canonical network name' });
+      networkName = '' as RegistryNetworkName;
     }
   }
 
@@ -710,7 +725,7 @@ function currentUid(options: RegistryPathOptions): number | undefined {
 }
 
 function modeIs(mode: number, expected: number): boolean {
-  return (mode & 0o777) === expected;
+  return (mode & 0o7777) === expected;
 }
 
 function isPrivateDirectoryStats(
@@ -782,7 +797,10 @@ export async function ensurePrivateDirectory(
     if (uid !== undefined && stats.uid !== uid) {
       throw new RegistryPathError(`registry directory is not owned by the current user: ${target}`);
     }
-    if (created || !modeIs(stats.mode, PRIVATE_DIRECTORY_MODE)) {
+    if (!modeIs(stats.mode, PRIVATE_DIRECTORY_MODE)) {
+      if (!created) {
+        throw new RegistryPathError(`registry directory is not private: ${target}`);
+      }
       await chmod(target, PRIVATE_DIRECTORY_MODE);
     }
     const tightened = await lstat(target);
@@ -819,15 +837,15 @@ async function ensurePrivateFile(file: string, options: RegistryPathOptions): Pr
     if (uid !== undefined && stats.uid !== uid) {
       throw new RegistryPathError(`registry record is not owned by the current user: ${file}`);
     }
-    await chmod(file, PRIVATE_FILE_MODE);
-    const tightened = await lstat(file);
-    if (!modeIs(tightened.mode, PRIVATE_FILE_MODE)) {
+    if (!modeIs(stats.mode, PRIVATE_FILE_MODE)) {
       throw new RegistryPathError(`registry record is not private: ${file}`);
     }
   }
 }
 
 const writeLocks = new Map<string, Promise<unknown>>();
+const REGISTRY_LOCK_RETRY_DELAY_MS = 10;
+const REGISTRY_LOCK_STALE_AFTER_MS = 2 * 60_000;
 
 async function withWriteLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
   const previous = writeLocks.get(key) ?? Promise.resolve();
@@ -840,6 +858,187 @@ async function withWriteLock<T>(key: string, operation: () => Promise<T>): Promi
       writeLocks.delete(key);
     }
   }
+}
+
+interface RegistryLockOwner {
+  readonly pid: number;
+  readonly token: string;
+  readonly acquiredAt: number;
+}
+
+function parseRegistryLockOwner(source: string): RegistryLockOwner | undefined {
+  try {
+    const value = JSON.parse(source) as unknown;
+    if (!isRecord(value)) {
+      return undefined;
+    }
+    const pid = value.pid;
+    const token = value.token;
+    const acquiredAt = value.acquiredAt;
+    if (
+      typeof pid !== 'number' ||
+      !Number.isSafeInteger(pid) ||
+      pid <= 0 ||
+      typeof token !== 'string' ||
+      token.length === 0 ||
+      typeof acquiredAt !== 'number' ||
+      !Number.isFinite(acquiredAt)
+    ) {
+      return undefined;
+    }
+    return { pid, token, acquiredAt };
+  } catch {
+    return undefined;
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) === 'EPERM';
+  }
+}
+
+function waitForRegistryLock(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, REGISTRY_LOCK_RETRY_DELAY_MS);
+  });
+}
+
+async function reclaimStaleRegistryLock(lockPath: string): Promise<void> {
+  let firstStats;
+  try {
+    firstStats = await lstat(lockPath);
+  } catch (error) {
+    if (isMissing(error)) {
+      return;
+    }
+    throw error;
+  }
+  if (!firstStats.isFile() || firstStats.isSymbolicLink()) {
+    return;
+  }
+  if (Date.now() - firstStats.mtimeMs < REGISTRY_LOCK_STALE_AFTER_MS) {
+    return;
+  }
+
+  let owner: RegistryLockOwner | undefined;
+  try {
+    owner = parseRegistryLockOwner(await readFile(lockPath, 'utf8'));
+  } catch (error) {
+    if (!isMissing(error)) {
+      throw error;
+    }
+  }
+  if (owner && processIsAlive(owner.pid)) {
+    return;
+  }
+
+  let secondStats;
+  try {
+    secondStats = await lstat(lockPath);
+  } catch (error) {
+    if (isMissing(error)) {
+      return;
+    }
+    throw error;
+  }
+  if (snapshotStat(firstStats) !== snapshotStat(secondStats)) {
+    return;
+  }
+  await unlink(lockPath).catch((error: unknown) => {
+    if (!isMissing(error)) {
+      throw error;
+    }
+  });
+}
+
+async function acquireRegistryRecordLock(recordPath: string): Promise<() => Promise<void>> {
+  const lockPath = `${recordPath}.lock`;
+  const owner: RegistryLockOwner = {
+    pid: process.pid,
+    token: randomBytes(16).toString('hex'),
+    acquiredAt: Date.now(),
+  };
+  const serializedOwner = JSON.stringify(owner);
+
+  while (true) {
+    let created = false;
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(lockPath, 'wx', PRIVATE_FILE_MODE);
+      created = true;
+      await handle.writeFile(serializedOwner, 'utf8');
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      return async () => {
+        let firstStats;
+        try {
+          firstStats = await lstat(lockPath);
+        } catch (error) {
+          if (isMissing(error)) {
+            return;
+          }
+          throw error;
+        }
+        let source: string;
+        try {
+          source = await readFile(lockPath, 'utf8');
+        } catch (error) {
+          if (isMissing(error)) {
+            return;
+          }
+          throw error;
+        }
+        let secondStats;
+        try {
+          secondStats = await lstat(lockPath);
+        } catch (error) {
+          if (isMissing(error)) {
+            return;
+          }
+          throw error;
+        }
+        if (
+          snapshotStat(firstStats) !== snapshotStat(secondStats) ||
+          parseRegistryLockOwner(source)?.token !== owner.token
+        ) {
+          return;
+        }
+        await unlink(lockPath).catch((error: unknown) => {
+          if (!isMissing(error)) {
+            throw error;
+          }
+        });
+      };
+    } catch (error) {
+      if (handle) {
+        await handle.close().catch(() => undefined);
+      }
+      if (created) {
+        await unlink(lockPath).catch(() => undefined);
+      }
+      if (errorCode(error) !== 'EEXIST') {
+        throw error;
+      }
+      await reclaimStaleRegistryLock(lockPath);
+      await waitForRegistryLock();
+    }
+  }
+}
+
+function withRegistryRecordLock<T>(recordPath: string, operation: () => Promise<T>): Promise<T> {
+  return withWriteLock(recordPath, async () => {
+    const release = await acquireRegistryRecordLock(recordPath);
+    try {
+      return await operation();
+    } finally {
+      await release();
+    }
+  });
 }
 
 async function openUniqueTemporaryFile(
@@ -877,7 +1076,7 @@ export async function publishRuntimeRecordAtomically(
   const paths = await ensureRegistryPaths(canonical.roomId, options);
   const target = safeRuntimePath(paths.recordsDirectory, canonical.runtimeId);
   const payload = JSON.stringify(canonical);
-  return withWriteLock(target, async () => {
+  return withRegistryRecordLock(target, async () => {
     let temporaryPath: string | undefined;
     let handle: FileHandle | undefined;
     try {
@@ -962,6 +1161,19 @@ async function readCandidate(
     const bytes = await readFile(path);
     source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
   } catch {
+    return undefined;
+  }
+  let sourceStats;
+  try {
+    sourceStats = await lstat(path);
+  } catch {
+    return undefined;
+  }
+  if (
+    !isPrivateFileStats(sourceStats, options) ||
+    sourceStats.size > (options.maxBytes ?? MAX_RUNTIME_RECORD_BYTES) ||
+    snapshotStat(sourceStats) !== snapshotStat(stats)
+  ) {
     return undefined;
   }
   const result = parseRuntimeRecordJson(source, {
@@ -1072,8 +1284,7 @@ async function currentStat(path: string): Promise<string | undefined> {
     return undefined;
   }
 }
-
-async function removeCandidateIfUnchanged(
+async function removeCandidateIfUnchangedUnlocked(
   paths: RegistryPaths,
   candidate: CandidateRecord,
 ): Promise<boolean> {
@@ -1095,6 +1306,15 @@ async function removeCandidateIfUnchanged(
   }
 }
 
+async function removeCandidateIfUnchanged(
+  paths: RegistryPaths,
+  candidate: CandidateRecord,
+): Promise<boolean> {
+  return withRegistryRecordLock(candidate.path, () =>
+    removeCandidateIfUnchangedUnlocked(paths, candidate),
+  );
+}
+
 function matchesCleanupExpectation(
   record: RuntimeRecord,
   options: RuntimeRecordCleanupOptions,
@@ -1110,7 +1330,7 @@ function matchesCleanupExpectation(
   }
   if (options.expectedNetworkName !== undefined) {
     try {
-      if (record.networkName !== asNormalizedName(options.expectedNetworkName)) {
+      if (record.networkName !== canonicalNetworkName(options.expectedNetworkName)) {
         return false;
       }
     } catch {
@@ -1135,6 +1355,7 @@ export async function removeRuntimeRecord(
     return false;
   }
   const fileName = fileNameFor(validatedRuntimeId);
+  const target = safeRuntimePath(paths.recordsDirectory, validatedRuntimeId);
   const first = await readCandidate(paths, fileName, {
     ...options,
     requireUnexpired: false,
@@ -1146,18 +1367,21 @@ export async function removeRuntimeRecord(
   ) {
     return false;
   }
-  const second = await readCandidate(paths, fileName, {
-    ...options,
-    requireUnexpired: false,
+  return withRegistryRecordLock(target, async () => {
+    const second = await readCandidate(paths, fileName, {
+      ...options,
+      requireUnexpired: false,
+    });
+    if (
+      !second ||
+      second.stat !== first.stat ||
+      second.record.runtimeId !== validatedRuntimeId ||
+      !matchesCleanupExpectation(second.record, options)
+    ) {
+      return false;
+    }
+    return removeCandidateIfUnchangedUnlocked(paths, second);
   });
-  if (
-    !second ||
-    second.record.runtimeId !== validatedRuntimeId ||
-    !matchesCleanupExpectation(second.record, options)
-  ) {
-    return false;
-  }
-  return removeCandidateIfUnchanged(paths, second);
 }
 
 export const cleanupRuntimeRecord = removeRuntimeRecord;
@@ -1193,7 +1417,6 @@ export function isDefinitiveEndpointFailure(
     kind === 'not-found' ||
     kind === 'refused' ||
     kind === 'connection-refused' ||
-    kind === 'unavailable' ||
     kind === 'definitive' ||
     kind === 'missing-endpoint'
   );
@@ -1280,7 +1503,7 @@ export class RuntimeRegistry {
   public readonly runtimeId: RuntimeId;
   public readonly sessionId: SessionId;
   public readonly roomId: RoomId;
-  public readonly networkName: NormalizedName;
+  public readonly networkName: RegistryNetworkName;
   public readonly endpoint: string;
   public readonly ttlMs: number;
   public readonly renewalIntervalMs: number;
@@ -1304,16 +1527,14 @@ export class RuntimeRegistry {
       throw new RuntimeRegistryError('networkName is required');
     }
     try {
-      const normalized = asNormalizedName(networkName);
-      if (normalized !== networkName) {
-        throw new RuntimeRegistryError('networkName must already be normalized');
-      }
-      this.networkName = normalized;
+      this.networkName = canonicalNetworkName(networkName);
     } catch (error) {
       if (error instanceof RuntimeRegistryError) {
         throw error;
       }
-      throw new RuntimeRegistryError('networkName must be a valid normalized name');
+      throw new RuntimeRegistryError(
+        'networkName must be a canonical base or published network name',
+      );
     }
     try {
       this.endpoint = assertText(options.endpoint, 'endpoint', MAX_ENDPOINT_LENGTH);
