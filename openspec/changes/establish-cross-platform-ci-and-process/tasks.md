@@ -29,4 +29,4 @@
 
 - [x] 5.1 Keep process helpers and fixtures under the established `tests/` boundaries so later protocol, registry, transport, and Pi tests can import them without importing final protocol code.
 - [x] 5.2 Update test-directory documentation with fixture control conventions, cleanup expectations, and the distinction between Node harness tests and future real-Pi integration tests.
-- [ ] 5.3 Run formatting, linting, type checking, unit/integration/process tests, and build locally; resolve Linux, macOS, and Windows-specific failures surfaced by CI.
+- [x] 5.3 Run formatting, linting, type checking, unit/integration/process tests, and build locally; resolve Linux, macOS, and Windows-specific failures surfaced by CI.
