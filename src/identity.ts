@@ -1,15 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
-/**
- * The logical identity of a Pi conversation. Pi supplies this value through its
- * session manager; this module deliberately does not create or persist it.
- */
-export type SessionId = string;
+import { asRuntimeId, asSessionId, type RuntimeId, type SessionId } from './protocol/messages.js';
+import { isRoomId, roomStorageKey, type RoomId } from './room.js';
 
-/**
- * The identity of one live extension runtime and its routing endpoint.
- */
-export type RuntimeId = string;
+export type { RuntimeId, SessionId } from './protocol/messages.js';
 
 /**
  * Identity carried by protocol envelopes and discovery records.
@@ -28,16 +22,16 @@ export type RuntimeIdentity = SessionRuntimeIdentity;
 
 /** A native Pi session-manager shape, kept local so this module has no Pi dependency. */
 export interface SessionManagerLike {
-  getSessionId(): SessionId;
+  getSessionId(): string;
 }
 
 /** Factory seam for deterministic lifecycle tests. */
-export type RuntimeIdFactory = () => RuntimeId;
+export type RuntimeIdFactory = () => string;
 
 /** A full machine-actionable runtime address, scoped to an exact room. */
 export interface RuntimeAddress {
   readonly runtimeId: RuntimeId;
-  readonly roomId: string;
+  readonly roomId: RoomId;
 }
 
 /** Error raised when an identity input is empty or contains unsafe control data. */
@@ -63,6 +57,18 @@ function requireIdentifier(value: string, field: string): string {
   return value;
 }
 
+function requireSessionId(value: string): SessionId {
+  return asSessionId(requireIdentifier(value, 'sessionId'));
+}
+
+function requireRuntimeId(value: string): RuntimeId {
+  return asRuntimeId(requireIdentifier(value, 'runtimeId'));
+}
+
+function isSafeIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && !CONTROL_CHARACTER_PATTERN.test(value);
+}
+
 /** Return whether a value has the UUIDv4 representation used by runtime IDs. */
 export function isUuidV4(value: unknown): value is RuntimeId {
   return typeof value === 'string' && UUID_V4_PATTERN.test(value);
@@ -70,7 +76,7 @@ export function isUuidV4(value: unknown): value is RuntimeId {
 
 /** Validate and create one runtime ID using the supplied (or cryptographic) factory. */
 export function createRuntimeId(factory: RuntimeIdFactory = randomUUID): RuntimeId {
-  return requireIdentifier(factory(), 'runtimeId');
+  return requireRuntimeId(factory());
 }
 
 /**
@@ -81,10 +87,10 @@ export function createRuntimeId(factory: RuntimeIdFactory = randomUUID): Runtime
  * the logical identity while generating a new runtime ID.
  */
 export function createRuntimeIdentity(
-  sessionId: SessionId,
+  sessionId: string,
   runtimeIdFactory: RuntimeIdFactory = randomUUID,
 ): SessionRuntimeIdentity {
-  const stableSessionId = requireIdentifier(sessionId, 'sessionId');
+  const stableSessionId = requireSessionId(sessionId);
   const runtimeId = createRuntimeId(runtimeIdFactory);
 
   return Object.freeze({ sessionId: stableSessionId, runtimeId });
@@ -108,25 +114,19 @@ export function isSessionRuntimeIdentity(value: unknown): value is SessionRuntim
   }
 
   const candidate = value as { sessionId?: unknown; runtimeId?: unknown };
-  return (
-    typeof candidate.sessionId === 'string' &&
-    typeof candidate.runtimeId === 'string' &&
-    candidate.sessionId.length > 0 &&
-    candidate.runtimeId.length > 0 &&
-    !CONTROL_CHARACTER_PATTERN.test(candidate.sessionId) &&
-    !CONTROL_CHARACTER_PATTERN.test(candidate.runtimeId)
-  );
+  return isSafeIdentifier(candidate.sessionId) && isSafeIdentifier(candidate.runtimeId);
 }
 
 /** Create an exact runtime address; the runtime UUID and room are both required for routing. */
 export function createRuntimeAddress(
   runtime: RuntimeId | SessionRuntimeIdentity,
-  roomId: string,
+  roomId: RoomId,
 ): RuntimeAddress {
-  const runtimeId = typeof runtime === 'string' ? runtime : runtime.runtimeId;
+  const runtimeId =
+    typeof runtime === 'string' ? requireRuntimeId(runtime) : requireRuntimeId(runtime.runtimeId);
   return Object.freeze({
-    runtimeId: requireIdentifier(runtimeId, 'runtimeId'),
-    roomId: requireIdentifier(roomId, 'roomId'),
+    runtimeId,
+    roomId: roomStorageKey(roomId),
   });
 }
 
@@ -137,19 +137,17 @@ export function isRuntimeAddress(value: unknown): value is RuntimeAddress {
   }
 
   const candidate = value as { runtimeId?: unknown; roomId?: unknown };
-  return (
-    typeof candidate.runtimeId === 'string' &&
-    typeof candidate.roomId === 'string' &&
-    candidate.runtimeId.length > 0 &&
-    candidate.roomId.length > 0 &&
-    !CONTROL_CHARACTER_PATTERN.test(candidate.runtimeId) &&
-    !CONTROL_CHARACTER_PATTERN.test(candidate.roomId)
-  );
+  return isSafeIdentifier(candidate.runtimeId) && isRoomId(candidate.roomId);
 }
 
 /** Exact comparison for machine-actionable runtime addresses. */
 export function runtimeAddressesEqual(left: RuntimeAddress, right: RuntimeAddress): boolean {
-  return left.runtimeId === right.runtimeId && left.roomId === right.roomId;
+  const leftRoomId = roomStorageKey(left.roomId);
+  const rightRoomId = roomStorageKey(right.roomId);
+  const leftRuntimeId = requireRuntimeId(left.runtimeId);
+  const rightRuntimeId = requireRuntimeId(right.runtimeId);
+
+  return leftRuntimeId === rightRuntimeId && leftRoomId === rightRoomId;
 }
 
 /** Alias emphasizing that a runtime address is the peer address. */
@@ -182,8 +180,8 @@ export class RuntimeIdentityLifecycle {
   }
 
   /** Start a runtime for the session ID read from Pi at `session_start`. */
-  start(sessionId: SessionId): SessionRuntimeIdentity {
-    const stableSessionId = requireIdentifier(sessionId, 'sessionId');
+  start(sessionId: string): SessionRuntimeIdentity {
+    const stableSessionId = requireSessionId(sessionId);
     let runtimeId = createRuntimeId(this.runtimeIdFactory);
 
     // A custom test factory may return a duplicate. Do not allow a lifecycle

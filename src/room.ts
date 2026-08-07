@@ -3,14 +3,18 @@ import { execFileSync } from 'node:child_process';
 import { isAbsolute, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 
+import { asRoomId, type RoomId } from './protocol/messages.js';
+
+export type { RoomId } from './protocol/messages.js';
+
 /** Room derivation sources are part of the hash domain and must not be mixed. */
 export type RoomSource = 'explicit' | 'git' | 'cwd';
 
 /** Compatibility input accepted by derivation helpers; `project` maps to `explicit`. */
 export type RoomSourceInput = RoomSource | 'project';
 
-/** Opaque, versioned, filesystem-safe room identity. */
-export type RoomId = string;
+/** A room storage key is the validated opaque room ID used as its registry path component. */
+export type RoomStorageKey = RoomId;
 
 /** A room identity plus the canonical value from which it was derived. */
 export interface RoomIdentity {
@@ -18,7 +22,7 @@ export interface RoomIdentity {
   readonly source: RoomSource;
   readonly value: string;
   /** Safe registry path component; it is deliberately the validated opaque room ID. */
-  readonly storageKey: string;
+  readonly storageKey: RoomStorageKey;
 }
 
 /** Local room-resolution options; no discovery, registry, or transport dependency is required. */
@@ -44,10 +48,10 @@ export class RoomInputError extends TypeError {
 /** Error used by routing/discovery callers when two room IDs differ exactly. */
 export class CrossRoomError extends Error {
   readonly code = 'cross_room' as const;
-  readonly expectedRoomId: string;
-  readonly actualRoomId: string;
+  readonly expectedRoomId: RoomId;
+  readonly actualRoomId: RoomId;
 
-  constructor(expectedRoomId: string, actualRoomId: string) {
+  constructor(expectedRoomId: RoomId, actualRoomId: RoomId) {
     super('room identity does not match');
     this.name = 'CrossRoomError';
     this.expectedRoomId = expectedRoomId;
@@ -133,6 +137,14 @@ export function isRoomId(value: unknown): value is RoomId {
   return typeof value === 'string' && ROOM_ID_PATTERN.test(value);
 }
 
+function requireValidRoomId(value: unknown): RoomId {
+  if (!isRoomId(value)) {
+    throw new RoomInputError('roomId must be a valid r1 room ID');
+  }
+
+  return value;
+}
+
 function requireRoomValue(value: string, field: string): string {
   return requireString(value, field);
 }
@@ -142,7 +154,7 @@ function roomIdFromSource(source: RoomSource, value: string): RoomId {
     .update(`${source}\0${value}`, 'utf8')
     .digest('hex')
     .slice(0, ROOM_ID_HEX_LENGTH);
-  return `${ROOM_ID_PREFIX}${digest}`;
+  return requireValidRoomId(asRoomId(`${ROOM_ID_PREFIX}${digest}`));
 }
 
 /**
@@ -177,7 +189,7 @@ export function deriveRoomId(
 
 function makeRoomIdentity(source: RoomSource, value: string): RoomIdentity {
   const roomId = roomIdFromSource(source, value);
-  return Object.freeze({ roomId, source, value, storageKey: roomId });
+  return Object.freeze({ roomId, source, value, storageKey: roomStorageKey(roomId) });
 }
 
 /** Derive a room identity from a source and canonical value. */
@@ -323,8 +335,14 @@ export const resolveRoom = resolveRoomIdentity;
 
 export type RoomReference = RoomId | Pick<RoomIdentity, 'roomId'>;
 
-function roomIdOf(reference: RoomReference): string {
-  return typeof reference === 'string' ? reference : reference.roomId;
+function roomIdOf(reference: RoomReference): RoomId {
+  const candidate =
+    typeof reference === 'string'
+      ? reference
+      : reference !== null && typeof reference === 'object'
+        ? reference.roomId
+        : undefined;
+  return requireValidRoomId(candidate);
 }
 
 /** Exact room comparison: no normalization, prefix matching, or cross-room fallback. */
@@ -349,10 +367,6 @@ export function assertSameRoom(expected: RoomReference, actual: RoomReference): 
 export const requireSameRoom = assertSameRoom;
 
 /** Validate a room ID before using it as a registry path component. */
-export function roomStorageKey(roomId: RoomId): string {
-  if (!isRoomId(roomId)) {
-    throw new RoomInputError('roomId must be a valid r1 room ID');
-  }
-
-  return roomId;
+export function roomStorageKey(roomId: RoomId): RoomStorageKey {
+  return requireValidRoomId(roomId);
 }
