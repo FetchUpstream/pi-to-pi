@@ -5,6 +5,7 @@ import {
   buildNetworkName,
   createInitialPeerName,
   isPublishedNetworkName,
+  isRuntimeNameSuffix,
   normalizeExplicitPeerName,
   normalizePeerLookupName,
   normalizePeerName,
@@ -16,6 +17,7 @@ import {
 } from '../../src/discovery/naming.js';
 import {
   AmbiguousPeerNameError,
+  CrossRoomPeerError,
   lookupPeerByName,
   lookupPeerByRuntimeId,
   resolvePeerTarget,
@@ -58,6 +60,11 @@ describe('canonical runtime peer naming', () => {
     expect(runtimeNameSuffix(RUNTIME_A)).toBe('qnv6');
     expect(runtimeNameSuffix(RUNTIME_A)).toBe(runtimeNameSuffix(RUNTIME_A));
     expect(runtimeNameSuffix(RUNTIME_A)).not.toBe(runtimeNameSuffix(RUNTIME_B));
+    expect(isRuntimeNameSuffix(runtimeNameSuffix(RUNTIME_A))).toBe(true);
+    expect(runtimeNameSuffix(RUNTIME_A)).toMatch(/^[0-9a-hjkmnp-tv-z]{4}$/u);
+    expect(() => runtimeNameSuffix('ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF')).toThrow(
+      'canonical lowercase',
+    );
 
     const networkName = buildNetworkName('Planner', RUNTIME_A);
     expect(networkName).toBe('planner-qnv6');
@@ -145,6 +152,14 @@ describe('same-room collision-safe peer lookup', () => {
       expect(found.address.runtimeId).toBe(RUNTIME_A);
       expect(found.address.roomId).toBe(ROOM_A);
     }
+    expect(resolvePeerTargetOrThrow(RUNTIME_A, ROOM_A, [plannerA])).toMatchObject({
+      address: { runtimeId: RUNTIME_A, roomId: ROOM_A },
+      record: plannerA,
+    });
+
+    expect(() => resolvePeerTargetOrThrow(RUNTIME_C, ROOM_A, [otherRoom])).toThrow(
+      CrossRoomPeerError,
+    );
 
     const isolated = resolvePeerTarget(RUNTIME_C, ROOM_A, [plannerA, otherRoom]);
     expect(isolated.kind).toBe('cross-room');
