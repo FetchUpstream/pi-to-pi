@@ -254,6 +254,58 @@ describe('correlated inbound delivery', () => {
     }
   });
 
+  it('rejects replies until an in-flight delivery completes', async () => {
+    const fixture = await createPersistedPiSessionFixture();
+    const correlation = createRequestCorrelation();
+    const requestId = 'opaque/request-in-flight-reply';
+    const originalSession = fixture.session;
+    const originalSendCustomMessage = originalSession.sendCustomMessage.bind(originalSession);
+    const sendStarted = deferred<void>();
+    const releaseSend = deferred<void>();
+    const barrierSession = new Proxy(originalSession, {
+      get(target, property, receiver) {
+        if (property !== 'sendCustomMessage') {
+          return Reflect.get(target, property, receiver);
+        }
+        return async (...args: Parameters<typeof originalSession.sendCustomMessage>) => {
+          await originalSendCustomMessage(...args);
+          sendStarted.resolve();
+          await releaseSend.promise;
+        };
+      },
+    });
+    const deliveryFixture = {
+      runtime: fixture.runtime,
+      session: barrierSession,
+      sessionId: barrierSession.sessionId,
+    } as unknown as PersistedFixture;
+    correlation.accept(deliveryFixture, requestId);
+    let delivery: Promise<void> | undefined;
+    try {
+      delivery = correlation.deliver(deliveryFixture, requestId, 'in-flight request body');
+      await sendStarted.promise;
+      expect(correlation.events).toEqual([{ type: 'registered', requestId }]);
+      expect(() => correlation.reply(deliveryFixture, requestId, 'premature reply')).toThrow(
+        'Cannot reply while delivery is in flight: opaque/request-in-flight-reply',
+      );
+      expect(correlation.state(requestId)).toBe('accepted');
+      expect(correlation.events).toEqual([{ type: 'registered', requestId }]);
+      releaseSend.resolve();
+      await delivery;
+      expect(correlation.events).toEqual([
+        { type: 'registered', requestId },
+        { type: 'delivered', requestId, stateAtDelivery: 'accepted' },
+      ]);
+      expect(correlation.reply(deliveryFixture, requestId, 'settled reply')).toEqual({
+        requestId,
+        content: 'settled reply',
+      });
+      expect(correlation.state(requestId)).toBe('completed');
+    } finally {
+      releaseSend.resolve();
+      await disposeFixture(fixture, delivery);
+    }
+  });
   it('binds accepted request state to the session and runtime identity', async () => {
     const fixture = await createPersistedPiSessionFixture();
     const correlation = createRequestCorrelation();
@@ -315,6 +367,14 @@ describe('correlated inbound delivery', () => {
       const originalSessionId = fixture.sessionId;
       await fixture.newSession();
       expect(fixture.sessionId).not.toBe(originalSessionId);
+      expect(() =>
+        correlation.reply(deliveryFixture, requestId, 'premature replacement reply'),
+      ).toThrow('Cannot reply while delivery is in flight: opaque/request-in-flight-replacement');
+      expect(() => correlation.reply(fixture, requestId, 'stale runtime reply')).toThrow(
+        'Request ID belongs to another Pi session/runtime: opaque/request-in-flight-replacement',
+      );
+      expect(correlation.events).toEqual([{ type: 'registered', requestId }]);
+      expect(correlation.state(requestId)).toBe('accepted');
       activeSession = fixture.session;
       releaseSend.resolve();
       await expect(delivery).rejects.toThrow(

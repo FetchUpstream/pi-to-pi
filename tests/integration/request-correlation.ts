@@ -123,6 +123,9 @@ export function createRequestCorrelation(): RequestCorrelation {
         throw new Error(`Unknown request ID: ${requestId}`);
       }
       assertRequestBelongsToFixture(requestId, request, fixture);
+      if (deliveriesInFlight.has(requestId)) {
+        throw new Error(`Cannot reply while delivery is in flight: ${requestId}`);
+      }
       if (request.state !== 'accepted') {
         throw new Error(`Cannot reply completed request ID: ${requestId}`);
       }
