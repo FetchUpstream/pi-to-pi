@@ -24,6 +24,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 class HangingChild extends EventEmitter {
+  pid: number | undefined = 101;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   stdin = { destroyed: false };
@@ -41,6 +42,7 @@ class HangingChild extends EventEmitter {
 }
 
 class NullStdioExitedChild extends EventEmitter {
+  pid: number | undefined = 202;
   exitCode: number | null = 3;
   signalCode: NodeJS.Signals | null = null;
   stdin = null;
@@ -49,6 +51,7 @@ class NullStdioExitedChild extends EventEmitter {
 }
 
 class NullCloseStateChild extends EventEmitter {
+  pid: number | undefined = 303;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   stdin = null;
@@ -61,7 +64,26 @@ class NullCloseStateChild extends EventEmitter {
     return true;
   }
 }
+class KillErrorChild extends EventEmitter {
+  pid: number | undefined = 404;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  stdin = null;
+  stdout = null;
+  stderr = null;
+  readonly signals: NodeJS.Signals[] = [];
 
+  kill(signal: NodeJS.Signals): boolean {
+    this.signals.push(signal);
+    queueMicrotask(() => {
+      this.emit('error', new Error('later kill error'));
+      this.emit('error', new Error('second later kill error'));
+      this.emit('close', null, null);
+    });
+    this.emit('error', new Error('synchronous kill error'));
+    throw new Error('synchronous kill throw');
+  }
+}
 describe('local IPC spike test helpers', () => {
   it('represents phase deadlines as finite absolute timestamps', () => {
     const deadline = createPhaseDeadline('read', 100, 1_000);
@@ -214,6 +236,18 @@ describe('local IPC spike test helpers', () => {
     expect(exit.timedOut).not.toBe(true);
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   }, 5_000);
+  it('observes synchronous and later kill errors before close', async () => {
+    const child = new KillErrorChild();
+    await expect(
+      cleanupChildProcess(child as unknown as ChildProcess, {
+        timeoutMs: 100,
+        forceWaitMs: 10,
+      }),
+    ).rejects.toMatchObject({
+      message: 'synchronous kill error',
+    });
+    expect(child.signals).toEqual(['SIGTERM']);
+  }, 5_000);
 
   it('waits for close with null stdio after exit metadata is available', async () => {
     const child = new NullStdioExitedChild();
@@ -272,6 +306,7 @@ describe('local IPC spike test helpers', () => {
     );
     child.emit('close', null, null);
     await expect(observed).resolves.toEqual({ code: null, signal: null });
+    child.exitCode = 7;
 
     await expect(
       cleanupChildProcess(child as unknown as ChildProcess, {
@@ -280,6 +315,26 @@ describe('local IPC spike test helpers', () => {
       }),
     ).resolves.toEqual({ code: null, signal: null });
     expect(child.signals).toEqual([]);
+  });
+  it('does not let a null/null close state skip a reused child generation', async () => {
+    const child = new NullCloseStateChild();
+    const observed = waitForChildExit(
+      child as unknown as ChildProcess,
+      createPhaseDeadline('child-exit', 100),
+    );
+    child.emit('close', null, null);
+    await expect(observed).resolves.toEqual({ code: null, signal: null });
+
+    child.pid = 304;
+    child.emit('spawn');
+    const pending = cleanupChildProcess(child as unknown as ChildProcess, {
+      timeoutMs: 100,
+      forceWaitMs: 10,
+    });
+    expect(child.signals).toEqual(['SIGTERM']);
+
+    child.emit('close', 0, null);
+    await expect(pending).resolves.toEqual({ code: 0, signal: null });
   });
   it('defers child errors until close so diagnostics include close state', async () => {
     const child = new NullStdioExitedChild();
@@ -357,6 +412,7 @@ describe('local IPC spike test helpers', () => {
     child.emit('close', 3, null);
     await expect(observed).resolves.toEqual({ code: 3, signal: null });
 
+    child.pid = 102;
     child.exitCode = null;
     const pending = cleanupChildProcess(child as unknown as ChildProcess, {
       timeoutMs: 100,

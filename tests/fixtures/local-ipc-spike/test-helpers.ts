@@ -401,32 +401,117 @@ function childExitState(child: ChildProcess): ChildExit | undefined {
   return undefined;
 }
 
-function sameChildExit(left: ChildExit, right: ChildExit): boolean {
-  return left.code === right.code && left.signal === right.signal;
+interface ChildCloseObservationState {
+  generation: symbol;
+  child: ChildProcess;
+  pid: number | undefined;
+  closed: boolean;
+  result: ChildExit | undefined;
+  pendingError: Error | undefined;
+  completion: Promise<ChildExit>;
+  onClose: (code: number | null, signal: NodeJS.Signals | null) => void;
+  onError: (error: unknown) => void;
+  onSpawn: () => void;
 }
 
-const childCloseStates = new WeakMap<ChildProcess, ChildExit>();
+const childCloseStates = new WeakMap<ChildProcess, ChildCloseObservationState>();
+
+function createChildCloseObservation(child: ChildProcess): ChildCloseObservationState {
+  let resolveCompletion: (result: ChildExit) => void = () => undefined;
+  let rejectCompletion: (error: unknown) => void = () => undefined;
+  const observation = {} as ChildCloseObservationState;
+  const completion = new Promise<ChildExit>((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  void completion.catch(() => undefined);
+  observation.generation = Symbol('child-close-generation');
+  observation.child = child;
+  observation.pid = child.pid;
+  observation.closed = false;
+  observation.result = undefined;
+  observation.pendingError = undefined;
+  observation.completion = completion;
+  observation.onClose = (code, signal): void => {
+    if (observation.closed) {
+      return;
+    }
+    observation.closed = true;
+    observation.result = { code, signal };
+    child.removeListener('error', observation.onError);
+    if (observation.pendingError !== undefined) {
+      rejectCompletion(observation.pendingError);
+    } else {
+      resolveCompletion(observation.result);
+    }
+  };
+  observation.onError = (error): void => {
+    if (observation.pendingError === undefined) {
+      observation.pendingError = errorFromUnknown(error);
+    }
+  };
+  observation.onSpawn = (): void => {
+    if (observation.closed) {
+      if (childCloseStates.get(child)?.generation === observation.generation) {
+        childCloseStates.delete(child);
+      }
+      child.removeListener('spawn', observation.onSpawn);
+      return;
+    }
+    observation.pid = child.pid;
+  };
+  return observation;
+}
+
+function disposeChildCloseObservation(observation: ChildCloseObservationState): void {
+  if (childCloseStates.get(observation.child)?.generation === observation.generation) {
+    childCloseStates.delete(observation.child);
+  }
+  observation.child.removeListener('error', observation.onError);
+  observation.child.removeListener('close', observation.onClose);
+  observation.child.removeListener('spawn', observation.onSpawn);
+}
+
+function ensureChildCloseObservation(child: ChildProcess): ChildCloseObservationState {
+  let observation = childCloseStates.get(child);
+  if (observation !== undefined) {
+    if (observation.closed && observation.pid !== child.pid) {
+      disposeChildCloseObservation(observation);
+      observation = undefined;
+    } else {
+      if (!observation.closed) {
+        observation.pid = child.pid;
+      }
+      return observation;
+    }
+  }
+  observation = createChildCloseObservation(child);
+  childCloseStates.set(child, observation);
+  child.on('error', observation.onError);
+  child.once('close', observation.onClose);
+  child.on('spawn', observation.onSpawn);
+  return observation;
+}
 
 function observedChildCloseState(child: ChildProcess): ChildExit | undefined {
-  const cachedClose = childCloseStates.get(child);
-  if (cachedClose === undefined) {
+  const observation = childCloseStates.get(child);
+  if (observation === undefined || !observation.closed || observation.result === undefined) {
     return undefined;
   }
-  const currentExit = childExitState(child);
-  // A close event can legitimately report (null, null) before ChildProcess exit
-  // metadata is populated; preserve that close-gated state for diagnostics and cleanup.
-  if (currentExit === undefined) {
-    if (cachedClose.code === null && cachedClose.signal === null) {
-      return cachedClose;
-    }
-    childCloseStates.delete(child);
+  // `closed` and the generation token are lifecycle state, not exit metadata.
+  // A changed pid identifies a reused child and retires the old observation;
+  // post-close updates to exitCode/signalCode do not invalidate a real close.
+  if (observation.pid !== child.pid) {
+    disposeChildCloseObservation(observation);
     return undefined;
   }
-  if (!sameChildExit(cachedClose, currentExit)) {
-    childCloseStates.delete(child);
-    return undefined;
+  return observation.result;
+}
+
+function recordChildError(observation: ChildCloseObservationState, error: unknown): void {
+  if (!observation.closed && observation.pendingError === undefined) {
+    observation.pendingError = errorFromUnknown(error);
   }
-  return cachedClose;
 }
 
 /** Wait for child close using one absolute, bounded deadline. */
@@ -435,42 +520,16 @@ export function waitForChildExit(
   deadline: Deadline = createPhaseDeadline('child-exit', DEFAULT_PHASE_TIMEOUT_MS),
   signal?: AbortSignal,
 ): Promise<ChildExit> {
-  const closed = observedChildCloseState(child);
-  if (closed !== undefined) {
-    return Promise.resolve(closed);
+  const observation = ensureChildCloseObservation(child);
+  if (observation.closed && observation.result !== undefined) {
+    if (observation.pendingError !== undefined) {
+      return Promise.reject(observation.pendingError);
+    }
+    return Promise.resolve(observation.result);
   }
 
   // `exit` fires before `close`; always wait for close so piped stdio is drained.
-
-  let onClose: ((code: number | null, closeSignal: NodeJS.Signals | null) => void) | undefined;
-  let onError: ((error: Error) => void) | undefined;
-  let pendingError: Error | undefined;
-  const completion = new Promise<ChildExit>((resolve, reject) => {
-    onClose = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
-      const result = { code, signal: closeSignal };
-      childCloseStates.set(child, result);
-      if (pendingError !== undefined) {
-        reject(pendingError);
-      } else {
-        resolve(result);
-      }
-    };
-    onError = (error: Error): void => {
-      pendingError = error;
-    };
-
-    child.once('close', onClose);
-    child.once('error', onError);
-  });
-
-  return withDeadline(completion, deadline, { signal }).finally(() => {
-    if (onClose !== undefined) {
-      child.removeListener('close', onClose);
-    }
-    if (onError !== undefined) {
-      child.removeListener('error', onError);
-    }
-  });
+  return withDeadline(observation.completion, deadline, { signal });
 }
 
 export interface ChildCleanupOptions {
@@ -483,7 +542,12 @@ export interface ChildCleanupOptions {
 }
 
 function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (observedChildCloseState(child) !== undefined) {
+  const observed = observedChildCloseState(child);
+  if (observed !== undefined) {
+    return;
+  }
+  const observation = ensureChildCloseObservation(child);
+  if (observation.closed) {
     return;
   }
   const currentExit = childExitState(child);
@@ -492,9 +556,10 @@ function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
   }
   try {
     child.kill(signal);
-  } catch {
-    // The process may have exited between the state check and kill(). A
-    // subsequent bounded wait determines whether it really remains alive.
+  } catch (error: unknown) {
+    // Record synchronous kill failures on the already-installed close observer;
+    // close-gated waiters will surface the first error without unhandled events.
+    recordChildError(observation, error);
   }
 }
 
@@ -513,28 +578,32 @@ export async function cleanupChildProcess(
   const forceWaitMs = options.forceWaitMs ?? DEFAULT_FORCE_KILL_WAIT_MS;
   validateDuration(forceWaitMs);
 
+  // Arm the close/error observer before issuing any teardown signal.
+  const initialWait = waitForChildExit(child, initialDeadline, options.signal);
   killChild(child, options.terminateSignal ?? 'SIGTERM');
 
   try {
-    return await waitForChildExit(child, initialDeadline, options.signal);
+    return await initialWait;
   } catch (error: unknown) {
     if (!(error instanceof PhaseDeadlineExceededError) && !(error instanceof AbortError)) {
       throw error;
     }
   }
 
-  killChild(child, options.forceSignal ?? 'SIGKILL');
   const forceDeadline = createPhaseDeadline('child-force-kill', forceWaitMs);
+  const forceWait = waitForChildExit(child, forceDeadline);
+  killChild(child, options.forceSignal ?? 'SIGKILL');
   try {
-    return await waitForChildExit(child, forceDeadline);
+    return await forceWait;
   } catch (error: unknown) {
     if (!(error instanceof PhaseDeadlineExceededError)) {
       throw error;
     }
-    killChild(child, options.forceSignal ?? 'SIGKILL');
     const closeDeadline = createPhaseDeadline('child-close', forceWaitMs);
+    const closeWait = waitForChildExit(child, closeDeadline);
+    killChild(child, options.forceSignal ?? 'SIGKILL');
     try {
-      const finalExit = await waitForChildExit(child, closeDeadline);
+      const finalExit = await closeWait;
       return { ...finalExit, timedOut: true };
     } catch (closeError: unknown) {
       if (!(closeError instanceof PhaseDeadlineExceededError)) {
@@ -620,6 +689,7 @@ export function captureChildDiagnostics(
   const maxErrorCount = options.maxErrorCount ?? DEFAULT_DIAGNOSTIC_ERROR_COUNT;
   validateDuration(maxOutputBytes);
   validateCount(maxErrorCount);
+  ensureChildCloseObservation(child);
 
   const stdout = new BoundedText(maxOutputBytes);
   const stderr = new BoundedText(maxOutputBytes);
@@ -633,15 +703,10 @@ export function captureChildDiagnostics(
       errors.push(errorFromUnknown(error));
     }
   };
-  const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
-    const result = { code, signal };
-    childCloseStates.set(child, result);
-  };
 
   child.stdout?.on('data', onStdout);
   child.stderr?.on('data', onStderr);
   child.on('error', onError);
-  child.once('close', onClose);
 
   const dispose = (): void => {
     if (disposed) {
@@ -651,7 +716,6 @@ export function captureChildDiagnostics(
     child.stdout?.off('data', onStdout);
     child.stderr?.off('data', onStderr);
     child.off('error', onError);
-    child.off('close', onClose);
   };
 
   return {
