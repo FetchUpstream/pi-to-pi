@@ -394,7 +394,24 @@ function childExitState(child: ChildProcess): ChildExit | undefined {
   return undefined;
 }
 
+function sameChildExit(left: ChildExit, right: ChildExit): boolean {
+  return left.code === right.code && left.signal === right.signal;
+}
+
 const childCloseStates = new WeakMap<ChildProcess, ChildExit>();
+
+function observedChildCloseState(child: ChildProcess): ChildExit | undefined {
+  const cachedClose = childCloseStates.get(child);
+  if (cachedClose === undefined) {
+    return undefined;
+  }
+  const currentExit = childExitState(child);
+  if (currentExit === undefined || !sameChildExit(cachedClose, currentExit)) {
+    childCloseStates.delete(child);
+    return undefined;
+  }
+  return cachedClose;
+}
 
 /** Wait for child close using one absolute, bounded deadline. */
 export function waitForChildExit(
@@ -402,7 +419,7 @@ export function waitForChildExit(
   deadline: Deadline = createPhaseDeadline('child-exit', DEFAULT_PHASE_TIMEOUT_MS),
   signal?: AbortSignal,
 ): Promise<ChildExit> {
-  const closed = childCloseStates.get(child);
+  const closed = observedChildCloseState(child);
   if (closed !== undefined) {
     return Promise.resolve(closed);
   }
@@ -445,14 +462,11 @@ export interface ChildCleanupOptions {
 }
 
 function killChild(child: ChildProcess, signal: NodeJS.Signals): void {
-  const cachedClose = childCloseStates.get(child);
+  if (observedChildCloseState(child) !== undefined) {
+    return;
+  }
   const currentExit = childExitState(child);
-  const closeMatchesExit =
-    cachedClose !== undefined &&
-    currentExit !== undefined &&
-    cachedClose.code === currentExit.code &&
-    cachedClose.signal === currentExit.signal;
-  if (closeMatchesExit || currentExit?.signal === signal) {
+  if (currentExit?.signal === signal) {
     return;
   }
   try {
@@ -505,7 +519,7 @@ export async function cleanupChildProcess(
       if (!(closeError instanceof PhaseDeadlineExceededError)) {
         throw closeError;
       }
-      const observedExit = childCloseStates.get(child) ?? childExitState(child);
+      const observedExit = observedChildCloseState(child) ?? childExitState(child);
       return {
         code: observedExit?.code ?? child.exitCode,
         signal: observedExit?.signal ?? child.signalCode,
@@ -589,7 +603,6 @@ export function captureChildDiagnostics(
   const stdout = new BoundedText(maxOutputBytes);
   const stderr = new BoundedText(maxOutputBytes);
   const errors: Error[] = [];
-  let exit: ChildExit | undefined;
   let disposed = false;
 
   const onStdout = (chunk: Buffer | string): void => stdout.append(chunk);
@@ -600,8 +613,8 @@ export function captureChildDiagnostics(
     }
   };
   const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
-    exit = { code, signal };
-    childCloseStates.set(child, exit);
+    const result = { code, signal };
+    childCloseStates.set(child, result);
   };
 
   child.stdout?.on('data', onStdout);
@@ -626,7 +639,7 @@ export function captureChildDiagnostics(
       stderr: stderr.value(),
       errors: [...errors],
       outputTruncated: stdout.truncated || stderr.truncated,
-      exit: exit ?? childExitState(child),
+      exit: observedChildCloseState(child),
     }),
     dispose,
   };

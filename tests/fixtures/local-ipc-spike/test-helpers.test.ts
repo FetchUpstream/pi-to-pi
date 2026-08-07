@@ -77,8 +77,8 @@ describe('local IPC spike test helpers', () => {
 
   it('chains timer delays for absolute deadlines beyond Node timer limits', async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(0);
-    const deadline = MAX_TIMER_DELAY_MS + 100;
+    vi.setSystemTime(10_000);
+    const deadline = 10_000 + MAX_TIMER_DELAY_MS + 100;
     const pending = withDeadline(new Promise<never>(() => undefined), deadline);
     let settled = false;
     pending.then(
@@ -170,6 +170,16 @@ describe('local IPC spike test helpers', () => {
     await expect(pending).resolves.toEqual({ code: 3, signal: null });
   });
 
+  it('does not report null-stdio exit metadata until close is observed', () => {
+    const child = new NullStdioExitedChild();
+    const capture = captureChildDiagnostics(child as unknown as ChildProcess);
+
+    expect(capture.snapshot().exit).toBeUndefined();
+
+    child.emit('close', 3, null);
+    expect(capture.snapshot().exit).toEqual({ code: 3, signal: null });
+    capture.dispose();
+  });
   it('waits for close after exit before cleanup returns', async () => {
     const child = new HangingChild();
     child.exitCode = 3;
@@ -207,6 +217,29 @@ describe('local IPC spike test helpers', () => {
       }),
     ).resolves.toEqual({ code: 3, signal: null });
     expect(child.signals).toEqual([]);
+  });
+
+  it('does not let stale close state skip cleanup for a reused child', async () => {
+    const child = new HangingChild();
+    child.exitCode = 3;
+    const observed = waitForChildExit(
+      child as unknown as ChildProcess,
+      createPhaseDeadline('child-exit', 100),
+    );
+
+    child.emit('close', 3, null);
+    await expect(observed).resolves.toEqual({ code: 3, signal: null });
+
+    child.exitCode = null;
+    const pending = cleanupChildProcess(child as unknown as ChildProcess, {
+      timeoutMs: 100,
+      forceWaitMs: 10,
+    });
+    expect(child.signals).toEqual(['SIGTERM']);
+
+    child.exitCode = 0;
+    child.emit('close', 0, null);
+    await expect(pending).resolves.toEqual({ code: 0, signal: null });
   });
 
   it('bounds post-kill cleanup when close never arrives', async () => {
