@@ -8,7 +8,7 @@ Run the complete fixture evidence matrix on the native runner with:
 
 ```sh
 node --version
-npx vitest run tests/fixtures/local-ipc tests/fixtures/local-ipc-spike --reporter=verbose
+npx vitest run tests/fixtures/local-ipc/endpoint.test.ts tests/fixtures/local-ipc-spike --reporter=verbose
 npm run typecheck
 npx eslint tests/fixtures/local-ipc tests/fixtures/local-ipc-spike
 ```

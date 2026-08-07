@@ -115,6 +115,13 @@ describe('raw node:net candidate unit boundaries', () => {
   });
   it('removes a quarantined socket when a replacement owns the endpoint', async () => {
     if (process.platform === 'win32') {
+      expect({
+        platform: process.platform,
+        limitation: 'POSIX quarantine replacement behavior requires a Linux or macOS runner',
+      }).toEqual({
+        platform: process.platform,
+        limitation: 'POSIX quarantine replacement behavior requires a Linux or macOS runner',
+      });
       return;
     }
     const endpoint = `/tmp/raw-net-replacement-${process.pid}-${Date.now()}.sock`;

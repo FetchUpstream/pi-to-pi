@@ -517,6 +517,36 @@ describe('raw node:net local IPC candidate', () => {
       await transport.close();
     }
   });
+  it('rejects trailing response bytes that arrive before completion settles', async () => {
+    const endpoint = createIpcEndpoint();
+    const response = encodeFrame(Buffer.from('{}'));
+    const sockets = new Set<Socket>();
+    let responseSocket: Socket | undefined;
+    const server = createServer({ allowHalfOpen: true }, (socket) => {
+      sockets.add(socket);
+      responseSocket = socket;
+      socket.on('error', () => undefined);
+      socket.once('close', () => sockets.delete(socket));
+      socket.once('data', () => socket.write(response));
+    });
+    await listenServer(server, endpoint);
+    const transport = new RawNetTransport({
+      validatePayload: () => {
+        if (responseSocket === undefined) {
+          throw new Error('response socket was not accepted');
+        }
+        responseSocket.write(Buffer.from([0]));
+      },
+    });
+    try {
+      await expect(transport.request(endpoint, Buffer.from('{}'))).rejects.toMatchObject({
+        code: 'trailing-data',
+      });
+    } finally {
+      await transport.close();
+      await closeServer(server, sockets);
+    }
+  });
 
   it('rejects malformed, truncated, trailing, and oversized responses', async () => {
     const cases: readonly { response: Buffer; code: string; maxPayloadBytes?: number }[] = [

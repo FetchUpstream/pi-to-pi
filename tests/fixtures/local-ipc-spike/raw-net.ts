@@ -599,8 +599,16 @@ function readResponse(
     let settling = false;
     let complete = false;
     let removeAbort = (): void => undefined;
+    let completionTimer: ReturnType<typeof setImmediate> | undefined;
 
+    const cancelCompletion = (): void => {
+      if (completionTimer !== undefined) {
+        clearImmediate(completionTimer);
+        completionTimer = undefined;
+      }
+    };
     const cleanup = (): void => {
+      cancelCompletion();
       socket.off('data', onData);
       socket.off('end', onEnd);
       socket.off('error', onError);
@@ -624,6 +632,19 @@ function readResponse(
       // be silently accepted after a successful frame.
       removeAbort();
       resolve(payload);
+    };
+    const scheduleSuccess = (payload: Buffer): void => {
+      if (settled || completionTimer !== undefined) {
+        return;
+      }
+      // Defer across a poll turn so trailing data can reject before success
+      // reaches the caller; the handle remains cancelable on failure.
+      completionTimer = setImmediate(() => {
+        completionTimer = setImmediate(() => {
+          completionTimer = undefined;
+          settleSuccess(payload);
+        });
+      });
     };
     const fail = (error: Error): void => {
       if (settled) {
@@ -651,7 +672,7 @@ function readResponse(
       }
       Promise.resolve(validation)
         .then(
-          () => settleSuccess(payload),
+          () => scheduleSuccess(payload),
           (error: unknown) => fail(protocolError(error)),
         )
         .catch((error: unknown) => fail(protocolError(error)));
