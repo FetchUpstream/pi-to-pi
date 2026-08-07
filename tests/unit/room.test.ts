@@ -88,6 +88,7 @@ describe('explicit project normalization', () => {
   it('rejects controls and labels that normalize to empty', () => {
     expect(() => normalizeProjectLabel('frontend\u0000')).toThrow(InvalidProjectLabelError);
     expect(() => normalizeProjectLabel('frontend\nbackend')).toThrow(InvalidProjectLabelError);
+    expect(() => normalizeProjectLabel('frontend\uFEFFbackend')).toThrow(InvalidProjectLabelError);
     expect(() => normalizeProjectLabel('---///')).toThrow(InvalidProjectLabelError);
     expect(() => normalizeProjectLabel('')).toThrow(InvalidProjectLabelError);
   });
@@ -125,6 +126,7 @@ describe('Git and cwd room derivation', () => {
       resolve(commonDirectory),
     );
     expect(runner).toHaveBeenCalledWith(resolve(directory), GIT_COMMON_DIRECTORY_ARGS);
+    expect(Object.isFrozen(GIT_COMMON_DIRECTORY_ARGS)).toBe(true);
   });
 
   it('groups Git worktrees by the canonical common directory', () => {
@@ -174,6 +176,12 @@ describe('Git and cwd room derivation', () => {
     expect(resolved.value).toBe(canonicalizeDirectory(directory));
     expect(resolved.roomId).toBe(deriveRoomId('cwd', resolved.value));
     expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it('canonicalizes direct path derivation inputs and rejects NUL paths', () => {
+    const directory = temporaryDirectory();
+    expect(deriveRoomId('cwd', join(directory, '.'))).toBe(deriveRoomId('cwd', directory));
+    expect(() => deriveRoomId('cwd', `${directory}\u0000unsafe`)).toThrow('NUL');
   });
 
   it('converges equivalent path spellings and symlinks', () => {

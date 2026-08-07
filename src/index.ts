@@ -1,22 +1,27 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  SessionInfoChangedEvent,
   SessionShutdownEvent,
   SessionStartEvent,
 } from '@earendil-works/pi-coding-agent';
 
 import { resolveP2PConfig, readP2PFlags, registerP2PFlags, type P2PConfig } from './config.js';
 import { createRuntimeLifecycle, type RuntimeIdentity, type RuntimeLifecycle } from './identity.js';
+import { resolveRoom, type ResolvedRoom } from './room.js';
 
 /** Runtime-scoped identity and configuration visible to later P2P layers. */
 export interface PiToPiRuntime {
   readonly identity: RuntimeIdentity;
   readonly config: P2PConfig;
+  /** One room resolved at session_start and reused for this runtime. */
+  readonly room: ResolvedRoom;
 }
 
 /** Lifecycle handlers plus an inspection seam for focused lifecycle tests. */
 export interface PiToPiLifecycle {
   readonly onSessionStart: (event: SessionStartEvent, ctx: ExtensionContext) => void;
+  readonly onSessionInfoChanged: (event: SessionInfoChangedEvent, ctx: ExtensionContext) => void;
   readonly onSessionShutdown: (event: SessionShutdownEvent, ctx: ExtensionContext) => void;
   readonly current: () => PiToPiRuntime | undefined;
 }
@@ -40,14 +45,31 @@ export function createPiToPiLifecycle(pi: Pick<ExtensionAPI, 'getFlag'>): PiToPi
           ? ctx.sessionManager.getSessionName()
           : undefined;
       const config = resolveP2PConfig({ flags: readP2PFlags(pi), sessionName });
+      const room = resolveRoom({ project: config.projectOverride, cwd: ctx.cwd });
       const identity = identityLifecycle.start(sessionId);
-      active = Object.freeze({ identity, config });
+      active = Object.freeze({ identity, config, room });
+    },
+    onSessionInfoChanged(event, _ctx): void {
+      void _ctx;
+      if (active === undefined || active.config.nameOverride !== undefined) {
+        return;
+      }
+
+      const config = resolveP2PConfig({ sessionName: event.name });
+      active = Object.freeze({ ...active, config });
     },
     onSessionShutdown(_event, _ctx): void {
       void _event;
       void _ctx;
-      identityLifecycle.shutdown();
-      active = undefined;
+      const runtime = active;
+      if (runtime === undefined) {
+        return;
+      }
+
+      identityLifecycle.shutdown(runtime.identity.runtimeId);
+      if (active?.identity.runtimeId === runtime.identity.runtimeId) {
+        active = undefined;
+      }
     },
     current(): PiToPiRuntime | undefined {
       return active;
@@ -69,5 +91,6 @@ export default function registerPiToPi(pi: ExtensionAPI): void {
   const lifecycle = createPiToPiLifecycle(pi);
 
   pi.on('session_start', lifecycle.onSessionStart);
+  pi.on('session_info_changed', lifecycle.onSessionInfoChanged);
   pi.on('session_shutdown', lifecycle.onSessionShutdown);
 }

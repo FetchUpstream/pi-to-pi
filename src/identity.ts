@@ -1,11 +1,14 @@
 import * as crypto from 'node:crypto';
 
-import { asRoomId, type RoomId } from './room.js';
+import {
+  asRoomId,
+  normalizeProjectLabel,
+  type NormalizedProjectLabel,
+  type RoomId,
+} from './room.js';
 
 declare const sessionIdBrand: unique symbol;
 declare const runtimeIdBrand: unique symbol;
-declare const normalizedNameBrand: unique symbol;
-declare const projectNameBrand: unique symbol;
 
 /** Stable logical identity supplied by Pi's session manager. */
 export type SessionId = string & { readonly [sessionIdBrand]: 'SessionId' };
@@ -14,10 +17,10 @@ export type SessionId = string & { readonly [sessionIdBrand]: 'SessionId' };
 export type RuntimeId = string & { readonly [runtimeIdBrand]: 'RuntimeId' };
 
 /** Canonical, already-normalized network display base. */
-export type NormalizedName = string & { readonly [normalizedNameBrand]: 'NormalizedName' };
+export type NormalizedName = NormalizedProjectLabel;
 
 /** Canonical project label used by explicit room configuration. */
-export type ProjectName = string & { readonly [projectNameBrand]: 'ProjectName' };
+export type ProjectName = NormalizedProjectLabel;
 
 /** Stable logical session identity. */
 export interface SessionIdentity {
@@ -49,37 +52,33 @@ export function asSessionId(value: string): SessionId {
   return value as SessionId;
 }
 
-/** Brand a non-empty runtime identifier. Generated IDs are UUIDs. */
+/** Brand a full UUID runtime identifier. */
 export function asRuntimeId(value: string): RuntimeId {
-  assertIdentityText(value, 'runtime ID');
+  if (!isUuid(value)) {
+    throw new Error(`Invalid runtime ID: expected a full UUID, received ${JSON.stringify(value)}`);
+  }
   return value as RuntimeId;
 }
 
-/** Return whether a value has UUID text syntax. */
-export function isUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
+/** Return whether a value has full UUID text syntax. */
+export function isUuid(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
+  );
 }
 
-/** Brand an already-normalized network name. */
+/** Normalize and brand a canonical network display base. */
 export function asNormalizedName(value: string): NormalizedName {
-  const codePoints = Array.from(value);
-  if (
-    codePoints.length === 0 ||
-    codePoints.length > 48 ||
-    !/^[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*$/u.test(value)
-  ) {
-    throw new Error(`Invalid normalized peer name: ${JSON.stringify(value)}`);
-  }
-  return value as NormalizedName;
+  return normalizeProjectLabel(value) as NormalizedName;
 }
 
-/** Brand an explicit project label after configuration validation. */
+/** Alias for name normalization at configuration and naming boundaries. */
+export const normalizePeerName = asNormalizedName;
+
+/** Normalize and brand an explicit project label. */
 export function asProjectName(value: string): ProjectName {
-  assertIdentityText(value, 'project name');
-  if (hasControlCharacter(value)) {
-    throw new Error('Project name must not contain control characters');
-  }
-  return value as ProjectName;
+  return normalizeProjectLabel(value);
 }
 
 /** Create a session identity from Pi's native session manager value. */
@@ -87,16 +86,18 @@ export function createSessionIdentity(sessionId: string): SessionIdentity {
   return Object.freeze({ sessionId: asSessionId(sessionId) });
 }
 
-/**
- * Create a fresh runtime identity.
- *
- * The default runtime ID is generated only when this function is called. In
- * particular, importing this module never allocates a runtime identity.
- */
-export function createRuntimeIdentity(sessionId: string, runtimeId?: string): RuntimeIdentity {
+/** Create a fresh runtime identity. */
+export function createRuntimeIdentity(sessionId: string): RuntimeIdentity {
+  return createRuntimeIdentityWithFactory(sessionId, createRuntimeId);
+}
+
+function createRuntimeIdentityWithFactory(
+  sessionId: string,
+  runtimeIdFactory: () => RuntimeId,
+): RuntimeIdentity {
   return Object.freeze({
     ...createSessionIdentity(sessionId),
-    runtimeId: asRuntimeId(runtimeId ?? crypto.randomUUID()),
+    runtimeId: runtimeIdFactory(),
   });
 }
 
@@ -116,7 +117,7 @@ export function createCanonicalPeerAddress(
 /** Stateful seam used by the Pi lifecycle wiring and lifecycle tests. */
 export interface RuntimeLifecycle {
   start(sessionId: string): RuntimeIdentity;
-  shutdown(): void;
+  shutdown(runtimeId: RuntimeId): void;
   current(): RuntimeIdentity | undefined;
 }
 
@@ -128,15 +129,26 @@ export interface RuntimeLifecycle {
  * identity boundary.
  */
 export function createRuntimeLifecycle(): RuntimeLifecycle {
+  return createRuntimeLifecycleWithFactory(createRuntimeId);
+}
+
+/** Deterministic lifecycle seam for focused tests; not a production override. */
+export function createRuntimeLifecycleForTesting(runtimeIdFactory: () => string): RuntimeLifecycle {
+  return createRuntimeLifecycleWithFactory(() => asRuntimeId(runtimeIdFactory()));
+}
+
+function createRuntimeLifecycleWithFactory(runtimeIdFactory: () => RuntimeId): RuntimeLifecycle {
   let active: RuntimeIdentity | undefined;
 
   return {
     start(sessionId: string): RuntimeIdentity {
-      active = createRuntimeIdentity(sessionId);
+      active = createRuntimeIdentityWithFactory(sessionId, runtimeIdFactory);
       return active;
     },
-    shutdown(): void {
-      active = undefined;
+    shutdown(runtimeId: RuntimeId): void {
+      if (active?.runtimeId === runtimeId) {
+        active = undefined;
+      }
     },
     current(): RuntimeIdentity | undefined {
       return active;

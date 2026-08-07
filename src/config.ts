@@ -1,15 +1,18 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 
-import { asProjectName, type ProjectName } from './identity.js';
+import {
+  asNormalizedName,
+  asProjectName,
+  type NormalizedName,
+  type ProjectName,
+} from './identity.js';
 
 /** Names registered through Pi's extension flag API. */
 export const P2P_NAME_FLAG = 'p2p-name' as const;
 export const P2P_PROJECT_FLAG = 'p2p-project' as const;
 
-/** Raw explicit name override, retained for the naming normalization seam. */
-declare const p2pNameOverrideBrand: unique symbol;
-export type P2PNameOverride = string & { readonly [p2pNameOverrideBrand]: 'P2PNameOverride' };
-
+/** Canonical explicit name override after shared normalization. */
+export type P2PNameOverride = NormalizedName;
 export type P2PNameSource = 'p2p-name' | 'session-name' | 'fallback';
 
 /** Values read from Pi's namespaced extension flags. */
@@ -30,8 +33,8 @@ export interface ResolveP2PConfigOptions {
 
 /** Effective process-level P2P configuration for one runtime. */
 export interface P2PConfig {
-  /** Effective display-name input; naming normalization runs in the naming seam. */
-  readonly name: string;
+  /** Effective canonical display-name base after shared normalization. */
+  readonly name: NormalizedName;
   /** Whether the effective name came from an explicit override or fallback. */
   readonly nameSource: P2PNameSource;
   /** Explicit `--p2p-name`, when configured. */
@@ -74,10 +77,10 @@ export function readP2PFlags(pi: Pick<ExtensionAPI, 'getFlag'>): P2PFlagValues {
 /**
  * Resolve explicit P2P options before automatic defaults.
  *
- * This function deliberately preserves raw label text. NFKC/lowercase and
- * punctuation normalization belong to the naming/room derivation waves; this
- * boundary only validates values that Pi's string flag API can provide and
- * records explicit-value precedence.
+ * Explicit names and projects share the room module's canonical NFKC/lowercase
+ * label normalizer and are branded only after normalization. Native session names
+ * use the same path, but an unusable native value falls back to `agent` rather
+ * than becoming an invalid published name.
  */
 export function resolveP2PConfig(options: ResolveP2PConfigOptions = {}): P2PConfig {
   const nameInput = firstDefined(options.p2pName, options.nameOverride, options.flags?.p2pName);
@@ -88,24 +91,33 @@ export function resolveP2PConfig(options: ResolveP2PConfigOptions = {}): P2PConf
   );
 
   const nameOverride = validateLabel(nameInput, P2P_NAME_FLAG) as P2PNameOverride | undefined;
-  const projectOverride = validateLabel(projectInput, P2P_PROJECT_FLAG);
+  const projectOverride = validateLabel(projectInput, P2P_PROJECT_FLAG) as ProjectName | undefined;
   const sessionName =
     options.sessionName && options.sessionName.length > 0 ? options.sessionName : undefined;
 
+  let name: NormalizedName;
   let nameSource: P2PNameSource;
   if (nameOverride !== undefined) {
+    name = nameOverride;
     nameSource = 'p2p-name';
   } else if (sessionName !== undefined) {
-    nameSource = 'session-name';
+    try {
+      name = asNormalizedName(sessionName);
+      nameSource = 'session-name';
+    } catch {
+      name = asNormalizedName('agent');
+      nameSource = 'fallback';
+    }
   } else {
+    name = asNormalizedName('agent');
     nameSource = 'fallback';
   }
 
   return Object.freeze({
-    name: nameOverride ?? sessionName ?? 'agent',
+    name,
     nameSource,
     ...(nameOverride === undefined ? {} : { nameOverride }),
-    ...(projectOverride === undefined ? {} : { projectOverride: asProjectName(projectOverride) }),
+    ...(projectOverride === undefined ? {} : { projectOverride }),
   });
 }
 
@@ -124,7 +136,7 @@ function firstDefined(...values: unknown[]): unknown {
 function validateLabel(
   value: unknown,
   option: typeof P2P_NAME_FLAG | typeof P2P_PROJECT_FLAG,
-): string | undefined {
+): NormalizedName | ProjectName | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -134,21 +146,11 @@ function validateLabel(
   if (value.length === 0) {
     throw new P2PConfigurationError(option, 'the value must not be empty');
   }
-  if (hasControlCharacter(value)) {
-    throw new P2PConfigurationError(option, 'control characters are not allowed');
-  }
-  if (!/[\p{L}\p{N}]/u.test(value)) {
-    throw new P2PConfigurationError(option, 'the value must contain a letter or number');
-  }
-  return value;
-}
 
-function hasControlCharacter(value: string): boolean {
-  for (const character of value) {
-    const codePoint = character.codePointAt(0) ?? 0;
-    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) {
-      return true;
-    }
+  try {
+    return option === P2P_NAME_FLAG ? asNormalizedName(value) : asProjectName(value);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'the value is invalid';
+    throw new P2PConfigurationError(option, message);
   }
-  return false;
 }

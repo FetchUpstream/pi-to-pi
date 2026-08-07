@@ -120,13 +120,12 @@ export class RoomIsolationError extends Error {
 /** Compatibility name for integrations that call a cross-room failure a mismatch. */
 export { RoomIsolationError as CrossRoomError };
 
-/** The exact argument vector used by the non-shell Git invocation. */
-export const GIT_COMMON_DIRECTORY_ARGS = [
+/** The exact, immutable argument vector used by the non-shell Git invocation. */
+export const GIT_COMMON_DIRECTORY_ARGS = Object.freeze([
   'rev-parse',
   '--path-format=absolute',
   '--git-common-dir',
-] as const;
-
+] as const);
 function defaultRealpath(path: string): string {
   return realpathSync(path);
 }
@@ -292,8 +291,10 @@ export function hashRoomId(source: CanonicalRoomSource, normalizedValue: string)
 }
 
 /**
- * Derive a room id from a source and value. Explicit values are normalized here;
- * path values are expected to have been canonicalized by the resolver.
+ * Derive a room id from a source and value.
+ *
+ * Explicit labels use the shared label normalizer; automatic Git and cwd inputs
+ * are canonicalized through realpath before hashing so equivalent paths converge.
  */
 export function deriveRoomId(source: CanonicalRoomSource, value: string): RoomId;
 /** Derive the room id selected by the complete precedence chain. */
@@ -307,7 +308,8 @@ export function deriveRoomId(
       throw new TypeError('room value is required when a source is provided');
     }
 
-    const normalizedValue = sourceOrOptions === 'explicit' ? normalizeProjectLabel(value) : value;
+    const normalizedValue =
+      sourceOrOptions === 'explicit' ? normalizeProjectLabel(value) : canonicalizeDirectory(value);
     return hashRoomId(sourceOrOptions, normalizedValue);
   }
 
@@ -319,16 +321,14 @@ export function deriveExplicitRoomId(project: string): RoomId {
   return hashRoomId('explicit', normalizeProjectLabel(project));
 }
 
-/** Derive a Git room id from a canonical common directory. */
+/** Derive a Git room id after canonicalizing the common directory. */
 export function deriveGitRoomId(commonDirectory: string): RoomId {
-  assertRoomHashInput(commonDirectory);
-  return hashRoomId('git', commonDirectory);
+  return hashRoomId('git', canonicalizeDirectory(commonDirectory));
 }
 
-/** Derive a working-directory room id from a canonical directory. */
+/** Derive a working-directory room id after canonicalization. */
 export function deriveWorkingDirectoryRoomId(directory: string): RoomId {
-  assertRoomHashInput(directory);
-  return hashRoomId('cwd', directory);
+  return hashRoomId('cwd', canonicalizeDirectory(directory));
 }
 
 /** Canonicalize an existing directory path with realpath. */
@@ -338,6 +338,9 @@ export function canonicalizeDirectory(
 ): string {
   if (typeof directory !== 'string' || directory.length === 0) {
     throw new TypeError('working directory must be a non-empty string');
+  }
+  if (directory.includes('\u0000')) {
+    throw new TypeError('working directory must not contain NUL');
   }
 
   const absolute = resolve(directory);
@@ -404,11 +407,11 @@ export function resolveRoom(options: RoomDerivationOptions = {}): ResolvedRoom {
   const explicitProject = getExplicitProject(options);
   if (explicitProject !== undefined) {
     const normalizedProject = normalizeProjectLabel(explicitProject);
-    return {
+    return Object.freeze({
       roomId: hashRoomId('explicit', normalizedProject),
       source: 'explicit',
       value: normalizedProject,
-    };
+    });
   }
 
   const resolver = getRealpathResolver(options.realpath);
@@ -420,18 +423,18 @@ export function resolveRoom(options: RoomDerivationOptions = {}): ResolvedRoom {
   });
 
   if (commonDirectory !== undefined) {
-    return {
+    return Object.freeze({
       roomId: hashRoomId('git', commonDirectory),
       source: 'git',
       value: commonDirectory,
-    };
+    });
   }
 
-  return {
+  return Object.freeze({
     roomId: hashRoomId('cwd', canonicalCwd),
     source: 'cwd',
     value: canonicalCwd,
-  };
+  });
 }
 
 /** Resolve and return only the opaque room id. */
