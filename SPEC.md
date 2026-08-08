@@ -1,4 +1,8 @@
-# Exploration result
+# Exploration and v1 boundary
+
+The authoritative, transport-independent v1 protocol contract is [`openspec/specs/pi-to-pi-v1-protocol/spec.md`](openspec/specs/pi-to-pi-v1-protocol/spec.md). Implementation issues must derive their protocol types, validation, routing, task-state, and conformance behavior from that specification rather than copying requirements into this document.
+
+The historical exploration below records the architecture and product boundary that motivated the contract. It is non-normative design context; where it differs from the canonical specification, the canonical specification wins.
 
 The new Pi-to-Pi should be designed as a **small, reliable peer-messaging substrate for independent Pi sessions**.
 
@@ -6,9 +10,7 @@ It should not become an orchestrator, task scheduler, subagent framework, worktr
 
 The central abstraction is:
 
-> One running Pi session can discover another running Pi session, send it a correlated request, and receive a correlated reply without either session being the parent of the other.
-
-No application code or OpenSpec artifacts were created during this exploration.
+ > One running Pi session can discover another running Pi session, send it a correlated request, and receive a correlated reply without either session being the parent of the other.
 
 ---
 
@@ -469,6 +471,8 @@ The original network version created a new client, a separate hub, a separate to
 
 # 11. Protocol model
 
+The normative envelope, operations, lifecycle, limits, identity checks, and errors are defined in [`openspec/specs/pi-to-pi-v1-protocol/spec.md`](openspec/specs/pi-to-pi-v1-protocol/spec.md); the summary below is retained only as non-normative architecture context.
+
 The wire protocol should be versioned from its first release.
 
 Every operation should carry:
@@ -501,7 +505,7 @@ task.cancel
 
 ## Requests and notifications
 
-A notification is fire-and-forget:
+A notification creates no task or logical reply; its delivery operation is acknowledged and deduplicated under the canonical v1 contract:
 
 ```text
 message.notify
@@ -523,13 +527,11 @@ message.request
 ## Task state
 
 ```text
-                  ┌──────────▶ rejected
-                  │
-created ─▶ accepted ─▶ queued ─▶ working ─▶ completed
-                  │                 │
-                  ├──────────▶ expired
-                  ├──────────▶ cancelled
-                  └──────────▶ failed
+created   -> accepted | rejected | expired
+accepted  -> queued | working | rejected | cancelling | cancelled | expired
+queued    -> working | rejected | cancelling | cancelled | expired
+working   -> completed | failed | rejected | cancelling | expired
+cancelling -> cancelled | completed | failed | expired
 
 ```
 
@@ -551,8 +553,8 @@ When a sender supplies an expected schema:
 
 1. The receiving model must see a concise representation of that contract in the inbound prompt.
 2. The exact schema remains in hidden request metadata.
-3. `p2p_reply` validates the supplied value against the stored schema.
-4. Invalid responses are rejected locally so the receiving model can correct them.
+3. The recipient validates a completed `p2p_reply` against the stored schema before sending it.
+4. The requester validates the reply again on receipt; an invalid reply returns `invalid_reply` and leaves the task nonterminal so a valid reply, failure, cancellation, or expiry can still win.
 
 This is materially different from merely calling `JSON.parse()`.
 
@@ -562,13 +564,14 @@ The sender should persist its outbound task metadata before transmitting.
 
 The receiver should:
 
-1. Validate the envelope.
-2. Validate room and destination.
-3. Check duplicate operation IDs.
-4. Check queue capacity and expiry.
-5. Record acceptance.
-6. Return an acknowledgement.
-7. Inject the request into Pi.
+1. Authenticate the binding and verify the claimed sender, recipient runtime, and exact room before task or deduplication lookup.
+2. Validate the protocol version and envelope.
+3. Validate expiry, typed content, schema, and effective size limits.
+4. Check duplicate operation IDs without reserving a transient `busy` operation.
+5. Check queue capacity and expiry.
+6. Record acceptance or delivery before acknowledging execution.
+7. Return the correlated operation acknowledgement.
+8. Inject an admitted request into Pi.
 
 Retries use the same operation ID. The receiver returns the existing acknowledgement for a duplicate rather than executing the request twice.
 
@@ -620,7 +623,7 @@ For a request it returns immediately with:
 ```text
 request ID
 target identity
-accepted | rejected | busy
+accepted | queued | rejected | busy
 
 ```
 
@@ -636,6 +639,7 @@ outcome: completed | failed | rejected
 ```
 
 The target is inferred from stored request metadata, not supplied by the model.
+The model-facing reply API may produce only `completed`, `failed`, or `rejected`; `cancelled` and `expired` terminal replies are system-generated.
 
 ## `p2p_status`
 
@@ -645,7 +649,7 @@ It can support one request ID or a filtered list.
 
 ## `p2p_cancel`
 
-A later addition for cooperative cancellation. V1 cancellation should not blindly call `ctx.abort()` because the Pi turn may also contain unrelated work.
+Cooperative cancellation is a v1 `task.cancel` operation. It must not blindly call `ctx.abort()` because the Pi turn may also contain unrelated work; cancellation is scoped to the matching task executor.
 
 ---
 
