@@ -29,16 +29,11 @@ import {
   PrivateFilesystemError,
 } from '../../src/discovery/filesystem.js';
 import { PRIVATE_DIRECTORY_MODE, resolveRuntimeRoot, RuntimeRootError } from '../../src/config.js';
-import {
-  assertRoomIdentity,
-  isCanonicalRoomId,
-  isRoomIdentity,
-  isSafeStorageKey,
-  validateRoomIdentity,
-} from '../../src/room.js';
+import { isValidRoomId } from '../../src/room.js';
 
-const RUNTIME_ID = 'runtime-1';
-const ROOM_ID = 'room-1';
+const RUNTIME_ID = '11111111-1111-4111-8111-111111111111';
+const ROOM_ID = `r1-${'a'.repeat(32)}`;
+const OTHER_ROOM_ID = `r1-${'b'.repeat(32)}`;
 const STORAGE_KEY = 'room-key-1';
 const RUNTIME_STARTED_AT = '2026-01-01T00:00:00.000Z';
 const LEASE_EXPIRES_AT = '2026-01-01T00:01:30.000Z';
@@ -360,29 +355,28 @@ describe('Agent Card identity and room/path safety', () => {
       'identity-mismatch',
     );
     expectIssue(
-      validateAgentCard(makeCard(), { expectedRoomId: 'room-2' }),
+      validateAgentCard(makeCard(), { expectedRoomId: OTHER_ROOM_ID }),
       'roomId',
       'room-mismatch',
     );
   });
 
   it('accepts canonical room identities and safe storage keys only', () => {
-    const identity = { roomId: ROOM_ID, storageKey: STORAGE_KEY };
-    const result = validateRoomIdentity(identity);
-
-    expect(result).toEqual({ valid: true, value: identity, errors: [] });
-    expect(isCanonicalRoomId(ROOM_ID)).toBe(true);
-    expect(isSafeStorageKey(STORAGE_KEY)).toBe(true);
-    expect(isRoomIdentity(identity)).toBe(true);
-    expect(() => assertRoomIdentity(identity)).not.toThrow();
+    expect(isValidRoomId(ROOM_ID)).toBe(true);
 
     for (const roomId of ['../room', 'room/name', ' room', 'room ']) {
-      expect(isCanonicalRoomId(roomId)).toBe(false);
-      expect(validateRoomIdentity({ roomId, storageKey: STORAGE_KEY }).valid).toBe(false);
+      expect(isValidRoomId(roomId)).toBe(false);
     }
+
+    const root = nodePath.join(tmpdir(), 'pi-to-pi-room-identity-fixture');
+    expect(() =>
+      buildRegistryPaths(root, { roomId: ROOM_ID, storageKey: STORAGE_KEY }),
+    ).not.toThrow();
+
     for (const storageKey of ['../escape', 'room/key', 'CON', 'unsafe.', 'unsafe ']) {
-      expect(isSafeStorageKey(storageKey)).toBe(false);
-      expect(validateRoomIdentity({ roomId: ROOM_ID, storageKey }).valid).toBe(false);
+      expect(() => buildRegistryPaths(root, { roomId: ROOM_ID, storageKey })).toThrow(
+        PrivateFilesystemError,
+      );
     }
   });
 

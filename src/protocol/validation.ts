@@ -13,13 +13,12 @@ import {
   MAX_PURPOSE_LENGTH,
   MAX_ROLE_TAG_LENGTH,
   MAX_ROLE_TAGS,
-  MAX_ROOM_ID_LENGTH,
   MAX_SUPPORTED_CONTENT_TYPES,
   MAX_WORKING_DIRECTORY_LABEL_LENGTH,
   SUPPORTED_AGENT_CARD_PROTOCOL_VERSIONS,
   type AgentCard,
 } from './agent-card.js';
-import { isCanonicalRoomId } from '../room.js';
+import { isValidRoomId } from '../room.js';
 
 export type AgentCardValidationCode =
   | 'invalid-type'
@@ -590,13 +589,8 @@ export function validateAgentCard(
   if (!isBoundedText(input.displayName, MAX_DISPLAY_NAME_LENGTH)) {
     issue(errors, 'displayName', 'invalid-value', 'must be bounded non-empty text');
   }
-  if (!isCanonicalRoomId(input.roomId)) {
-    issue(
-      errors,
-      'roomId',
-      'invalid-value',
-      `must be a canonical room identity of at most ${MAX_ROOM_ID_LENGTH} characters`,
-    );
+  if (!isValidRoomId(input.roomId)) {
+    issue(errors, 'roomId', 'invalid-value', 'must be a canonical r1 room ID');
   }
   if (options.expectedRoomId !== undefined && input.roomId !== options.expectedRoomId) {
     issue(errors, 'roomId', 'room-mismatch', 'does not match the room being listed');
