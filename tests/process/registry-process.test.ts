@@ -2,7 +2,7 @@ import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -16,9 +16,10 @@ const ROOM_B = `r1-${'b'.repeat(32)}`;
 const STORAGE_KEY_A = 'room-a';
 const STORAGE_KEY_B = 'room-b';
 const CARD_BASE_NOW = Date.parse('2026-01-01T00:00:00.000Z');
-const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
-const LOADER_PATH = fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
+const WORKER_ENTRYPOINT = relative(REPOSITORY_ROOT, WORKER_PATH);
+const LOADER_PATH = fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 
 interface WorkerInput {
   readonly root: string;
@@ -150,7 +151,14 @@ async function temporaryRoot(): Promise<string> {
 function runWorker(mode: string, payload: WorkerInput): Promise<WorkerResponse> {
   const child = spawn(
     process.execPath,
-    ['--no-warnings', '--experimental-strip-types', '--loader', LOADER_PATH, WORKER_PATH, mode],
+    [
+      '--no-warnings',
+      '--experimental-strip-types',
+      '--loader',
+      LOADER_PATH,
+      WORKER_ENTRYPOINT,
+      mode,
+    ],
     {
       cwd: REPOSITORY_ROOT,
       env: {
