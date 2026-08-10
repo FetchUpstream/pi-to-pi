@@ -1,7 +1,7 @@
 import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -21,7 +21,7 @@ const LOADER_PATH = fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 function nodeModuleSpecifier(path: string): string {
-  return path;
+  return process.platform === 'win32' ? pathToFileURL(path).href : path;
 }
 interface WorkerInput {
   readonly root: string;
