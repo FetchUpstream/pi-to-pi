@@ -27,10 +27,10 @@
 - [x] 4.3 Add concurrent multi-process requests with deliberately varied response timing and verify that responses never cross-wire.
 - [x] 4.4 Add process-level silent-peer, slow-drip header/body, malformed/truncated/oversized frame, peer-exit, caller-abort, and bounded-deadline scenarios.
 - [x] 4.5 Add process-level stale endpoint scenarios proving that live, inconclusive, timed-out, and replacement endpoints are never blindly removed.
-- [ ] 4.6 Run the focused production transport suite on native Linux, macOS, and Windows CI and retain the actual platform results; do not infer unavailable platform evidence from Linux.
+- [x] 4.6 Run the focused production transport suite on native Linux, macOS, and Windows CI and retain the actual platform results; do not infer unavailable platform evidence from Linux (GitHub Actions run 31372925578).
 
 ## 5. Verify scope and repository integration
 
 - [x] 5.1 Run targeted transport tests, type checking, linting, formatting, and build checks for the production transport changes.
-- [ ] 5.2 Run the repository's existing validation suite and confirm the cross-platform CI matrix exercises the new production tests without adding dependencies or a second process framework.
+- [x] 5.2 Run the repository's existing validation suite and confirm the cross-platform CI matrix exercises the new production tests without adding dependencies or a second process framework (GitHub Actions run 31372925578).
 - [x] 5.3 Confirm the final diff is limited to `src/transport/*`, focused transport tests, narrowly necessary test-fixture documentation, and an approved compatibility-only room identity export fix required by the pre-existing repository validation suite; leave room derivation semantics, protocol, router, discovery, Pi, and runtime-integration ownership untouched.
