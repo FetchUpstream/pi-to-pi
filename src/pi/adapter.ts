@@ -134,8 +134,9 @@ export class PiAdapter {
       content,
       ...(expectedResponse === undefined ? {} : { expectedResponse }),
     });
-    this.active?.outboundTaskIds.add(handle.requestId);
-    this.trackCompletion(handle, resolved.record.runtimeId as unknown as RuntimeId);
+    const active = this.active;
+    active?.outboundTaskIds.add(handle.requestId);
+    this.trackCompletion(handle, resolved.record.runtimeId as unknown as RuntimeId, active);
     try {
       const admission = await handle.admission;
       return {
@@ -238,9 +239,13 @@ export class PiAdapter {
     return 'Peer target was not found';
   }
 
-  private trackCompletion(handle: RouterRequestHandle, peerRuntimeId: RuntimeId): void {
+  private trackCompletion(
+    handle: RouterRequestHandle,
+    peerRuntimeId: RuntimeId,
+    active: ActiveRuntime | undefined,
+  ): void {
     void handle.completion.then((snapshot) =>
-      this.injectTerminal(handle.requestId, peerRuntimeId, snapshot),
+      this.injectTerminal(handle.requestId, peerRuntimeId, snapshot, active),
     );
   }
 
@@ -248,10 +253,11 @@ export class PiAdapter {
     requestId: RequestId,
     peerRuntimeId: RuntimeId,
     snapshot: TaskSnapshot,
+    active: ActiveRuntime | undefined,
   ): Promise<void> {
-    const active = this.active;
     if (
       active === undefined ||
+      active !== this.active ||
       !isTerminalTaskState(snapshot.state) ||
       active.terminalRequestIds.has(requestId)
     ) {
@@ -283,13 +289,28 @@ function textResult(content: string, isError = false) {
 }
 
 /** Register communication-only Pi tools against an injectable adapter. */
-export function registerPiTools(pi: Pick<ExtensionAPI, 'registerTool'>, adapter: PiAdapter): void {
+/** Register communication-only Pi tools against an adapter or current-runtime resolver. */
+export function registerPiTools(
+  pi: Pick<ExtensionAPI, 'registerTool'>,
+  adapter: PiAdapter | (() => PiAdapter | undefined),
+): void {
+  const current = (): PiAdapter => {
+    const resolved = typeof adapter === 'function' ? adapter() : adapter;
+    if (resolved === undefined) throw new Error('No active Pi-to-Pi runtime');
+    return resolved;
+  };
   pi.registerTool({
     name: 'p2p_peers',
     label: 'P2P peers',
     description: 'List live peers in this room.',
     parameters: Type.Object({}),
-    execute: async () => textResult(JSON.stringify(await adapter.listPeers(), null, 2)),
+    execute: async () => {
+      try {
+        return textResult(JSON.stringify(await current().listPeers(), null, 2));
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : 'Unable to list peers', true);
+      }
+    },
   });
   pi.registerTool({
     name: 'p2p_send',
@@ -305,10 +326,10 @@ export function registerPiTools(pi: Pick<ExtensionAPI, 'registerTool'>, adapter:
       try {
         const content = { type: 'text' as const, text: params.text };
         if (params.notification) {
-          await adapter.notify(params.target, content);
+          await current().notify(params.target, content);
           return textResult('Notification admitted.');
         }
-        const result = await adapter.send(
+        const result = await current().send(
           params.target,
           content,
           params.expectedResponse === undefined
@@ -334,7 +355,7 @@ export function registerPiTools(pi: Pick<ExtensionAPI, 'registerTool'>, adapter:
     }),
     execute: async (_id, params) => {
       try {
-        const snapshot = adapter.reply({
+        const snapshot = current().reply({
           requestId: params.requestId,
           outcome: params.outcome,
           ...(params.text === undefined
@@ -353,12 +374,19 @@ export function registerPiTools(pi: Pick<ExtensionAPI, 'registerTool'>, adapter:
     description: 'Inspect one live router task by exact request ID.',
     parameters: Type.Object({ requestId: Type.String() }),
     execute: async (_id, params) => {
-      const report = adapter.statusReport(params.requestId);
-      return textResult(
-        report.snapshot === undefined
-          ? 'No live router task found.'
-          : JSON.stringify(report, null, 2),
-      );
+      try {
+        const report = current().statusReport(params.requestId);
+        return textResult(
+          report.snapshot === undefined
+            ? 'No live router task found.'
+            : JSON.stringify(report, null, 2),
+        );
+      } catch (error) {
+        return textResult(
+          error instanceof Error ? error.message : 'Unable to inspect status',
+          true,
+        );
+      }
     },
   });
 }

@@ -5,7 +5,7 @@ Define Pi's explicit, router-backed peer communication interface.
 ## Requirements
 
 ### Requirement: Pi SHALL expose explicit peer communication tools
-The extension SHALL register `p2p_peers`, `p2p_send`, `p2p_reply`, and `p2p_status` as communication-only tools. It SHALL NOT expose `p2p_await` in v1 or introduce orchestration, role, worktree, or agent-spawning semantics in tool descriptions or prompt guidance.
+The default extension SHALL register `p2p_peers`, `p2p_send`, `p2p_reply`, and `p2p_status` as communication-only tools through a stable runtime-aware dispatcher. The dispatcher SHALL use only the current self-composed production Pi adapter and SHALL return a normal tool error when no active runtime exists. It SHALL NOT expose `p2p_await` in v1 or introduce orchestration, role, worktree, or agent-spawning semantics in tool descriptions or prompt guidance.
 
 #### Scenario: A peer answer is asynchronous
 - **WHEN** `p2p_send` admits a request that expects a response
@@ -72,3 +72,10 @@ The adapter SHALL observe each `RouterRequestHandle.completion` or equivalent pr
 #### Scenario: A historical record exists without a live task
 - **WHEN** a session contains an audit entry for a previous runtime request ID and the current router has no snapshot
 - **THEN** `p2p_status` does not report that record as an active task
+
+### Requirement: Pi delivery SHALL be fenced to its originating runtime generation
+The adapter and task executor SHALL capture the generation, session, and runtime that own inbound delivery and outbound completion callbacks. They SHALL deliver a terminal follow-up only when that exact generation remains active, and SHALL drop callbacks from replaced runtimes.
+
+#### Scenario: Old completion resolves after replacement
+- **WHEN** an old runtime's request completion resolves after reload, new, resume, fork, or clone creates a replacement runtime
+- **THEN** no result custom message is injected into the replacement Pi session

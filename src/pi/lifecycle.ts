@@ -7,48 +7,42 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 
 import { readP2PFlags, resolveP2PConfig, type P2PConfig } from '../config.js';
-import {
-  createInitialPeerName,
-  synchronizePeerName,
-  type PublishedPeerName,
-} from '../discovery/naming.js';
-import { RuntimeRegistry, type RuntimeRegistryOptions } from '../discovery/registry.js';
+import { createInitialPeerName, type PublishedPeerName } from '../discovery/naming.js';
+import { type RuntimeRegistry, type RuntimeRegistryOptions } from '../discovery/registry.js';
 import {
   createRuntimeLifecycle,
   type RuntimeIdentity,
   type RuntimeLifecycle,
 } from '../identity.js';
 import { resolveRoom, type ResolvedRoom } from '../room.js';
+import {
+  PiToPiRuntimeComposition,
+  type PiToPiRuntimeCompositionOptions,
+} from '../runtime/composition.js';
 
-/** Registry options supplied by the embedding host and lifecycle tests. */
-export type PiToPiRegistryOptions = Omit<
-  RuntimeRegistryOptions,
-  'identity' | 'runtimeId' | 'sessionId' | 'roomId' | 'networkName' | 'endpoint'
->;
-
-/** Endpoint construction remains opaque until the transport layer is wired. */
-export type PiToPiEndpointFactory =
-  string | ((identity: RuntimeIdentity, ctx: ExtensionContext) => string);
-
-/** Options for the lifecycle integration seam and deterministic tests. */
-export interface PiToPiLifecycleOptions {
-  readonly registryOptions?: PiToPiRegistryOptions;
-  readonly endpoint?: PiToPiEndpointFactory;
+export type PiToPiLifecycleOptions = Pick<
+  Partial<PiToPiRuntimeCompositionOptions>,
+  'registryOptions' | 'transportOptions' | 'createTransport' | 'createEndpoint'
+> & {
+  readonly createComposition?: (
+    options: PiToPiRuntimeCompositionOptions,
+  ) => PiToPiRuntimeComposition;
+  /** Deprecated compatibility seam; production lifecycle never invokes it. */
   readonly createRegistry?: (options: RuntimeRegistryOptions) => RuntimeRegistry;
   readonly onError?: (error: unknown) => void;
-}
+};
 
-/** Runtime-scoped identity, naming, room, endpoint, and registry ownership. */
 export interface PiToPiRuntime {
   readonly identity: RuntimeIdentity;
   readonly config: P2PConfig;
   readonly room: ResolvedRoom;
   readonly endpoint: string;
-  readonly publishedName: PublishedPeerName;
+  readonly composition: PiToPiRuntimeComposition;
+  /** Legacy inspection seams; the active owner is always `composition`. */
   readonly registry: RuntimeRegistry;
+  readonly publishedName: PublishedPeerName;
 }
 
-/** Lifecycle handlers plus a read-only inspection seam for focused tests. */
 export interface PiToPiLifecycle {
   readonly onSessionStart: (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>;
   readonly onSessionInfoChanged: (
@@ -59,209 +53,106 @@ export interface PiToPiLifecycle {
   readonly current: () => PiToPiRuntime | undefined;
 }
 
-interface ActiveRuntime extends PiToPiRuntime {
-  stopPromise?: Promise<void>;
-}
-
-function readSessionName(ctx: ExtensionContext): string | undefined {
+function sessionName(ctx: ExtensionContext): string | undefined {
   try {
-    return typeof ctx.sessionManager.getSessionName === 'function'
-      ? ctx.sessionManager.getSessionName()
-      : undefined;
+    return ctx.sessionManager.getSessionName?.();
   } catch {
     return undefined;
   }
 }
 
-function resolveEndpoint(
-  endpoint: PiToPiEndpointFactory | undefined,
-  identity: RuntimeIdentity,
-  ctx: ExtensionContext,
-): string {
-  const value =
-    typeof endpoint === 'function'
-      ? endpoint(identity, ctx)
-      : (endpoint ?? `unbound:${identity.runtimeId}`);
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new TypeError('lifecycle endpoint must be a non-empty string');
-  }
-  return value;
-}
-
-/**
- * Create lifecycle handlers for one extension factory invocation.
- *
- * Factory evaluation only creates in-memory lifecycle state. Registry paths,
- * record files, and lease timers are created after Pi emits `session_start`.
- */
+/** Lifecycle owner for a single current, generation-fenced production composition. */
 export function createPiToPiLifecycle(
   pi: Pick<ExtensionAPI, 'getFlag'>,
   options: PiToPiLifecycleOptions = {},
 ): PiToPiLifecycle {
-  const identityLifecycle: RuntimeLifecycle = createRuntimeLifecycle();
-  const createRegistry =
-    options.createRegistry ?? ((registryOptions) => new RuntimeRegistry(registryOptions));
-  let active: ActiveRuntime | undefined;
+  const identities: RuntimeLifecycle = createRuntimeLifecycle();
+  const createComposition =
+    options.createComposition ?? ((input) => new PiToPiRuntimeComposition(input));
+  let active: PiToPiRuntime | undefined;
+  let generation = 0;
   let stopping: Promise<void> | undefined;
 
-  function isCurrentRuntime(runtime: ActiveRuntime): boolean {
-    const current = active;
-    return (
-      current !== undefined &&
-      current.identity.runtimeId === runtime.identity.runtimeId &&
-      current.identity.sessionId === runtime.identity.sessionId &&
-      current.registry === runtime.registry
-    );
-  }
-
-  function hasCommittedName(runtime: ActiveRuntime, publishedName: PublishedPeerName): boolean {
-    const record = runtime.registry.current();
-    return (
-      record !== undefined &&
-      runtime.registry.networkName === publishedName.networkName &&
-      record.runtimeId === runtime.identity.runtimeId &&
-      record.sessionId === runtime.identity.sessionId &&
-      record.roomId === runtime.room.roomId &&
-      record.endpoint === runtime.endpoint &&
-      record.networkName === publishedName.networkName
-    );
-  }
-
-  function stopRuntime(runtime: ActiveRuntime): Promise<void> {
-    if (runtime.stopPromise !== undefined) {
-      return runtime.stopPromise;
-    }
-
-    if (active === runtime) {
-      active = undefined;
-    }
-
-    const cleanup = (async () => {
-      try {
-        await runtime.registry.shutdown();
-      } finally {
-        identityLifecycle.shutdown(runtime.identity.runtimeId);
-      }
-    })();
-    runtime.stopPromise = cleanup;
+  const stop = (runtime: PiToPiRuntime): Promise<void> => {
+    if (active === runtime) active = undefined;
+    const cleanup = runtime.composition.shutdown().finally(() => {
+      identities.shutdown(runtime.identity.runtimeId);
+      if (stopping === cleanup) stopping = undefined;
+    });
     stopping = cleanup;
-
-    function clearStopping(): void {
-      if (stopping === cleanup) {
-        stopping = undefined;
-      }
-    }
-    void cleanup.then(clearStopping, clearStopping);
     return cleanup;
-  }
+  };
 
   return {
     async onSessionStart(_event, ctx): Promise<void> {
-      void _event;
-      const previous = active;
-      if (previous !== undefined) {
-        await stopRuntime(previous);
-      }
-      if (stopping !== undefined) {
-        await stopping;
-      }
-
-      const sessionId = ctx.sessionManager.getSessionId();
-      const sessionName = readSessionName(ctx);
-      const config = resolveP2PConfig({ flags: readP2PFlags(pi), sessionName });
+      if (active !== undefined) await stop(active);
+      if (stopping !== undefined) await stopping;
+      const identity = identities.start(ctx.sessionManager.getSessionId());
+      const config = resolveP2PConfig({ flags: readP2PFlags(pi), sessionName: sessionName(ctx) });
       const room = resolveRoom({ project: config.projectOverride, cwd: ctx.cwd });
-      const identity = identityLifecycle.start(sessionId);
-      const publishedName = createInitialPeerName(identity.runtimeId, config.name);
-      let endpoint: string;
-      let registry: RuntimeRegistry;
+      const nextGeneration = ++generation;
       try {
-        endpoint = resolveEndpoint(options.endpoint, identity, ctx);
-        registry = createRegistry({
-          ...options.registryOptions,
+        const composition = createComposition({
           identity,
-          roomId: room.roomId,
-          networkName: publishedName.networkName,
-          endpoint,
+          room,
+          config,
+          displayName: sessionName(ctx),
+          generation: nextGeneration,
+          registryOptions: options.registryOptions,
+          transportOptions: options.transportOptions,
+          createTransport: options.createTransport,
+          createEndpoint: options.createEndpoint,
         });
+        await composition.start();
+        active = {
+          identity,
+          config,
+          room,
+          endpoint: composition.endpoint,
+          composition,
+          registry: composition.registry as unknown as RuntimeRegistry,
+          publishedName: createInitialPeerName(identity.runtimeId, config.name),
+        };
       } catch (error) {
-        identityLifecycle.shutdown(identity.runtimeId);
-        throw error;
-      }
-      const runtime: ActiveRuntime = {
-        identity,
-        config,
-        room,
-        endpoint,
-        publishedName,
-        registry,
-      };
-      active = runtime;
-
-      try {
-        await registry.start();
-      } catch (error) {
-        try {
-          await stopRuntime(runtime);
-        } catch (cleanupError) {
-          options.onError?.(cleanupError);
-        }
+        identities.shutdown(identity.runtimeId);
         throw error;
       }
     },
 
-    async onSessionInfoChanged(event, _ctx): Promise<void> {
-      void _ctx;
+    async onSessionInfoChanged(event): Promise<void> {
       const runtime = active;
-      if (runtime === undefined || runtime.config.nameOverride !== undefined) {
+      if (
+        runtime === undefined ||
+        runtime.config.nameOverride !== undefined ||
+        typeof event.name !== 'string'
+      ) {
         return;
       }
-
-      const publishedName = synchronizePeerName(runtime.publishedName, event.name, {
-        p2pName: runtime.config.nameOverride,
-      });
-      if (publishedName.networkName === runtime.publishedName.networkName) {
-        return;
-      }
-
-      const config = resolveP2PConfig({
-        sessionName: event.name,
-        p2pProject: runtime.config.projectOverride,
-      });
-      await runtime.registry.updateNetworkName(publishedName.networkName);
-      if (!isCurrentRuntime(runtime) || !hasCommittedName(runtime, publishedName)) {
-        return;
-      }
-      const current = active;
-      if (current !== undefined) {
+      await runtime.composition.updateDisplayName(event.name);
+      if (active === runtime) {
         active = {
-          ...current,
-          config,
-          publishedName,
+          ...runtime,
+          config: resolveP2PConfig({
+            sessionName: event.name,
+            p2pProject: runtime.config.projectOverride,
+          }),
+          publishedName: createInitialPeerName(runtime.identity.runtimeId, event.name),
         };
       }
     },
 
-    async onSessionShutdown(_event, _ctx): Promise<void> {
-      void _event;
-      void _ctx;
+    async onSessionShutdown(): Promise<void> {
       const runtime = active;
-      const cleanup = runtime === undefined ? stopping : stopRuntime(runtime);
-      if (cleanup === undefined) {
-        return;
-      }
-
+      if (runtime === undefined) return stopping;
       try {
-        await cleanup;
+        await stop(runtime);
       } catch (error) {
         options.onError?.(error);
       }
     },
 
-    current(): PiToPiRuntime | undefined {
-      return active;
-    },
+    current: () => active,
   };
 }
 
-/** Alias for callers that use the shorter lifecycle terminology. */
 export const createLifecycle = createPiToPiLifecycle;
