@@ -16,30 +16,6 @@ export {
   type PiToPiRuntime,
 } from './pi/lifecycle.js';
 
-export {
-  AgentCardRegistry,
-  AgentCardRecordRegistry,
-  AgentCardRegistryError,
-  createAgentCardRegistry,
-  createDiscoveryAgentCardRegistry,
-  cleanupAgentCardState,
-  cleanupStaleAgentCards,
-  listLiveAgentCards,
-  listLiveAgentCardPeers,
-  readAgentCard,
-  removeAgentCard,
-  resolveAgentCardRoom,
-  runtimeInstanceIdFromRuntimeId,
-  type AgentCardCleanupOptions,
-  type AgentCardCleanupResult,
-  type AgentCardEndpointInput,
-  type AgentCardListingOptions,
-  type AgentCardMetadataPatch,
-  type AgentCardPeerRecord,
-  type AgentCardRegistryOptions,
-  type AgentCardRoomInput,
-} from './discovery/agent-card-registry.js';
-
 /**
  * Register the Pi-to-Pi extension.
  *

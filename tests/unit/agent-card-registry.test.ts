@@ -37,8 +37,8 @@ import {
   validateRoomIdentity,
 } from '../../src/room.js';
 
-const RUNTIME_ID = '11111111-1111-4111-8111-111111111111';
-const ROOM_ID = `r1-${'a'.repeat(32)}`;
+const RUNTIME_ID = 'runtime-1';
+const ROOM_ID = 'room-1';
 const STORAGE_KEY = 'room-key-1';
 const RUNTIME_STARTED_AT = '2026-01-01T00:00:00.000Z';
 const LEASE_EXPIRES_AT = '2026-01-01T00:01:30.000Z';
@@ -343,33 +343,24 @@ describe('Agent Card nullability and display-name rules', () => {
 describe('Agent Card identity and room/path safety', () => {
   it('requires runtime identity, endpoint identity, room identity, and record filename to agree', () => {
     expectIssue(
-      validateAgentCard(makeCard(), {
-        expectedRuntimeInstanceId: '22222222-2222-4222-8222-222222222222',
-      }),
+      validateAgentCard(makeCard(), { expectedRuntimeInstanceId: 'runtime-2' }),
       'runtimeInstanceId',
       'identity-mismatch',
     );
     expectIssue(
-      validateAgentCard(makeCard(), {
-        expectedRecordFileName: '22222222-2222-4222-8222-222222222222.json',
-      }),
+      validateAgentCard(makeCard(), { expectedRecordFileName: 'runtime-2.json' }),
       'runtimeInstanceId',
       'identity-mismatch',
     );
     expectIssue(
       validateAgentCard(
-        makeCard({
-          endpoint: {
-            ...makeCard().endpoint,
-            runtimeInstanceId: '22222222-2222-4222-8222-222222222222',
-          },
-        }),
+        makeCard({ endpoint: { ...makeCard().endpoint, runtimeInstanceId: 'runtime-2' } }),
       ),
       'endpoint.runtimeInstanceId',
       'identity-mismatch',
     );
     expectIssue(
-      validateAgentCard(makeCard(), { expectedRoomId: `r1-${'b'.repeat(32)}` }),
+      validateAgentCard(makeCard(), { expectedRoomId: 'room-2' }),
       'roomId',
       'room-mismatch',
     );

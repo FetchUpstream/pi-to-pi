@@ -20,7 +20,6 @@ import {
   type AgentCard,
 } from './agent-card.js';
 import { isCanonicalRoomId } from '../room.js';
-import { isUuid } from '../identity.js';
 
 export type AgentCardValidationCode =
   | 'invalid-type'
@@ -108,6 +107,9 @@ const ENDPOINT_FIELDS = new Set(['kind', 'address', 'runtimeInstanceId']);
 const ISO_TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/u;
+const SAFE_RUNTIME_INSTANCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const WINDOWS_RESERVED_RUNTIME_INSTANCE_ID_PATTERN =
+  /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)/iu;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -152,11 +154,17 @@ function isIdentifier(value: unknown): value is string {
 
 /**
  * Runtime identities are shared by registry construction, path construction, and
- * card schema validation. They are full canonical UUIDs so a filename, card, and
- * endpoint can all identify the same runtime without truncation.
+ * card schema validation. Keep this check cross-platform and stricter than the
+ * generic logical session identity grammar.
  */
 export function isSafeRuntimeInstanceId(value: unknown): value is string {
-  return isUuid(value);
+  return (
+    typeof value === 'string' &&
+    SAFE_RUNTIME_INSTANCE_ID_PATTERN.test(value) &&
+    !value.endsWith('.') &&
+    !value.endsWith(' ') &&
+    !WINDOWS_RESERVED_RUNTIME_INSTANCE_ID_PATTERN.test(value)
+  );
 }
 
 function isFiniteInteger(value: unknown): value is number {

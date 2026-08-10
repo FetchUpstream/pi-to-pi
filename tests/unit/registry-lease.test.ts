@@ -311,14 +311,14 @@ describe('runtime record validation and atomic publication', () => {
 });
 
 describe('lease expiry and stale-record handling', () => {
-  it('uses the thirty-second renewal and ninety-second expiry bounds', () => {
-    expect(DEFAULT_LEASE_RENEWAL_INTERVAL_MS).toBe(30_000);
-    expect(DEFAULT_LEASE_TTL_MS).toBe(90_000);
-    expect(leaseExpiration({ now: 0 })).toBe(90_000);
-    expect(isLeaseExpired(90_000, 89_999)).toBe(false);
-    expect(isLeaseExpired(90_000, 90_000)).toBe(true);
-    expect(filterUnexpiredRecords([{ leaseExpiresAt: 90_000 }, { leaseExpiresAt: 1 }], 2)).toEqual([
-      { leaseExpiresAt: 90_000 },
+  it('uses the ten-second renewal and thirty-second expiry bounds', () => {
+    expect(DEFAULT_LEASE_RENEWAL_INTERVAL_MS).toBe(10_000);
+    expect(DEFAULT_LEASE_TTL_MS).toBe(30_000);
+    expect(leaseExpiration({ now: 0 })).toBe(30_000);
+    expect(isLeaseExpired(30_000, 29_999)).toBe(false);
+    expect(isLeaseExpired(30_000, 30_000)).toBe(true);
+    expect(filterUnexpiredRecords([{ leaseExpiresAt: 30_000 }, { leaseExpiresAt: 1 }], 2)).toEqual([
+      { leaseExpiresAt: 30_000 },
     ]);
   });
 
@@ -671,10 +671,10 @@ describe('serialized lease and lifecycle cleanup', () => {
 
     await registry.start();
     await replacement.start();
-    expect(registry.current()?.leaseExpiresAt).toBe(91_000);
+    expect(registry.current()?.leaseExpiresAt).toBe(31_000);
     now = 11_000;
     tick?.();
-    await vi.waitFor(() => expect(registry.current()?.leaseExpiresAt).toBe(101_000));
+    await vi.waitFor(() => expect(registry.current()?.leaseExpiresAt).toBe(41_000));
 
     expect(await registry.shutdown()).toBe(true);
     expect(await registry.shutdown()).toBe(true);

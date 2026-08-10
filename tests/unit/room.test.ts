@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -125,12 +125,9 @@ describe('Git and cwd room derivation', () => {
     const runner = vi.fn(() => '.git\n');
 
     expect(discoverGitCommonDirectory(directory, { gitRunner: runner })).toBe(
-      canonicalizeDirectory(commonDirectory),
+      resolve(commonDirectory),
     );
-    expect(runner).toHaveBeenCalledWith(
-      canonicalizeDirectory(directory),
-      GIT_COMMON_DIRECTORY_ARGS,
-    );
+    expect(runner).toHaveBeenCalledWith(resolve(directory), GIT_COMMON_DIRECTORY_ARGS);
     expect(Object.isFrozen(GIT_COMMON_DIRECTORY_ARGS)).toBe(true);
   });
 
