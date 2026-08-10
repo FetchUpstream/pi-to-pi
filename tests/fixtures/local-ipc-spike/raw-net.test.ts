@@ -706,7 +706,7 @@ describe('raw node:net local IPC candidate', () => {
             }
             return;
           }
-          socket.write(response.subarray(offset, offset + 1));
+          socket.write(response.subarray(offset, offset + 1), () => undefined);
           offset += 1;
           dripWrites += 1;
         }, 10);
