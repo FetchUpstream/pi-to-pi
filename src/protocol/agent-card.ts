@@ -1,3 +1,9 @@
+import {
+  leaseExpiration,
+  serializeLeaseTimestamp,
+  type LeaseTimestamp,
+} from '../discovery/lease.js';
+
 /**
  * Versioned, discovery-only metadata published by a running Pi runtime.
  *
@@ -5,12 +11,11 @@
  * must not be used as a message, task, credential, or capability-token store.
  */
 
+export { DEFAULT_LEASE_RENEWAL_INTERVAL_MS, DEFAULT_LEASE_TTL_MS } from '../discovery/lease.js';
+
 export const AGENT_CARD_PROTOCOL_VERSION = 1 as const;
 export const SUPPORTED_AGENT_CARD_PROTOCOL_VERSIONS = [AGENT_CARD_PROTOCOL_VERSION] as const;
 export type AgentCardProtocolVersion = (typeof SUPPORTED_AGENT_CARD_PROTOCOL_VERSIONS)[number];
-
-export const DEFAULT_LEASE_TTL_MS = 90_000;
-export const DEFAULT_LEASE_RENEWAL_INTERVAL_MS = 30_000;
 
 export const MAX_AGENT_CARD_SIZE_BYTES = 64 * 1024;
 export const MAX_AGENT_ID_LENGTH = 128;
@@ -176,3 +181,70 @@ export function resolveDisplayName(
 
 /** Alias named after the rule used by lifecycle/card construction code. */
 export const effectiveDisplayName = resolveDisplayName;
+
+export interface AgentCardDraft {
+  readonly protocolVersion?: AgentCardProtocolVersion;
+  readonly sessionId: string;
+  readonly runtimeInstanceId: string;
+  readonly displayName?: string | null;
+  readonly roomId: string;
+  readonly purpose?: string | null;
+  readonly workingDirectoryLabel?: string | null;
+  readonly roleTags?: readonly string[];
+  readonly model?: AgentModel | null;
+  readonly capabilities: AgentCapabilities;
+  readonly state?: AgentState;
+  readonly contextUsage?: ContextUsage | null;
+  readonly inboundQueueDepth?: number;
+  readonly endpoint: Omit<EndpointDescriptor, 'runtimeInstanceId'> &
+    Partial<Pick<EndpointDescriptor, 'runtimeInstanceId'>>;
+  readonly runtimeStartedAt?: LeaseTimestamp;
+  readonly leaseExpiresAt?: LeaseTimestamp;
+  readonly now?: number | Date;
+  readonly ttlMs?: number;
+}
+
+/** Construct a complete card while keeping lease fields serialized as ISO text. */
+export function createAgentCard(draft: AgentCardDraft): AgentCard {
+  const now =
+    draft.now === undefined
+      ? Date.now()
+      : draft.now instanceof Date
+        ? draft.now.getTime()
+        : draft.now;
+  const runtimeStartedAt = serializeLeaseTimestamp(
+    draft.runtimeStartedAt ?? now,
+    'runtimeStartedAt',
+  );
+  const leaseExpiresAt = serializeLeaseTimestamp(
+    draft.leaseExpiresAt ?? leaseExpiration({ now, ttlMs: draft.ttlMs }),
+    'leaseExpiresAt',
+  );
+  const endpointRuntimeInstanceId = draft.endpoint.runtimeInstanceId ?? draft.runtimeInstanceId;
+  if (endpointRuntimeInstanceId !== draft.runtimeInstanceId) {
+    throw new TypeError('endpoint.runtimeInstanceId must match runtimeInstanceId');
+  }
+
+  return Object.freeze({
+    protocolVersion: draft.protocolVersion ?? AGENT_CARD_PROTOCOL_VERSION,
+    sessionId: draft.sessionId,
+    runtimeInstanceId: draft.runtimeInstanceId,
+    displayName: resolveDisplayName(draft.displayName, draft.runtimeInstanceId),
+    roomId: draft.roomId,
+    purpose: normalizeOptionalText(draft.purpose),
+    workingDirectoryLabel: normalizeOptionalText(draft.workingDirectoryLabel),
+    roleTags: Object.freeze([...(draft.roleTags ?? [])]),
+    model: normalizeModel(draft.model),
+    capabilities: draft.capabilities,
+    state: draft.state ?? 'idle',
+    contextUsage: normalizeContextUsage(draft.contextUsage),
+    inboundQueueDepth: draft.inboundQueueDepth ?? 0,
+    endpoint: Object.freeze({
+      kind: draft.endpoint.kind,
+      address: draft.endpoint.address,
+      runtimeInstanceId: draft.runtimeInstanceId,
+    }),
+    runtimeStartedAt,
+    leaseExpiresAt,
+  });
+}

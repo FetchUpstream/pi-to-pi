@@ -1078,7 +1078,7 @@ async function restoreQuarantinedUnixEntry(
       }
       try {
         if (quarantinedStat.isSymbolicLink()) {
-          const target = await withDeadline(tracker.track(readlink(quarantine)), deadline);
+          const target = await withDeadline(tracker.track(readlink(quarantine, 'utf8')), deadline);
           await withDeadline(tracker.track(symlink(target, endpoint)), deadline);
         } else {
           await withDeadline(tracker.track(link(quarantine, endpoint)), deadline);
