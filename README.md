@@ -52,9 +52,9 @@ The namespaced `--p2p-name` option is an explicit network-name override:
 - Without the override, the base comes from Pi's current session name, or falls back to `agent` when no session name exists. Pi's `session_info_changed` name changes update the published base only when no override is configured; they do not change the session ID, runtime ID, room, or endpoint.
 - Normalization applies NFKC, lowercases, rejects Unicode control and format characters (`Cc`/`Cf`), retains Unicode letters and numbers, converts runs of whitespace, punctuation, and symbols to `-`, collapses and trims hyphens, and bounds the result to 48 Unicode code points. An explicitly supplied value that becomes empty is rejected.
 
-The published network name is `<base>-<suffix>`, where `<suffix>` is the first four lowercase Crockford-base32 characters of the SHA-256 digest of the runtime UUID. The suffix identifies the runtime generation, so it changes when the runtime is replaced and does not change merely because the Pi session is renamed. Four characters are not a uniqueness guarantee.
+The normalized `NormalizedName` is the human-facing display base. The canonical `PublishedNetworkName` is `<base>-<suffix>`, where `<suffix>` is the first four lowercase Crockford-base32 characters of the SHA-256 digest of the full runtime UUID. The suffix identifies the runtime generation, so it changes when the runtime is replaced and does not change merely because the Pi session is renamed. Four characters are display- and lookup-only, not a routing identity or uniqueness guarantee.
 
-The full runtime UUID is the canonical machine-actionable peer address. A network name is only a human-facing lookup key. If a name matches more than one live record, resolution returns all candidate full runtime addresses and reports ambiguity; it does not choose a peer or silently rename one. Exact runtime addressing is still subject to room validation.
+The full runtime UUID plus exact opaque `roomId` is the canonical machine-actionable peer address. A `PublishedNetworkName` is only a human-facing lookup key. If a name matches more than one live record, resolution returns all candidate full runtime addresses and reports ambiguity; it does not choose a peer or silently rename one. External fields such as Agent Card `runtimeInstanceId` are validated and mapped to internal `runtimeId` only at an explicit adapter boundary.
 
 ### Project rooms and automatic room derivation
 
@@ -72,7 +72,7 @@ Each runtime belongs to exactly one room. Discovery and target validation requir
 
 ### Leases and stale peers
 
-Registry records are keyed by the full runtime UUID in a per-user room directory. A record includes the runtime ID, logical session ID, room ID, normalized network name, endpoint, and lease expiry. Publication uses a unique temporary file followed by an atomic rename.
+Registry records are keyed by the full runtime UUID in a per-user room directory. A record includes the runtime ID, logical session ID, opaque room ID, canonical `PublishedNetworkName`, endpoint, and lease expiry. Publication uses a unique temporary file followed by an atomic rename.
 
 A live runtime renews its own lease approximately every 10 seconds, with a 30-second lease window. Normal shutdown removes only its exact runtime record and is idempotent. If a process crashes, its record can remain on disk, but lease expiry is authoritative: discovery ignores an expired record and may garbage-collect it. A replacement runtime always has a new runtime UUID and endpoint, so it cannot be mistaken for or overwritten by the stale record.
 

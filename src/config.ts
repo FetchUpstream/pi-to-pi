@@ -6,13 +6,9 @@ import nodePath from 'node:path';
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 
-import {
-  asNormalizedName,
-  asProjectName,
-  type NormalizedName,
-  type ProjectName,
-} from './identity.js';
+import { asNormalizedName, type NormalizedName } from './identity.js';
 import type { ProtocolLimits } from './protocol/messages.js';
+import { normalizeProjectLabel, type NormalizedProjectLabel } from './room.js';
 /** Names registered through Pi's extension flag API. */
 export const P2P_NAME_FLAG = 'p2p-name' as const;
 export const P2P_PROJECT_FLAG = 'p2p-project' as const;
@@ -32,8 +28,6 @@ export interface ResolveP2PConfigOptions {
   readonly flags?: P2PFlagValues;
   readonly p2pName?: unknown;
   readonly p2pProject?: unknown;
-  readonly nameOverride?: unknown;
-  readonly projectOverride?: unknown;
   readonly sessionName?: string;
 }
 
@@ -46,7 +40,7 @@ export interface P2PConfig {
   /** Explicit `--p2p-name`, when configured. */
   readonly nameOverride?: P2PNameOverride;
   /** Explicit `--p2p-project`, when configured. */
-  readonly projectOverride?: ProjectName;
+  readonly projectOverride?: NormalizedProjectLabel;
 }
 
 /** Configuration error raised for an invalid explicit P2P option. */
@@ -89,15 +83,12 @@ export function readP2PFlags(pi: Pick<ExtensionAPI, 'getFlag'>): P2PFlagValues {
  * than becoming an invalid published name.
  */
 export function resolveP2PConfig(options: ResolveP2PConfigOptions = {}): P2PConfig {
-  const nameInput = firstDefined(options.p2pName, options.nameOverride, options.flags?.p2pName);
-  const projectInput = firstDefined(
-    options.p2pProject,
-    options.projectOverride,
-    options.flags?.p2pProject,
-  );
+  const nameInput = firstDefined(options.p2pName, options.flags?.p2pName);
+  const projectInput = firstDefined(options.p2pProject, options.flags?.p2pProject);
 
   const nameOverride = validateLabel(nameInput, P2P_NAME_FLAG) as P2PNameOverride | undefined;
-  const projectOverride = validateLabel(projectInput, P2P_PROJECT_FLAG) as ProjectName | undefined;
+  const projectOverride = validateLabel(projectInput, P2P_PROJECT_FLAG) as
+    NormalizedProjectLabel | undefined;
   const sessionName =
     options.sessionName && options.sessionName.length > 0 ? options.sessionName : undefined;
 
@@ -127,9 +118,6 @@ export function resolveP2PConfig(options: ResolveP2PConfigOptions = {}): P2PConf
   });
 }
 
-/** Short alias for consumers that use the generic configuration terminology. */
-export const resolveConfig = resolveP2PConfig;
-
 function firstDefined(...values: unknown[]): unknown {
   for (const value of values) {
     if (value !== undefined) {
@@ -142,7 +130,7 @@ function firstDefined(...values: unknown[]): unknown {
 function validateLabel(
   value: unknown,
   option: typeof P2P_NAME_FLAG | typeof P2P_PROJECT_FLAG,
-): NormalizedName | ProjectName | undefined {
+): NormalizedName | NormalizedProjectLabel | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -154,7 +142,7 @@ function validateLabel(
   }
 
   try {
-    return option === P2P_NAME_FLAG ? asNormalizedName(value) : asProjectName(value);
+    return option === P2P_NAME_FLAG ? asNormalizedName(value) : normalizeProjectLabel(value);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'the value is invalid';
     throw new P2PConfigurationError(option, message);

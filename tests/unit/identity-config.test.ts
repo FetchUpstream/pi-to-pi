@@ -9,6 +9,8 @@ import {
   resolveP2PConfig,
 } from '../../src/config.js';
 import {
+  adaptExternalPeerAddress,
+  adaptExternalRuntimeIdentity,
   asNormalizedName,
   asRuntimeId,
   asSessionId,
@@ -18,7 +20,7 @@ import {
   isSessionId,
   isUuid,
 } from '../../src/identity.js';
-import { asRoomId, createResolvedRoom, isRoomId } from '../../src/room.js';
+import { asRoomId, isValidRoomId, resolveRoom } from '../../src/room.js';
 
 describe('P2P identity and configuration foundations', () => {
   it('generates a new runtime identity for every lifecycle start', () => {
@@ -96,6 +98,31 @@ describe('P2P identity and configuration foundations', () => {
       createCanonicalPeerAddress('11111111-1111-4111-8111-111111111111', 'not-a-room'),
     ).toThrow('Invalid room ID');
   });
+  it('adapts external runtimeInstanceId fields to canonical identity and addresses', () => {
+    const roomId = asRoomId(`r1-${'a'.repeat(32)}`);
+    const runtimeInstanceId = '11111111-1111-4111-8111-111111111111';
+
+    expect(adaptExternalRuntimeIdentity({ sessionId: 'session-id', runtimeInstanceId })).toEqual({
+      sessionId: 'session-id',
+      runtimeId: runtimeInstanceId,
+    });
+    expect(adaptExternalPeerAddress({ runtimeInstanceId, roomId })).toEqual({
+      runtimeId: runtimeInstanceId,
+      roomId,
+    });
+    expect(() =>
+      adaptExternalRuntimeIdentity({ sessionId: 'session-id', runtimeInstanceId: 'runtime-1' }),
+    ).toThrow('full UUID');
+    expect(() => adaptExternalPeerAddress({ runtimeInstanceId: 'runtime-1', roomId })).toThrow(
+      'full UUID',
+    );
+    expect(() => adaptExternalPeerAddress({ runtimeInstanceId, roomId: '../room' })).toThrow(
+      'Invalid room ID',
+    );
+    expect(() => adaptExternalPeerAddress({ runtimeInstanceId, roomId: [roomId] })).toThrow(
+      'expected a string',
+    );
+  });
   it('keys shutdown to the owning runtime and tolerates repeated cleanup', () => {
     const uuids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
     const lifecycle = createRuntimeLifecycleForTesting(() => uuids.shift() ?? uuids[0]!);
@@ -163,12 +190,10 @@ describe('P2P identity and configuration foundations', () => {
 
   it('brands only opaque versioned room IDs', () => {
     const roomId = asRoomId(`r1-${'a'.repeat(32)}`);
-    expect(isRoomId(roomId)).toBe(true);
-    expect(createResolvedRoom(roomId, 'explicit-project', 'frontend')).toEqual({
-      id: roomId,
-      source: 'explicit-project',
-      input: 'frontend',
-    });
+    expect(isValidRoomId(roomId)).toBe(true);
+    const resolved = resolveRoom({ project: 'Frontend' });
+    expect(resolved).toMatchObject({ source: 'explicit', value: 'frontend' });
+    expect('id' in resolved).toBe(false);
     expect(() => asRoomId('../shared')).toThrow('Invalid room ID');
   });
 });

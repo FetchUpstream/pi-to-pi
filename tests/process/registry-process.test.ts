@@ -358,7 +358,7 @@ describe('multi-process registry publication and discovery', () => {
     );
     expect(result.records.every((record) => record.roomId === ROOM_A)).toBe(true);
     expect(result.lookup?.kind).toBe('ambiguous');
-    expect(result.lookup?.addresses?.map((address) => address.runtimeId).sort()).toEqual(
+    expect(result.lookup?.candidates?.map((address) => address.runtimeId).sort()).toEqual(
       [first.runtimeId, second.runtimeId].sort(),
     );
   }, 30_000);
@@ -386,7 +386,7 @@ describe('multi-process registry publication and discovery', () => {
     });
     const result = crossRoom.result as LookupResponse;
     expect(result.kind).toBe('cross-room');
-    expect(result.addresses?.map((address) => address.runtimeId)).toEqual([otherRoom.runtimeId]);
+    expect(result.candidates?.map((address) => address.runtimeId)).toEqual([otherRoom.runtimeId]);
   }, 30_000);
 
   it('keeps complete records from many concurrent child-process starts', async () => {
@@ -403,7 +403,7 @@ describe('multi-process registry publication and discovery', () => {
     );
     expect(sortedDiscoveredRecords).toEqual(sortedRecords);
     expect(result.lookup?.kind).toBe('ambiguous');
-    expect(result.lookup?.addresses).toHaveLength(indexes.length);
+    expect(result.lookup?.candidates).toHaveLength(indexes.length);
 
     const paths = getRegistryPaths(ROOM_A, { rootDirectory: root });
     const files = await readdir(paths.recordsDirectory);
