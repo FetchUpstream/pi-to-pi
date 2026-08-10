@@ -127,7 +127,15 @@ function errorCode(value: unknown): string | undefined {
     ? value.code
     : undefined;
 }
-
+function isTransientWindowsConnectError(error: unknown): boolean {
+  if (process.platform !== 'win32' || !(error instanceof TransportError)) {
+    return false;
+  }
+  if (error.code !== 'connect-error' || !('cause' in error)) {
+    return false;
+  }
+  return errorCode(error.cause) === 'ENOENT';
+}
 function normalizeTimeout(value: number | undefined, fallback: number, name: string): number {
   const timeout = value ?? fallback;
   if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > MAX_TIMER_DELAY_MS) {
@@ -1198,19 +1206,40 @@ export class LocalIpcTransport implements LocalIpcTransportContract {
     );
     let socket: Socket | undefined;
 
-    try {
-      return await withDeadline(
-        () => {
-          if (this.closing || this.closed) {
-            throw new TransportError('shutdown-error', 'Transport is shutting down');
+    const requestWithRetries = async (): Promise<Buffer> => {
+      for (;;) {
+        throwIfAborted(options.signal);
+        if (Date.now() >= overallDeadline.at) {
+          throw new PhaseDeadlineExceededError(overallDeadline.phase, overallDeadline.at);
+        }
+        const attemptSocket = this.options.socketFactory(endpoint);
+        socket = attemptSocket;
+        trackSocket(this.clientSockets, attemptSocket);
+        try {
+          return await this.requestOnSocket(
+            attemptSocket,
+            frame,
+            options,
+            overallDeadline,
+            startedAt,
+          );
+        } catch (error: unknown) {
+          if (!isTransientWindowsConnectError(error) || Date.now() >= overallDeadline.at) {
+            throw error;
           }
-          socket = this.options.socketFactory(endpoint);
-          trackSocket(this.clientSockets, socket);
-          return this.requestOnSocket(socket, frame, options, overallDeadline, startedAt);
-        },
-        overallDeadline,
-        { signal: options.signal, onTimeout: () => socket && destroySocket(socket) },
-      );
+          destroySocket(attemptSocket);
+          await socketClosed(attemptSocket);
+          socket = undefined;
+          await new Promise<void>((resolve) => setTimeout(resolve, 1));
+        }
+      }
+    };
+
+    try {
+      return await withDeadline(requestWithRetries(), overallDeadline, {
+        signal: options.signal,
+        onTimeout: () => socket && destroySocket(socket),
+      });
     } finally {
       if (socket !== undefined) {
         destroySocket(socket);

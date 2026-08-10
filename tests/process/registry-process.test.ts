@@ -13,8 +13,14 @@ const PUBLICATION_READY_TIMEOUT_MS = 2_000;
 const PUBLICATION_POLL_INTERVAL_MS = 25;
 const ROOM_A = `r1-${'a'.repeat(32)}`;
 const ROOM_B = `r1-${'b'.repeat(32)}`;
-const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
-const LOADER_PATH = fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
+const WORKER_PATH =
+  process.platform === 'win32'
+    ? new URL('./registry-worker.ts', import.meta.url).href
+    : fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
+const LOADER_PATH =
+  process.platform === 'win32'
+    ? new URL('./ts-source-loader.mjs', import.meta.url).href
+    : fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 interface WorkerInput {
