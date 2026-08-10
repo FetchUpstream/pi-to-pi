@@ -1,7 +1,7 @@
 import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -154,7 +154,7 @@ function runWorker(mode: string, payload: WorkerInput): Promise<WorkerResponse> 
       '--no-warnings',
       '--experimental-strip-types',
       '--loader',
-      pathToFileURL(LOADER_PATH).href,
+      LOADER_PATH,
       WORKER_PATH,
       mode,
     ],
