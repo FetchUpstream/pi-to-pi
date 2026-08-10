@@ -7,10 +7,10 @@
  * deterministic in unit tests and lets lifecycle integration stop it safely.
  */
 
-/** A lease is renewed roughly every ten seconds. */
-export const DEFAULT_LEASE_RENEWAL_INTERVAL_MS = 10_000;
-/** A record remains live for thirty seconds after its last renewal. */
-export const DEFAULT_LEASE_TTL_MS = 30_000;
+/** The canonical renewal interval shared by all discovery contracts. */
+export const DEFAULT_LEASE_RENEWAL_INTERVAL_MS = 30_000;
+/** The canonical time-to-live shared by all discovery contracts. */
+export const DEFAULT_LEASE_TTL_MS = 90_000;
 
 /** Compatibility aliases for callers that use the shorter names. */
 export const DEFAULT_RENEWAL_INTERVAL_MS = DEFAULT_LEASE_RENEWAL_INTERVAL_MS;
@@ -18,6 +18,7 @@ export const DEFAULT_TTL_MS = DEFAULT_LEASE_TTL_MS;
 export const LEASE_RENEWAL_INTERVAL_MS = DEFAULT_LEASE_RENEWAL_INTERVAL_MS;
 export const LEASE_TTL_MS = DEFAULT_LEASE_TTL_MS;
 
+export type LeaseTimestamp = number | Date | string;
 export type LeaseClock = () => number;
 export type LeaseRenewal = () => void | Promise<void>;
 export type LeaseTimer = ReturnType<typeof setInterval>;
@@ -83,6 +84,31 @@ function finiteTimestamp(value: number, label: string): number {
   return value;
 }
 
+/** Parse a serialized or in-memory lease timestamp to epoch milliseconds. */
+export function parseLeaseTimestamp(value: LeaseTimestamp, label = 'lease timestamp'): number {
+  const parsed =
+    value instanceof Date ? value.getTime() : typeof value === 'string' ? Date.parse(value) : value;
+  return finiteTimestamp(parsed, label);
+}
+
+/** Serialize an in-memory lease timestamp as canonical ISO-8601 UTC text. */
+export function serializeLeaseTimestamp(value: LeaseTimestamp, label = 'lease timestamp'): string {
+  const parsed = parseLeaseTimestamp(value, label);
+  try {
+    return new Date(parsed).toISOString();
+  } catch {
+    throw new LeaseConfigurationError(`${label} is outside the supported ISO timestamp range`);
+  }
+}
+
+/** Calculate and serialize a lease expiry using the canonical policy. */
+export function leaseExpirationIso(options?: {
+  readonly now?: number | Date;
+  readonly ttlMs?: number;
+}): string {
+  return serializeLeaseTimestamp(leaseExpiration(options), 'lease expiration');
+}
+
 function clockValue(clock: LeaseClock): number {
   return finiteTimestamp(clock(), 'lease clock');
 }
@@ -125,16 +151,20 @@ export function leaseExpiration(
 /** Alias used by record-publishing callers. */
 export const leaseExpiresAt = leaseExpiration;
 
-/** Return whether a numeric expiry has passed at the supplied clock value. */
-export function isLeaseExpired(leaseExpiresAt: number, now = Date.now()): boolean {
-  if (!Number.isFinite(leaseExpiresAt) || !Number.isFinite(now)) {
+/** Return whether an in-memory or serialized expiry has passed at the supplied clock value. */
+export function isLeaseExpired(leaseExpiresAt: LeaseTimestamp, now = Date.now()): boolean {
+  if (!Number.isFinite(now)) {
     return true;
   }
-  return leaseExpiresAt <= now;
+  try {
+    return parseLeaseTimestamp(leaseExpiresAt) <= now;
+  } catch {
+    return true;
+  }
 }
 
 /** Keep only records whose lease expiry is still in the future. */
-export function filterUnexpiredRecords<T extends { readonly leaseExpiresAt: number }>(
+export function filterUnexpiredRecords<T extends { readonly leaseExpiresAt: LeaseTimestamp }>(
   records: readonly T[],
   now = Date.now(),
 ): T[] {

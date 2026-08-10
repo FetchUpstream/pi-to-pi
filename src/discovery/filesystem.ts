@@ -4,12 +4,14 @@ import type { FileHandle } from 'node:fs/promises';
 import nodePath from 'node:path';
 import { PRIVATE_DIRECTORY_MODE, protectWindowsPathSync, resolveRuntimeRoot } from '../config.js';
 import type { RuntimeRootOptions, RuntimeRootSelection } from '../config.js';
+import { assertValidRoomId, isSafeStorageKey } from '../room.js';
+import { DEFAULT_LEASE_TTL_MS } from './lease.js';
 import { MAX_AGENT_CARD_SIZE_BYTES } from '../protocol/agent-card.js';
 import { isSafeRuntimeInstanceId, validateAgentCard } from '../protocol/validation.js';
 /** Card files are deliberately bounded before they reach the filesystem. */
 export const DEFAULT_MAX_CARD_BYTES = 1024 * 1024;
-/** A temp file older than two lease TTLs is safe to consider abandoned. */
-export const DEFAULT_ABANDONED_TEMP_AGE_MS = 2 * 90_000;
+/** A temp file older than two canonical lease TTLs is safe to consider abandoned. */
+export const DEFAULT_ABANDONED_TEMP_AGE_MS = 2 * DEFAULT_LEASE_TTL_MS;
 export const DEFAULT_ABANDONED_TEMP_MAX_ENTRIES = 128;
 export const DEFAULT_ABANDONED_TEMP_TIME_BUDGET_MS = 250;
 export const PRIVATE_FILE_MODE = 0o600;
@@ -172,17 +174,16 @@ function safeComponent(value: string, label: string): string {
 }
 
 function validateRoomIdentity(identity: RoomStorageIdentity): void {
-  if (
-    typeof identity.roomId !== 'string' ||
-    identity.roomId.length === 0 ||
-    identity.roomId.length > 1024
-  ) {
-    throw new PrivateFilesystemError('roomId must be a non-empty canonical identity');
+  try {
+    assertValidRoomId(identity.roomId);
+  } catch {
+    throw new PrivateFilesystemError('roomId must be a canonical r1 room identity');
   }
-  if (containsControlCharacter(identity.roomId)) {
-    throw new PrivateFilesystemError('roomId contains a control character');
+  if (!isSafeStorageKey(identity.storageKey)) {
+    throw new PrivateFilesystemError(
+      `storageKey is not a safe filesystem component: ${identity.storageKey}`,
+    );
   }
-  safeComponent(identity.storageKey, 'storageKey');
 }
 
 function runtimeRootPath(root: string | RuntimeRootSelection): string {
@@ -839,16 +840,27 @@ export async function writeAgentCardAtomically(
       try {
         const temporary = await openUniqueTemporaryCard(target.agentsDirectory, identity);
         temporaryPath = temporary.path;
-        handle = temporary.handle;
-        await handle.writeFile(serialized, 'utf8');
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
-        await ensurePrivateFile(temporaryPath, options);
-        await rename(temporaryPath, target.finalPath);
-        temporaryPath = undefined;
-        await ensurePrivateFile(target.finalPath, options);
-        return target.finalPath;
+        const temporaryHandle = temporary.handle;
+        handle = temporaryHandle;
+        const writtenPath = await withAgentCardWriteLock(
+          temporary.path,
+          async () => {
+            await temporaryHandle.writeFile(serialized, 'utf8');
+            await temporaryHandle.sync();
+            await temporaryHandle.close();
+            handle = undefined;
+            await ensurePrivateFile(temporary.path, options);
+            await rename(temporary.path, target.finalPath);
+            temporaryPath = undefined;
+            await ensurePrivateFile(target.finalPath, options);
+            return target.finalPath;
+          },
+          options,
+        );
+        if (writtenPath === undefined) {
+          throw new PrivateFilesystemError('Agent Card publication exceeded its write deadline');
+        }
+        return writtenPath;
       } catch (error) {
         if (handle) {
           await handle.close().catch(() => undefined);
@@ -1085,44 +1097,16 @@ export async function cleanupAbandonedTemporaryFiles(
       continue;
     }
 
-    // Re-read immediately before unlinking, so a writer that replaced or
-    // renewed this temp path cannot be removed based on stale metadata.
-    let second;
-    try {
-      const result = await awaitBeforeDeadline(lstat(path), deadlineMs);
-      if (result === DEADLINE_EXCEEDED) {
-        break;
-      }
-      second = result;
-    } catch (error) {
-      if (isMissing(error)) {
-        continue;
-      }
-      throw error;
-    }
+    // Compare and delete under the same lock used by card writers. The writer
+    // also locks its temporary path, so an in-flight publication cannot be
+    // unlinked after this candidate has been revalidated.
     if (
-      !second.isFile() ||
-      second.isSymbolicLink() ||
-      first.dev !== second.dev ||
-      first.ino !== second.ino ||
-      first.size !== second.size ||
-      first.mtimeMs !== second.mtimeMs
+      await compareAndDeleteFile(path, fileSnapshot(first), {
+        ...options,
+        deadlineMs,
+      })
     ) {
-      continue;
-    }
-    if (deadlineExpired(deadlineMs)) {
-      break;
-    }
-    try {
-      const result = await awaitBeforeDeadline(unlink(path), deadlineMs);
-      if (result === DEADLINE_EXCEEDED) {
-        return removed;
-      }
       removed += 1;
-    } catch (error) {
-      if (!isMissing(error)) {
-        throw error;
-      }
     }
   }
   return removed;

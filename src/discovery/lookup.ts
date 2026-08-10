@@ -205,9 +205,10 @@ function recordsFor<TRecord extends PeerRecordLike>(
 /**
  * Resolve a normalized human-facing name in one exact room.
  *
- * The input records are expected to come from `listRuntimeRecords(currentRoom)`;
- * room filtering is repeated here so this helper cannot accidentally become a
- * cross-room fallback when used with a broader in-memory collection.
+ * The input records are expected to come from a room-scoped discovery adapter;
+ * both the Agent Card boundary and the deprecated compatibility seam can provide
+ * this pure lookup shape. Room filtering is repeated here so this helper cannot
+ * accidentally become a cross-room fallback when used with a broader collection.
  */
 export function lookupPeerByName<TRecord extends PeerRecordLike>(
   name: string,
