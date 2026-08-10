@@ -16,16 +16,25 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function registry(): Promise<AgentCardRegistry> {
-  const rootDirectory = await mkdtemp(join(tmpdir(), 'pi-to-pi-adapter-'));
-  roots.push(rootDirectory);
+async function registry(
+  options: {
+    readonly rootDirectory?: string;
+    readonly runtimeId?: string;
+    readonly sessionId?: string;
+    readonly displayName?: string;
+    readonly address?: string;
+  } = {},
+): Promise<AgentCardRegistry> {
+  const rootDirectory =
+    options.rootDirectory ?? (await mkdtemp(join(tmpdir(), 'pi-to-pi-adapter-')));
+  if (options.rootDirectory === undefined) roots.push(rootDirectory);
   const instance = new AgentCardRegistry({
     rootDirectory,
     room: { roomId: ROOM_ID, storageKey: 'adapter-room' },
-    runtimeId: RUNTIME_ID,
-    sessionId: 'session-a',
-    displayName: 'planner',
-    endpoint: { kind: 'unix', address: '/tmp/pi-to-pi-adapter' },
+    runtimeId: options.runtimeId ?? RUNTIME_ID,
+    sessionId: options.sessionId ?? 'session-a',
+    displayName: options.displayName ?? 'planner',
+    endpoint: { kind: 'unix', address: options.address ?? '/tmp/pi-to-p2p-adapter' },
   });
   await instance.start();
   return instance;
@@ -51,9 +60,14 @@ describe('PiAdapter', () => {
       'p2p_report_issue',
       'p2p_status',
     ]);
-    await expect(adapter.listPeers()).resolves.toMatchObject([
-      { displayName: 'planner', runtimeId: RUNTIME_ID },
-    ]);
+    const peersTool = registerTool.mock.calls.find(([tool]) => tool.name === 'p2p_peers')?.[0];
+    const toolResult = await peersTool.execute('call-1', {});
+    expect(toolResult.content[0].text).toContain('You: planner');
+    expect(toolResult.content[0].text).not.toContain('endpoint');
+    await expect(adapter.listPeers()).resolves.toMatchObject({
+      self: { displayName: 'planner', publishedTarget: expect.any(String) },
+      peers: [],
+    });
   });
 
   it('suppresses an inbound task whose cancellation signal is already aborted', async () => {
@@ -70,6 +84,43 @@ describe('PiAdapter', () => {
     await adapter.taskExecutor({ signal: controller.signal } as never);
 
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+  it('projects self-aware compact discovery and keeps ambiguous runtime IDs', async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), 'pi-to-pi-adapter-many-'));
+    roots.push(rootDirectory);
+    const self = await registry({ rootDirectory });
+    const remote = await registry({
+      rootDirectory,
+      runtimeId: '22222222-2222-4222-8222-222222222222',
+      sessionId: 'session-b',
+      displayName: 'planner',
+      address: '/tmp/pi-to-pi-adapter-remote',
+    });
+    const adapter = new PiAdapter({
+      peers: self,
+      router: new MessageRouter({ runtimeId: RUNTIME_ID, sessionId: 'session-a', roomId: ROOM_ID }),
+    });
+
+    await remote.updateMetadata({
+      state: 'busy',
+      inboundQueueDepth: 2,
+      model: { provider: 'test', id: 'model-1' },
+      contextUsage: { tokens: 120, percent: 4 },
+    });
+    const view = await adapter.listPeers();
+    expect(view.self).toMatchObject({ displayName: 'planner', state: 'idle' });
+    expect(view.peers).toHaveLength(1);
+    expect(view.peers[0]).toMatchObject({
+      displayName: 'planner',
+      state: 'busy',
+      inboundQueueDepth: 2,
+      model: { provider: 'test', id: 'model-1' },
+      runtimeId: '22222222-2222-4222-8222-222222222222',
+    });
+    expect(JSON.stringify(view)).not.toContain('endpoint');
+    expect(JSON.stringify(view).length).toBeLessThan(JSON.stringify(await self.listPeers()).length);
+
+    await Promise.all([self.shutdown(), remote.shutdown()]);
   });
   it('uses triggered idle delivery and steer while busy', async () => {
     const peers = await registry();
