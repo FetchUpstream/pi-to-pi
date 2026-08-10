@@ -265,8 +265,10 @@ describe('runtime record validation and atomic publication', () => {
     expect(
       (await readdir(paths.recordsDirectory)).filter((name) => name.includes('.tmp-')),
     ).toEqual([]);
-    expect((await stat(root)).mode & 0o7777).toBe(PRIVATE_DIRECTORY_MODE);
-    expect((await stat(path)).mode & 0o7777).toBe(PRIVATE_FILE_MODE);
+    if (process.platform !== 'win32') {
+      expect((await stat(root)).mode & 0o7777).toBe(PRIVATE_DIRECTORY_MODE);
+      expect((await stat(path)).mode & 0o7777).toBe(PRIVATE_FILE_MODE);
+    }
     expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(published);
   });
 

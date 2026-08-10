@@ -1134,6 +1134,12 @@ export class LocalIpcTransport implements LocalIpcTransportContract {
       await listenServer(server, endpoint);
       return await publish();
     } catch (error: unknown) {
+      if (isAddressInUse(error) && !isPosixRuntime() && !this.closing && !this.closed) {
+        await discard();
+        throw new TransportError('endpoint-in-use', `A live listener owns endpoint ${endpoint}`, {
+          cause: error,
+        });
+      }
       if (!isAddressInUse(error) || !isPosixRuntime() || this.closing || this.closed) {
         await discard();
         throw error;

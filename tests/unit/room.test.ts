@@ -127,7 +127,10 @@ describe('Git and cwd room derivation', () => {
     expect(discoverGitCommonDirectory(directory, { gitRunner: runner })).toBe(
       realpathSync(resolve(commonDirectory)),
     );
-    expect(runner).toHaveBeenCalledWith(resolve(directory), GIT_COMMON_DIRECTORY_ARGS);
+    expect(runner).toHaveBeenCalledWith(
+      realpathSync(resolve(directory)),
+      GIT_COMMON_DIRECTORY_ARGS,
+    );
     expect(Object.isFrozen(GIT_COMMON_DIRECTORY_ARGS)).toBe(true);
   });
 

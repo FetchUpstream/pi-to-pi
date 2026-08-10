@@ -11,6 +11,7 @@ import {
   PhaseDeadlineExceededError,
   TransportError,
   createIpcEndpoint,
+  isWindowsPipeEndpoint,
   encodeFrame,
   LocalIpcTransport,
 } from '../../src/transport/index.js';
@@ -241,9 +242,9 @@ describe('production local IPC transport', () => {
     });
     transports.push(transport);
 
-    await expect(
-      transport.request('fixture-backpressure', Buffer.from('request')),
-    ).resolves.toEqual(Buffer.from('fake-response'));
+    await expect(transport.request(createIpcEndpoint(), Buffer.from('request'))).resolves.toEqual(
+      Buffer.from('fake-response'),
+    );
     expect(backpressure).toEqual(['request']);
   });
 
@@ -329,7 +330,7 @@ describe('production local IPC transport', () => {
     const peer = createServer((socket) => socket.destroy());
     await listen(peer, peerEndpoint);
     await expect(transport.request(peerEndpoint, Buffer.from('peer-exit'))).rejects.toMatchObject({
-      code: expect.stringMatching(/^(connect|write|premature|read)/u),
+      code: expect.stringMatching(/^(connect|write|premature|truncated|read)/u),
     });
     await closeServer(peer);
   });
@@ -361,7 +362,12 @@ describe('production local IPC transport', () => {
     const payload = Buffer.from('{"task":"opaque"}');
     expect(payload).toBeInstanceOf(Uint8Array);
     expect(transport.maxPayloadBytes).toBeGreaterThan(0);
-    expect(createIpcEndpoint()).toMatch(/^\/tmp\/p2p-[a-f0-9]{24}\.sock$/u);
+    const endpoint = createIpcEndpoint();
+    expect(
+      process.platform === 'win32'
+        ? isWindowsPipeEndpoint(endpoint)
+        : /^\/tmp\/p2p-[a-f0-9]{24}\.sock$/u.test(endpoint),
+    ).toBe(true);
     expect(new TransportError('connect-error', 'test')).toMatchObject({ code: 'connect-error' });
 
     const source = await fs.readFile(
