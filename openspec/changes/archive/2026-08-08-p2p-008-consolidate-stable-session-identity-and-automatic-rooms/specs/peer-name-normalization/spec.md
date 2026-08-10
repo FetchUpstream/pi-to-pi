@@ -1,10 +1,4 @@
-# Peer Name Normalization
-
-## Purpose
-
-TBD — define normalized, collision-safe network peer names.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Namespaced network-name configuration
 The extension MUST expose `--p2p-name` as the explicit network-name override. Without that override, Pi's native session name MUST remain the primary human-facing name source, with the documented `agent` fallback when no usable native name exists.
@@ -16,21 +10,6 @@ The extension MUST expose `--p2p-name` as the explicit network-name override. Wi
 #### Scenario: No explicit P2P name is supplied
 - **WHEN** the runtime starts without `--p2p-name`
 - **THEN** the published network name is based on Pi's current session name, or the `agent` fallback when no usable session name exists
-
-### Requirement: Canonical lowercase name normalization
-The extension MUST normalize a name by applying NFKC normalization, lowercasing, rejecting Unicode control and format characters (`Cc`/`Cf`), retaining Unicode letters and numbers, replacing runs of whitespace/punctuation/symbols with `-`, collapsing repeated hyphens, trimming hyphens, and enforcing a maximum of 48 Unicode code points.
-
-#### Scenario: Mixed-case and symbols are normalized
-- **WHEN** a name contains uppercase letters, whitespace, punctuation, or symbols
-- **THEN** the published base name is lowercase, hyphen-separated, and contains no unnormalized symbol runs
-
-#### Scenario: Explicit name has no valid content
-- **WHEN** an explicitly supplied P2P name becomes empty after normalization
-- **THEN** startup rejects the invalid configuration
-
-#### Scenario: No name is configured
-- **WHEN** neither `--p2p-name` nor a Pi session name is available
-- **THEN** the normalized base name is `agent`
 
 ### Requirement: Runtime-derived four-character suffix
 The published network name MUST append a four-character lowercase Crockford-base32 suffix derived from the full runtime UUID's SHA-256 digest. The suffix MUST remain display- and lookup-only and MUST NOT become a routing identifier.
