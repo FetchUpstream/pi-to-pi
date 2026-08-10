@@ -252,7 +252,7 @@ describe('AgentCardRegistry boundary', () => {
     now = BASE_NOW + 300;
     const result = await cleanupAgentCardState(
       { roomId: ROOM_ID, storageKey: STORAGE_KEY },
-      { rootDirectory, now, ttlMs: 100, maxEntries: 32 },
+      { rootDirectory, now, ttlMs: 100, maxEntries: 32, maxDurationMs: 2_000 },
     );
     expect(result).toEqual({ cardsRemoved: 1, temporaryFilesRemoved: 1, totalRemoved: 2 });
     await expect(readFile(oldTemporary, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
