@@ -78,6 +78,18 @@ export function isUuid(value: unknown): value is string {
   );
 }
 
+/** Return whether a value is a canonical lowercase UUID version 4. */
+export function isUuidV4(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value)
+  );
+}
+
+/** Bounded identifier grammar used at protocol boundaries for session/runtime labels. */
+export function isSafeIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/u.test(value);
+}
 /** Normalize and brand a canonical network display base. */
 export function asNormalizedName(value: string): NormalizedName {
   return normalizeProjectLabel(value) as NormalizedName;

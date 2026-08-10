@@ -12,7 +12,7 @@ import {
   type NormalizedName,
   type ProjectName,
 } from './identity.js';
-
+import type { ProtocolLimits } from './protocol/messages.js';
 /** Names registered through Pi's extension flag API. */
 export const P2P_NAME_FLAG = 'p2p-name' as const;
 export const P2P_PROJECT_FLAG = 'p2p-project' as const;
@@ -497,3 +497,54 @@ export function resolveRuntimeRootPath(options: RuntimeRootOptions = {}): string
 
 /** Compatibility alias for registry callers that use a getter-style name. */
 export const getRuntimeRoot = resolveRuntimeRoot;
+
+/** v1 protocol defaults and hard maxima. */
+export const DEFAULT_REQUEST_TTL_MS = 10 * 60 * 1000;
+export const MAX_REQUEST_TTL_MS = 60 * 60 * 1000;
+export const MAX_CONTROL_TTL_MS = 30 * 1000;
+export const MAX_ENVELOPE_BYTES = 1024 * 1024;
+export const MAX_SCHEMA_BYTES = 64 * 1024;
+export const DEFAULT_QUEUE_LIMIT = 32;
+export const DEDUPE_RETENTION_GRACE_MS = 10 * 60 * 1000;
+
+export type ProtocolConfig = ProtocolLimits;
+export type PiToPiProtocolConfig = ProtocolConfig;
+
+const V1_LIMIT_CEILINGS: Readonly<ProtocolLimits> = Object.freeze({
+  requestTtlMs: MAX_REQUEST_TTL_MS,
+  maxRequestTtlMs: MAX_REQUEST_TTL_MS,
+  maxControlTtlMs: MAX_CONTROL_TTL_MS,
+  maxEnvelopeBytes: MAX_ENVELOPE_BYTES,
+  maxSchemaBytes: MAX_SCHEMA_BYTES,
+  maxQueueEntries: DEFAULT_QUEUE_LIMIT,
+});
+
+export const DEFAULT_PROTOCOL_LIMITS: Readonly<ProtocolLimits> = Object.freeze({
+  requestTtlMs: DEFAULT_REQUEST_TTL_MS,
+  maxRequestTtlMs: MAX_REQUEST_TTL_MS,
+  maxControlTtlMs: MAX_CONTROL_TTL_MS,
+  maxEnvelopeBytes: MAX_ENVELOPE_BYTES,
+  maxSchemaBytes: MAX_SCHEMA_BYTES,
+  maxQueueEntries: DEFAULT_QUEUE_LIMIT,
+});
+export const DEFAULT_PROTOCOL_CONFIG: Readonly<ProtocolConfig> = DEFAULT_PROTOCOL_LIMITS;
+export const DEFAULT_CONFIG: Readonly<ProtocolConfig> = DEFAULT_PROTOCOL_CONFIG;
+
+export function createProtocolConfig(overrides: Partial<ProtocolConfig> = {}): ProtocolConfig {
+  const config = { ...DEFAULT_PROTOCOL_LIMITS, ...overrides };
+  for (const [name, ceiling] of Object.entries(V1_LIMIT_CEILINGS) as [
+    keyof ProtocolLimits,
+    number,
+  ][]) {
+    const value = config[name];
+    if (!Number.isFinite(value) || value <= 0 || value > ceiling) {
+      throw new RangeError(`${name} must be a finite positive value no greater than ${ceiling}`);
+    }
+  }
+  if (config.requestTtlMs > config.maxRequestTtlMs) {
+    throw new RangeError('requestTtlMs must not exceed maxRequestTtlMs');
+  }
+  return config;
+}
+
+export const resolveProtocolLimits = createProtocolConfig;
