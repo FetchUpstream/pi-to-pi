@@ -266,7 +266,7 @@ async function corrupt(payload: WorkerPayload): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const mode = process.argv[2];
+  const mode = process.env.PI_TO_PI_PROCESS_MODE ?? process.argv[2];
   const payload = readPayload();
   switch (mode) {
     case 'start':

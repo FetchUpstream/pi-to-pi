@@ -1062,7 +1062,7 @@ async function restoreQuarantinedUnixEntry(
   // when the endpoint is vacant; never overwrite a replacement endpoint.
   let operationError: unknown;
   let relinkSawEexist = false;
-  let relinkRestored = false;
+  let relinkedEndpointIdentity: BigIntStats | undefined;
   try {
     let endpointStat: BigIntStats | undefined;
     try {
@@ -1083,7 +1083,10 @@ async function restoreQuarantinedUnixEntry(
         } else {
           await withDeadline(tracker.track(link(quarantine, endpoint)), deadline);
         }
-        relinkRestored = true;
+        relinkedEndpointIdentity = await withDeadline(
+          tracker.track(lstat(endpoint, { bigint: true })),
+          deadline,
+        );
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           throw error;
@@ -1121,12 +1124,19 @@ async function restoreQuarantinedUnixEntry(
     const endpointSharesQuarantine =
       finalEndpointStat !== undefined &&
       sameUnixObjectIdentity(finalEndpointStat, finalQuarantineStat);
+    const endpointRetainsRelinkedEntry =
+      finalEndpointStat !== undefined &&
+      relinkedEndpointIdentity !== undefined &&
+      sameUnixObjectIdentity(finalEndpointStat, relinkedEndpointIdentity);
     // An EEXIST relink means another owner has claimed the endpoint. Preserve
     // a non-owned quarantine entry even when it is unchanged: it may be the
     // only pathname for a live listener moved by the racing rename. Only an
     // unchanged moved entry can be removed, and owned residuals are removable
     // even when the replacement owns the endpoint.
-    if (quarantinedIsOwned || (!relinkSawEexist && (endpointSharesQuarantine || relinkRestored))) {
+    if (
+      quarantinedIsOwned ||
+      (!relinkSawEexist && (endpointSharesQuarantine || endpointRetainsRelinkedEntry))
+    ) {
       await withDeadline(tracker.track(unlink(quarantine)), deadline);
     }
   } catch (error: unknown) {

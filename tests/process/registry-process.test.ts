@@ -16,12 +16,9 @@ const ROOM_B = `r1-${'b'.repeat(32)}`;
 const STORAGE_KEY_A = 'room-a';
 const STORAGE_KEY_B = 'room-b';
 const CARD_BASE_NOW = Date.parse('2026-01-01T00:00:00.000Z');
-const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
-const LOADER_PATH =
-  process.platform === 'win32'
-    ? new URL('./ts-source-loader.mjs', import.meta.url).href
-    : fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const WORKER_URL = new URL('./registry-worker.ts', import.meta.url).href;
+const LOADER_URL = new URL('./ts-source-loader.mjs', import.meta.url).href;
 
 interface WorkerInput {
   readonly root: string;
@@ -153,11 +150,21 @@ async function temporaryRoot(): Promise<string> {
 function runWorker(mode: string, payload: WorkerInput): Promise<WorkerResponse> {
   const child = spawn(
     process.execPath,
-    ['--no-warnings', '--experimental-strip-types', '--loader', LOADER_PATH, WORKER_PATH, mode],
+    [
+      '--no-warnings',
+      '--experimental-strip-types',
+      '--loader',
+      LOADER_URL,
+      '--import',
+      WORKER_URL,
+      '--eval',
+      '',
+    ],
     {
       cwd: REPOSITORY_ROOT,
       env: {
         ...process.env,
+        PI_TO_PI_PROCESS_MODE: mode,
         PI_TO_PI_PROCESS_PAYLOAD: JSON.stringify(payload),
       },
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -78,7 +78,7 @@ describe('AgentCardRegistry boundary', () => {
 
     const peers = await listLiveAgentCardPeers(
       { roomId: ROOM_ID, storageKey: STORAGE_KEY },
-      { rootDirectory, now: BASE_NOW },
+      { rootDirectory, now: BASE_NOW, maxDurationMs: 2_000 },
     );
     expect(peers.map((peer) => peer.runtimeId).sort()).toEqual([RUNTIME_A, RUNTIME_B].sort());
     expect(new Set(peers.map((peer) => peer.networkName)).size).toBe(2);
