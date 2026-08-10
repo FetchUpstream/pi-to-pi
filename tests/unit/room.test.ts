@@ -13,11 +13,10 @@ import {
   assertExactRoom,
   canonicalizeDirectory,
   deriveExplicitRoomId,
-  deriveRoom,
   deriveRoomId,
   discoverGitCommonDirectory,
   hashRoomId,
-  isSameRoom,
+  roomsEqual,
   isValidRoomId,
   normalizeProjectLabel,
   resolveRoom,
@@ -164,7 +163,7 @@ describe('Git and cwd room derivation', () => {
     initializeRepository(first);
     initializeRepository(second);
 
-    expect(deriveRoom({ cwd: first })).not.toBe(deriveRoom({ cwd: second }));
+    expect(deriveRoomId({ cwd: first })).not.toBe(deriveRoomId({ cwd: second }));
   });
 
   it('falls back to canonical cwd when Git fails', () => {
@@ -244,10 +243,9 @@ describe('exact room isolation', () => {
     const current = deriveExplicitRoomId('frontend');
     const other = deriveExplicitRoomId('backend');
 
-    expect(isSameRoom(current, current)).toBe(true);
-    expect(isSameRoom(current, { roomId: current })).toBe(true);
-    expect(isSameRoom(current, other)).toBe(false);
-    expect(isSameRoom('not-a-room', 'not-a-room')).toBe(false);
+    expect(roomsEqual(current, current)).toBe(true);
+    expect(roomsEqual(current, other)).toBe(false);
+    expect(roomsEqual('not-a-room', 'not-a-room')).toBe(false);
     expect(assertExactRoom(current, current)).toBe(current);
     expect(() => assertExactRoom(current, other)).toThrow(RoomIsolationError);
     expect(() => assertExactRoom(current, 'not-a-room')).toThrow(InvalidRoomIdError);

@@ -1,7 +1,7 @@
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
 
 /** The room-id format version. A future incompatible contract must use another prefix. */
 export const ROOM_ID_VERSION = 'r1';
@@ -12,9 +12,6 @@ export const ROOM_ID_PREFIX = `${ROOM_ID_VERSION}-`;
 /** Maximum number of Unicode code points in a normalized explicit project label. */
 export const MAX_PROJECT_LABEL_CODE_POINTS = 48;
 
-/** Alias retained for callers that use length terminology for the code-point bound. */
-export const MAX_PROJECT_LABEL_LENGTH = MAX_PROJECT_LABEL_CODE_POINTS;
-
 const ROOM_ID_HEX_LENGTH = 32;
 const ROOM_ID_PATTERN = new RegExp(`^${ROOM_ID_PREFIX}[0-9a-f]{${ROOM_ID_HEX_LENGTH}}$`, 'u');
 const CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}]/u;
@@ -23,11 +20,6 @@ const LETTER_OR_NUMBER_PATTERN = /[\p{L}\p{N}]/u;
 /** Canonical discriminators used in room hashing and automatic resolution. */
 export type CanonicalRoomSource = 'explicit' | 'git' | 'cwd';
 
-/** Legacy source names retained for the identity foundation compatibility seam. */
-export type LegacyRoomSource = 'explicit-project' | 'git-common-directory' | 'working-directory';
-
-/** Source used to derive a room; legacy names are accepted only by compatibility models. */
-export type RoomSource = CanonicalRoomSource | LegacyRoomSource;
 /** A normalized project label is safe to use as a logical value, not as a path. */
 export type NormalizedProjectLabel = string & {
   readonly __normalizedProjectLabel: unique symbol;
@@ -52,14 +44,10 @@ export type GitCommonDirectoryRunner = (cwd: string, args: readonly string[]) =>
 export interface RoomDerivationOptions {
   /** Explicit `--p2p-project` label. It takes precedence over all path discovery. */
   readonly project?: string;
-  /** Verbose alias for `project`, useful at integration boundaries. */
-  readonly explicitProject?: string;
   /** Working directory to resolve; defaults to `process.cwd()`. */
   readonly cwd?: string;
   /** Override Git invocation for tests or an embedding runtime. */
   readonly gitRunner?: GitCommonDirectoryRunner;
-  /** Alias for `gitRunner` retained for integration callers. */
-  readonly runGit?: GitCommonDirectoryRunner;
   /** Override realpath canonicalization for tests or an embedding runtime. */
   readonly realpath?: RealpathResolver;
 }
@@ -67,11 +55,13 @@ export interface RoomDerivationOptions {
 /** Options specific to Git common-directory discovery. */
 export interface GitCommonDirectoryOptions {
   readonly gitRunner?: GitCommonDirectoryRunner;
-  readonly runGit?: GitCommonDirectoryRunner;
   readonly realpath?: RealpathResolver;
 }
 
-/** Metadata returned by automatic room resolution in addition to the opaque room id. */
+/**
+ * Metadata returned by automatic room resolution in addition to the opaque room
+ * id. The source is always `explicit`, `git`, or `cwd`.
+ */
 export interface ResolvedRoom {
   readonly roomId: RoomId;
   readonly source: CanonicalRoomSource;
@@ -79,15 +69,6 @@ export interface ResolvedRoom {
   readonly value: string;
 }
 
-/** Legacy resolved-room model retained for the identity foundation compatibility seam. */
-export interface LegacyResolvedRoom {
-  readonly id: RoomId;
-  readonly source: RoomSource;
-  readonly input: string;
-}
-/** A room id or an object carrying one, accepted by exact-room helpers. */
-export type RoomLike =
-  RoomId | string | { readonly roomId: RoomId | string } | { readonly id: RoomId | string };
 /** Thrown when an explicit project label cannot become a valid normalized label. */
 export class InvalidProjectLabelError extends TypeError {
   public constructor(message: string) {
@@ -117,15 +98,13 @@ export class RoomIsolationError extends Error {
   }
 }
 
-/** Compatibility name for integrations that call a cross-room failure a mismatch. */
-export { RoomIsolationError as CrossRoomError };
-
 /** The exact, immutable argument vector used by the non-shell Git invocation. */
 export const GIT_COMMON_DIRECTORY_ARGS = Object.freeze([
   'rev-parse',
   '--path-format=absolute',
   '--git-common-dir',
 ] as const);
+
 function defaultRealpath(path: string): string {
   return realpathSync(path);
 }
@@ -146,21 +125,7 @@ function getRealpathResolver(resolver?: RealpathResolver): RealpathResolver {
 }
 
 function getGitRunner(options: GitCommonDirectoryOptions): GitCommonDirectoryRunner {
-  return options.gitRunner ?? options.runGit ?? defaultGitRunner;
-}
-
-function getExplicitProject(options: RoomDerivationOptions): string | undefined {
-  if (
-    options.project !== undefined &&
-    options.explicitProject !== undefined &&
-    options.project !== options.explicitProject
-  ) {
-    throw new InvalidProjectLabelError(
-      'project and explicitProject were both supplied with different values',
-    );
-  }
-
-  return options.explicitProject ?? options.project;
+  return options.gitRunner ?? defaultGitRunner;
 }
 
 /**
@@ -213,12 +178,6 @@ export function normalizeProjectLabel(value: string): NormalizedProjectLabel {
   return bounded.join('') as NormalizedProjectLabel;
 }
 
-/** Alias for callers that use the shorter project terminology. */
-export const normalizeProject = normalizeProjectLabel;
-
-/** Alias for callers that use name terminology at a configuration boundary. */
-export const normalizeProjectName = normalizeProjectLabel;
-
 /** Return whether a value is a valid filesystem-safe opaque room id. */
 export function isValidRoomId(value: unknown): value is RoomId {
   return typeof value === 'string' && ROOM_ID_PATTERN.test(value);
@@ -233,27 +192,11 @@ export function assertValidRoomId(value: string): RoomId {
   return value;
 }
 
-/** Compatibility alias for validation-oriented callers. */
-export const validateRoomId = assertValidRoomId;
-
-/** Return whether a value satisfies the legacy room-id model. */
-export function isRoomId(value: unknown): value is RoomId {
-  return isValidRoomId(value);
-}
-
 /** Brand a room id for identity and protocol-address boundaries. */
 export function asRoomId(value: string): RoomId {
   return assertValidRoomId(value);
 }
 
-/** Construct the legacy resolved-room model without deriving or allocating resources. */
-export function createResolvedRoom(
-  id: RoomId | string,
-  source: RoomSource,
-  input: string,
-): LegacyResolvedRoom {
-  return Object.freeze({ id: asRoomId(id), source, input });
-}
 function assertRoomHashInput(value: string): void {
   if (typeof value !== 'string') {
     throw new TypeError('room hash input must be a string');
@@ -395,18 +338,14 @@ export function discoverGitCommonDirectory(
   }
 }
 
-/** Alias for callers that spell the Git operation as a getter. */
-export const getGitCommonDirectory = discoverGitCommonDirectory;
-
 /**
  * Resolve one room using explicit project, Git common directory, then cwd.
  * The returned source and value make precedence observable without exposing a
  * raw project label or path as a registry identifier.
  */
 export function resolveRoom(options: RoomDerivationOptions = {}): ResolvedRoom {
-  const explicitProject = getExplicitProject(options);
-  if (explicitProject !== undefined) {
-    const normalizedProject = normalizeProjectLabel(explicitProject);
+  if (options.project !== undefined) {
+    const normalizedProject = normalizeProjectLabel(options.project);
     return Object.freeze({
       roomId: hashRoomId('explicit', normalizedProject),
       source: 'explicit',
@@ -418,7 +357,6 @@ export function resolveRoom(options: RoomDerivationOptions = {}): ResolvedRoom {
   const canonicalCwd = canonicalizeDirectory(options.cwd, resolver);
   const commonDirectory = discoverGitCommonDirectory(canonicalCwd, {
     gitRunner: options.gitRunner,
-    runGit: options.runGit,
     realpath: resolver,
   });
 
@@ -437,44 +375,15 @@ export function resolveRoom(options: RoomDerivationOptions = {}): ResolvedRoom {
   });
 }
 
-/** Resolve and return only the opaque room id. */
-export function deriveRoom(options: RoomDerivationOptions = {}): RoomId {
-  return resolveRoom(options).roomId;
+/** Compare two canonical opaque room ids using exact equality. */
+export function roomsEqual(left: RoomId | string, right: RoomId | string): boolean {
+  return isValidRoomId(left) && isValidRoomId(right) && left === right;
 }
-
-/** Alias for id-only resolution at registry/discovery boundaries. */
-export const resolveRoomId = deriveRoom;
-
-function extractRoomId(room: RoomLike): string {
-  if (typeof room === 'string') {
-    return room;
-  }
-
-  if (room !== null && typeof room === 'object') {
-    if ('roomId' in room) {
-      return room.roomId;
-    }
-    if ('id' in room) {
-      return room.id;
-    }
-  }
-  return '';
-}
-
-/** Compare two rooms using validated, exact opaque ids. */
-export function roomsEqual(left: RoomLike, right: RoomLike): boolean {
-  const leftRoom = extractRoomId(left);
-  const rightRoom = extractRoomId(right);
-  return isValidRoomId(leftRoom) && isValidRoomId(rightRoom) && leftRoom === rightRoom;
-}
-
-/** Exact-room comparison alias used by discovery callers. */
-export const isSameRoom = roomsEqual;
 
 /** Validate that a target is in the current room; never falls back cross-room. */
-export function assertExactRoom(currentRoom: RoomLike, targetRoom: RoomLike): RoomId {
-  const current = assertValidRoomId(extractRoomId(currentRoom));
-  const target = assertValidRoomId(extractRoomId(targetRoom));
+export function assertExactRoom(currentRoom: RoomId | string, targetRoom: RoomId | string): RoomId {
+  const current = assertValidRoomId(currentRoom);
+  const target = assertValidRoomId(targetRoom);
 
   if (current !== target) {
     throw new RoomIsolationError(current, target);
@@ -482,9 +391,3 @@ export function assertExactRoom(currentRoom: RoomLike, targetRoom: RoomLike): Ro
 
   return target;
 }
-
-/** Alias emphasizing target validation at protocol boundaries. */
-export const assertSameRoom = assertExactRoom;
-
-/** Alias for target-validation call sites. */
-export const validateTargetRoom = assertExactRoom;

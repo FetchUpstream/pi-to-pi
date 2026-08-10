@@ -40,7 +40,8 @@ const OTHER_ROOM_ID = `r1-${'b'.repeat(32)}`;
 const RUNTIME_A = '11111111-1111-4111-8111-111111111111';
 const RUNTIME_B = '22222222-2222-4222-8222-222222222222';
 const RUNTIME_C = '33333333-3333-4333-8333-333333333333';
-
+const PLANNER_A = buildNetworkName('planner', RUNTIME_A);
+const RENAMED_A = buildNetworkName('renamed', RUNTIME_A);
 const temporaryDirectories: string[] = [];
 
 async function temporaryRoot(): Promise<string> {
@@ -186,6 +187,23 @@ describe('runtime record validation and atomic publication', () => {
     expect(parseRuntimeRecordJson('{not-json').valid).toBe(false);
   });
 
+  it('rejects raw names, paths, and legacy room values at path boundaries', () => {
+    expect(() => getRegistryPaths('frontend')).toThrow('Invalid room ID');
+    expect(() => getRegistryPaths('../room')).toThrow('Invalid room ID');
+    expect(() => getRegistryPaths({ id: ROOM_ID } as never)).toThrow('Invalid room ID');
+    expect(() => getRuntimeRecordPath(ROOM_ID, 'runtime-1')).toThrow(
+      'canonical lowercase full UUID',
+    );
+    expect(() =>
+      createRuntimeRecord({
+        runtimeId: RUNTIME_A,
+        sessionId: 'session-a',
+        roomId: ROOM_ID,
+        networkName: '../escape',
+        endpoint: '/tmp/endpoint-a',
+      }),
+    ).toThrow('networkName');
+  });
   it('persists canonical full published names at the maximum base length', async () => {
     const root = await temporaryRoot();
     const networkName = buildNetworkName('a'.repeat(48), RUNTIME_A);
@@ -493,7 +511,7 @@ describe('serialized lease and lifecycle cleanup', () => {
       await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
         'post-rename publication fails',
       );
-      expect(registry.networkName).toBe('planner');
+      expect(registry.networkName).toBe(PLANNER_A);
       expect(registry.current()).toEqual(committed);
       expect(
         await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
@@ -538,12 +556,12 @@ describe('serialized lease and lifecycle cleanup', () => {
       await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
         'restoration publication fails',
       );
-      expect(registry.networkName).toBe('planner');
+      expect(registry.networkName).toBe(PLANNER_A);
       expect(registry.current()).toBeUndefined();
       expect(
         await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
       ).toMatchObject({
-        networkName: 'renamed',
+        networkName: RENAMED_A,
         sessionId: 'session-a',
         endpoint: '/tmp/endpoint-a',
       });
@@ -586,7 +604,7 @@ describe('serialized lease and lifecycle cleanup', () => {
       await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
         'rename publication fails',
       );
-      expect(registry.networkName).toBe('planner');
+      expect(registry.networkName).toBe(PLANNER_A);
       expect(registry.current()).toEqual(committed);
       expect(
         await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
@@ -620,7 +638,7 @@ describe('serialized lease and lifecycle cleanup', () => {
       await expect(registry.updateNetworkName('renamed')).rejects.toThrow(
         'initial post-rename publication fails',
       );
-      expect(registry.networkName).toBe('planner');
+      expect(registry.networkName).toBe(PLANNER_A);
       expect(registry.current()).toBeUndefined();
       expect(
         await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
@@ -704,9 +722,9 @@ describe('serialized lease and lifecycle cleanup', () => {
 
     await expect(renewal).resolves.toBeUndefined();
     await expect(rename).rejects.toThrow('rename publication fails');
-    expect(registry.observedNames).toEqual(['planner', 'planner', 'renamed']);
-    expect(registry.networkName).toBe('planner');
-    expect(registry.current()?.networkName).toBe('planner');
+    expect(registry.observedNames).toEqual([PLANNER_A, PLANNER_A, RENAMED_A]);
+    expect(registry.networkName).toBe(PLANNER_A);
+    expect(registry.current()?.networkName).toBe(PLANNER_A);
     expect(
       await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
     ).toEqual(registry.current());
@@ -734,8 +752,8 @@ describe('serialized lease and lifecycle cleanup', () => {
     await registry.renewalStarted;
 
     try {
-      expect(registry.networkName).toBe('planner');
-      expect(registry.current()?.networkName).toBe('planner');
+      expect(registry.networkName).toBe(PLANNER_A);
+      expect(registry.current()?.networkName).toBe(PLANNER_A);
       expect(
         await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
       ).toEqual(registry.current());
@@ -745,9 +763,9 @@ describe('serialized lease and lifecycle cleanup', () => {
 
     await expect(rename).rejects.toThrow('rename publication fails after commit');
     await expect(renewal).resolves.toBeUndefined();
-    expect(registry.observedNames).toEqual(['planner', 'renamed', 'planner']);
-    expect(registry.networkName).toBe('planner');
-    expect(registry.current()?.networkName).toBe('planner');
+    expect(registry.observedNames).toEqual([PLANNER_A, RENAMED_A, PLANNER_A]);
+    expect(registry.networkName).toBe(PLANNER_A);
+    expect(registry.current()?.networkName).toBe(PLANNER_A);
     expect(
       await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),
     ).toEqual(registry.current());
@@ -768,12 +786,12 @@ describe('serialized lease and lifecycle cleanup', () => {
     });
 
     await registry.start();
-    expect(registry.current()?.networkName).toBe('planner');
+    expect(registry.current()?.networkName).toBe(PLANNER_A);
     const rename = registry.updateNetworkName('renamed');
     const shutdown = registry.shutdown();
 
     await expect(rename).rejects.toThrow('stopped');
-    expect(registry.networkName).toBe('planner');
+    expect(registry.networkName).toBe(PLANNER_A);
     expect(await shutdown).toBe(true);
     expect(
       await readRuntimeRecord(ROOM_ID, RUNTIME_A, { rootDirectory: root, now: 1_000 }),

@@ -13,9 +13,10 @@ import {
   type RuntimeIdentity,
   type SessionId,
 } from '../identity.js';
-import { asRoomId, type RoomId, type RoomLike } from '../room.js';
+import { asRoomId, type RoomId } from '../room.js';
 import {
   asPublishedNetworkName,
+  buildNetworkName,
   isPublishedNetworkName,
   runtimeNameSuffix,
   type PublishedNetworkName,
@@ -65,15 +66,14 @@ const RUNTIME_RECORD_FILE_PATTERN =
 const MAX_ENDPOINT_LENGTH = 4096;
 export type RegistryClock = LeaseClock;
 export type LeaseExpiryInput = number | Date | string;
-export type RegistryNetworkName = NormalizedName | PublishedNetworkName;
 
 /** The validated, machine-actionable runtime registry record. */
 export interface RuntimeRecord {
   readonly runtimeId: RuntimeId;
   readonly sessionId: SessionId;
   readonly roomId: RoomId;
-  /** A canonical base-only or full published network label. */
-  readonly networkName: RegistryNetworkName;
+  /** Canonical suffix-qualified lookup key derived from the normalized display base. */
+  readonly networkName: PublishedNetworkName;
   /** Opaque local transport endpoint address. */
   readonly endpoint: string;
   /** Epoch milliseconds at which this record ceases to be live. */
@@ -83,13 +83,10 @@ export interface RuntimeRecord {
 /** Input accepted by record construction and publication helpers. */
 export interface RuntimeRecordDraft {
   readonly identity?: RuntimeIdentity;
-  readonly runtimeIdentity?: RuntimeIdentity;
   readonly runtimeId?: RuntimeId | string;
   readonly sessionId?: SessionId | string;
   readonly roomId?: RoomId | string;
-  readonly room?: RoomLike;
   readonly networkName?: NormalizedName | string;
-  readonly name?: NormalizedName | string;
   readonly endpoint: string;
   readonly leaseExpiresAt?: LeaseExpiryInput;
   readonly now?: number | Date;
@@ -184,13 +181,10 @@ export interface EndpointFailureOptions extends RuntimeRecordCleanupOptions {
 
 export interface RuntimeRegistryOptions extends RegistryPathOptions {
   readonly identity?: RuntimeIdentity;
-  readonly runtimeIdentity?: RuntimeIdentity;
   readonly runtimeId?: RuntimeId | string;
   readonly sessionId?: SessionId | string;
   readonly roomId?: RoomId | string;
-  readonly room?: RoomLike;
   readonly networkName?: NormalizedName | string;
-  readonly name?: NormalizedName | string;
   readonly endpoint: string;
   readonly ttlMs?: number;
   readonly renewalIntervalMs?: number;
@@ -287,7 +281,7 @@ function assertText(value: unknown, field: string, maxLength: number): string {
   return value;
 }
 
-function canonicalNetworkName(value: unknown, runtimeId: RuntimeId): RegistryNetworkName {
+function canonicalNetworkName(value: unknown, runtimeId: RuntimeId): PublishedNetworkName {
   if (typeof value !== 'string') {
     throw new TypeError('network name must be text');
   }
@@ -303,7 +297,7 @@ function canonicalNetworkName(value: unknown, runtimeId: RuntimeId): RegistryNet
   if (normalized !== value) {
     throw new TypeError('network name must already be normalized');
   }
-  return normalized;
+  return buildNetworkName(normalized, runtimeId);
 }
 function validateRecordFields(
   value: unknown,
@@ -331,7 +325,7 @@ function validateRecordFields(
   let runtimeId: RuntimeId;
   let sessionId: SessionId;
   let roomId: RoomId;
-  let networkName: RegistryNetworkName;
+  let networkName: PublishedNetworkName;
   let endpoint = '';
   let leaseExpiresAt: number;
 
@@ -373,13 +367,13 @@ function validateRecordFields(
 
   if (typeof value.networkName !== 'string') {
     errors.push({ field: 'networkName', message: 'must be a canonical network name' });
-    networkName = '' as RegistryNetworkName;
+    networkName = '' as PublishedNetworkName;
   } else {
     try {
       networkName = canonicalNetworkName(value.networkName, runtimeId);
     } catch {
       errors.push({ field: 'networkName', message: 'must be a canonical network name' });
-      networkName = '' as RegistryNetworkName;
+      networkName = '' as PublishedNetworkName;
     }
   }
 
@@ -509,7 +503,7 @@ function identityFromDraft(draft: RuntimeRecordDraft): {
   readonly runtimeId: RuntimeId;
   readonly sessionId: SessionId;
 } {
-  const identity = draft.identity ?? draft.runtimeIdentity;
+  const identity = draft.identity;
   const runtimeId = draft.runtimeId ?? identity?.runtimeId;
   const sessionId = draft.sessionId ?? identity?.sessionId;
   if (runtimeId === undefined || sessionId === undefined) {
@@ -530,43 +524,22 @@ function identityFromDraft(draft: RuntimeRecordDraft): {
   return { runtimeId: brandedRuntimeId, sessionId: brandedSessionId };
 }
 
-function roomIdFromLike(value: RoomLike): RoomId {
-  if (typeof value === 'string') {
-    return asRoomId(value);
-  }
-  if ('roomId' in value) {
-    return asRoomId(value.roomId);
-  }
-  return asRoomId(value.id);
-}
-
-function resolveRoomId(
-  direct: RoomId | string | undefined,
-  room: RoomLike | undefined,
-): RoomId | undefined {
-  const directRoom = direct === undefined ? undefined : asRoomId(direct);
-  const objectRoom = room === undefined ? undefined : roomIdFromLike(room);
-  if (directRoom !== undefined && objectRoom !== undefined && directRoom !== objectRoom) {
-    throw new Error('roomId and room disagree');
-  }
-  return objectRoom ?? directRoom;
-}
-
 /** Construct and validate a record, deriving its initial lease when omitted. */
 export function createRuntimeRecord(draft: RuntimeRecordDraft): RuntimeRecord {
   const { runtimeId, sessionId } = identityFromDraft(draft);
-  let roomId: RoomId | undefined;
+  if (draft.roomId === undefined) {
+    throw new RuntimeRecordValidationError([{ field: 'roomId', message: 'is required' }]);
+  }
+
+  let roomId: RoomId;
   try {
-    roomId = resolveRoomId(draft.roomId, draft.room);
+    roomId = asRoomId(draft.roomId);
   } catch (error) {
     throw new RuntimeRecordValidationError([
       { field: 'roomId', message: error instanceof Error ? error.message : 'is invalid' },
     ]);
   }
-  const networkName = draft.networkName ?? draft.name;
-  if (roomId === undefined) {
-    throw new RuntimeRecordValidationError([{ field: 'roomId', message: 'is required' }]);
-  }
+  const networkName = draft.networkName;
   if (networkName === undefined) {
     throw new RuntimeRecordValidationError([{ field: 'networkName', message: 'is required' }]);
   }
@@ -685,10 +658,10 @@ function safeRuntimePath(recordsDirectory: string, runtimeId: RuntimeId): string
 
 /** Build room-scoped paths using only validated opaque identifiers. */
 export function getRegistryPaths(
-  roomId: RoomLike,
+  roomId: RoomId | string,
   options: RegistryPathOptions = {},
 ): RegistryPaths {
-  const validatedRoomId = roomIdFromLike(roomId);
+  const validatedRoomId = asRoomId(roomId);
   const root = resolveRegistryRoot(options);
   const roomsDirectory = nodePath.join(root, REGISTRY_ROOMS_DIRECTORY);
   const roomDirectory = safeRoomPath(root, validatedRoomId);
@@ -711,7 +684,7 @@ export const buildRegistryPaths = getRegistryPaths;
 
 /** Return the exact path for one runtime key without touching the filesystem. */
 export function getRuntimeRecordPath(
-  roomId: RoomLike,
+  roomId: RoomId | string,
   runtimeId: RuntimeId | string,
   options: RegistryPathOptions = {},
 ): string {
@@ -819,7 +792,7 @@ export async function ensurePrivateDirectory(
 
 /** Create the complete private root/room/record directory tree. */
 export async function ensureRegistryPaths(
-  roomId: RoomLike,
+  roomId: RoomId | string,
   options: RegistryPathOptions = {},
 ): Promise<RegistryPaths> {
   const paths = getRegistryPaths(roomId, options);
@@ -1228,7 +1201,7 @@ async function directoryFileNames(
 
 /** Read one exact runtime record, ignoring malformed or expired content. */
 export async function readRuntimeRecord(
-  roomId: RoomLike,
+  roomId: RoomId | string,
   runtimeId: RuntimeId | string,
   options: RuntimeRecordReadOptions = {},
 ): Promise<RuntimeRecord | undefined> {
@@ -1247,7 +1220,7 @@ export const loadRuntimeRecord = readRuntimeRecord;
  * cross-room, expired, symlinked, or incorrectly named file is ignored.
  */
 export async function listRuntimeRecords(
-  roomId: RoomLike,
+  roomId: RoomId | string,
   options: RuntimeRecordListOptions = {},
 ): Promise<RuntimeRecord[]> {
   const paths = getRegistryPaths(roomId, options);
@@ -1353,7 +1326,7 @@ function matchesCleanupExpectation(
  * cross-room content is left untouched and reports `false`.
  */
 export async function removeRuntimeRecord(
-  roomId: RoomLike,
+  roomId: RoomId | string,
   runtimeId: RuntimeId | string,
   options: RuntimeRecordCleanupOptions = {},
 ): Promise<boolean> {
@@ -1444,7 +1417,7 @@ export function isEndpointTimeout(
  * an unexpired record available until renewal or lease expiry.
  */
 export async function handleEndpointFailure(
-  roomId: RoomLike,
+  roomId: RoomId | string,
   runtimeId: RuntimeId | string,
   options: EndpointFailureOptions,
 ): Promise<boolean> {
@@ -1462,23 +1435,21 @@ export const removeAfterEndpointFailure = handleEndpointFailure;
 export const handleProbeFailure = handleEndpointFailure;
 
 function roomFromOptions(options: RuntimeRegistryOptions): RoomId {
-  let roomId: RoomId | undefined;
+  if (options.roomId === undefined) {
+    throw new RuntimeRegistryError('roomId is required');
+  }
   try {
-    roomId = resolveRoomId(options.roomId, options.room);
+    return asRoomId(options.roomId);
   } catch (error) {
     throw new RuntimeRegistryError(error instanceof Error ? error.message : 'roomId is invalid');
   }
-  if (roomId === undefined) {
-    throw new RuntimeRegistryError('roomId is required');
-  }
-  return roomId;
 }
 
 function runtimeIdentityFromOptions(options: RuntimeRegistryOptions): {
   readonly runtimeId: RuntimeId;
   readonly sessionId: SessionId;
 } {
-  const identity = options.identity ?? options.runtimeIdentity;
+  const identity = options.identity;
   const runtimeId = options.runtimeId ?? identity?.runtimeId;
   const sessionId = options.sessionId ?? identity?.sessionId;
   if (runtimeId === undefined || sessionId === undefined) {
@@ -1511,7 +1482,7 @@ export class RuntimeRegistry {
   public readonly runtimeId: RuntimeId;
   public readonly sessionId: SessionId;
   public readonly roomId: RoomId;
-  public get networkName(): RegistryNetworkName {
+  public get networkName(): PublishedNetworkName {
     return this.currentNetworkName;
   }
   public readonly endpoint: string;
@@ -1521,7 +1492,7 @@ export class RuntimeRegistry {
 
   private readonly pathOptions: RegistryPathOptions;
   private readonly clock: RegistryClock;
-  private currentNetworkName: RegistryNetworkName;
+  private currentNetworkName: PublishedNetworkName;
   private readonly cleanupOptions: RuntimeRecordCleanupOptions;
   private currentRecord: RuntimeRecord | undefined;
   private shutdownCleanupRecords: readonly RuntimeRecord[] = [];
@@ -1535,7 +1506,7 @@ export class RuntimeRegistry {
     this.runtimeId = identity.runtimeId;
     this.sessionId = identity.sessionId;
     this.roomId = roomFromOptions(options);
-    const networkName = options.networkName ?? options.name;
+    const networkName = options.networkName;
     if (networkName === undefined) {
       throw new RuntimeRegistryError('networkName is required');
     }
@@ -1679,8 +1650,8 @@ export class RuntimeRegistry {
   }
 
   /** Update the published name while retaining this runtime's exact ownership. */
-  public updateNetworkName(networkName: RegistryNetworkName | string): Promise<void> {
-    let canonical: RegistryNetworkName;
+  public updateNetworkName(networkName: string): Promise<void> {
+    let canonical: PublishedNetworkName;
     try {
       canonical = canonicalNetworkName(networkName, this.runtimeId);
     } catch {
@@ -1711,7 +1682,7 @@ export class RuntimeRegistry {
   }
 
   /** Alias for lifecycle callers that describe the operation as a rename. */
-  public renameNetworkName(networkName: RegistryNetworkName | string): Promise<void> {
+  public renameNetworkName(networkName: string): Promise<void> {
     return this.updateNetworkName(networkName);
   }
 
