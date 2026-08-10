@@ -150,14 +150,7 @@ async function temporaryRoot(): Promise<string> {
 function runWorker(mode: string, payload: WorkerInput): Promise<WorkerResponse> {
   const child = spawn(
     process.execPath,
-    [
-      '--no-warnings',
-      '--experimental-strip-types',
-      '--loader',
-      LOADER_PATH,
-      WORKER_PATH,
-      mode,
-    ],
+    ['--no-warnings', '--experimental-strip-types', '--loader', LOADER_PATH, WORKER_PATH, mode],
     {
       cwd: REPOSITORY_ROOT,
       env: {
