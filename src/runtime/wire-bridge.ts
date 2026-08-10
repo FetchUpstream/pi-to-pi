@@ -1,4 +1,5 @@
 import type { AgentCardRegistry } from '../discovery/agent-card-registry.js';
+import type { DiagnosticEventSink } from '../diagnostics.js';
 import { createProtocolError } from '../protocol/errors.js';
 import type { OutboundDelivery, OutboundDeliveryResult } from '../protocol/interfaces.js';
 import type {
@@ -83,6 +84,7 @@ export interface LocalIpcBridgeOptions {
   readonly peers: AgentCardRegistry;
   readonly codec: ProtocolWireCodec;
   readonly router: () => MessageRouter | undefined;
+  readonly diagnostics?: DiagnosticEventSink;
 }
 
 /** Routes authenticated local IPC operations into one runtime-local router. */
@@ -90,6 +92,7 @@ export class LocalIpcBridge implements OutboundDelivery {
   public constructor(private readonly options: LocalIpcBridgeOptions) {}
 
   public async handle(payload: Uint8Array): Promise<Uint8Array> {
+    this.options.diagnostics?.record({ component: 'ipc', name: 'inbound-frame' });
     const router = this.options.router();
     if (router === undefined) throw new ProtocolWireError('runtime is not ready');
     const envelope = this.options.codec.decodeEnvelope(payload);
@@ -119,6 +122,13 @@ export class LocalIpcBridge implements OutboundDelivery {
   }
 
   public async send(envelope: ProtocolEnvelope): Promise<OutboundDeliveryResult> {
+    this.options.diagnostics?.record({
+      component: 'ipc',
+      name: 'outbound-frame',
+      operation: envelope.operation,
+      runtimeId: envelope.sender.runtimeId,
+      peerRuntimeId: envelope.recipientRuntimeId,
+    });
     const router = this.options.router();
     if (router === undefined) return this.failure('runtime is not ready');
     const target = await this.target(envelope.recipientRuntimeId, envelope.roomId);

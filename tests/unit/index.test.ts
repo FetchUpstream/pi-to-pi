@@ -94,6 +94,7 @@ describe('production runtime composition', () => {
       'p2p_peers',
       'p2p_send',
       'p2p_reply',
+      'p2p_report_issue',
       'p2p_status',
     ]);
     expect(handlers.get('session_start')).toEqual(expect.any(Function));

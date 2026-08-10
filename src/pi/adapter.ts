@@ -2,6 +2,13 @@ import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 import type { AgentCardRegistry } from '../discovery/agent-card-registry.js';
+import type { DiagnosticSnapshot } from '../diagnostics.js';
+import {
+  unavailableIssueReporter,
+  type IssueReporter,
+  type IssueReportResult,
+  type ModelIssueReport,
+} from '../issue-reporter.js';
 import { resolvePeerTarget } from '../discovery/lookup.js';
 import { createProtocolError } from '../protocol/errors.js';
 import type {
@@ -48,6 +55,10 @@ export interface PiMessageDelivery {
 export interface PiAdapterOptions {
   readonly router: MessageRouter;
   readonly peers: AgentCardRegistry;
+  readonly reporter?: IssueReporter;
+  readonly diagnostics?: (
+    input: Pick<ModelIssueReport, 'operation' | 'requestId' | 'peerRuntimeId'>,
+  ) => DiagnosticSnapshot;
 }
 
 interface ActiveRuntime {
@@ -68,11 +79,25 @@ export interface PiReplyInput {
 export class PiAdapter {
   public readonly router: MessageRouter;
   public readonly peers: AgentCardRegistry;
+  private readonly reporter: IssueReporter;
+  private readonly diagnostics: NonNullable<PiAdapterOptions['diagnostics']>;
   private active: ActiveRuntime | undefined;
 
   public constructor(options: PiAdapterOptions) {
     this.router = options.router;
     this.peers = options.peers;
+    this.reporter = options.reporter ?? unavailableIssueReporter;
+    this.diagnostics =
+      options.diagnostics ??
+      (() => ({
+        timestamp: new Date().toISOString(),
+        packageVersion: 'unknown',
+        runtimeId: 'unknown',
+        roomId: 'unknown',
+        platform: process.platform,
+        lifecycle: 'created',
+        events: [],
+      }));
   }
 
   public bind(delivery: PiMessageDelivery): void {
@@ -205,6 +230,17 @@ export class PiAdapter {
 
   public status(requestId: string): TaskSnapshot | undefined {
     return this.router.taskSnapshot(requestId as RequestId);
+  }
+
+  public async reportIssue(input: ModelIssueReport): Promise<IssueReportResult> {
+    try {
+      return await this.reporter.report({
+        ...input,
+        diagnostics: this.diagnostics(input),
+      });
+    } catch {
+      return { status: 'failed', reason: 'Pi-to-Pi issue reporting failed' };
+    }
   }
 
   public statusReport(requestId: string): {
@@ -365,6 +401,37 @@ export function registerPiTools(
         return textResult(`Request ${snapshot.requestId} is ${snapshot.state}.`);
       } catch (error) {
         return textResult(error instanceof Error ? error.message : 'Unable to reply', true);
+      }
+    },
+  });
+  pi.registerTool({
+    name: 'p2p_report_issue',
+    label: 'Report Pi-to-Pi defect',
+    description:
+      'Report only suspected Pi-to-Pi discovery, transport, routing, lifecycle, or protocol defects; do not use for application failures, feature requests, or arbitrary GitHub issues.',
+    parameters: Type.Object({
+      title: Type.String(),
+      description: Type.String(),
+      expected: Type.Optional(Type.String()),
+      actual: Type.Optional(Type.String()),
+      operation: Type.Optional(Type.String()),
+      requestId: Type.Optional(Type.String()),
+      peerRuntimeId: Type.Optional(Type.String()),
+    }),
+    execute: async (_id, params) => {
+      try {
+        const result = await current().reportIssue(params);
+        if (result.status === 'created' || result.status === 'existing') {
+          return textResult(
+            `${result.status === 'created' ? 'Created' : 'Reused'} upstream issue #${result.number}: ${result.url}`,
+          );
+        }
+        return textResult(
+          `Issue reporting ${result.status}: ${'reason' in result ? result.reason : 'failed'}`,
+          result.status === 'failed',
+        );
+      } catch {
+        return textResult('Pi-to-Pi issue reporting failed', true);
       }
     },
   });

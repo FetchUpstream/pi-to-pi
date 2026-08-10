@@ -49,7 +49,21 @@ export {
   type PiToPiRuntimeCompositionOptions,
 } from './runtime/composition.js';
 export { LocalIpcBridge, ProtocolWireCodec, ProtocolWireError } from './runtime/wire-bridge.js';
-
+export {
+  DiagnosticEventRing,
+  formatDiagnosticSnapshot,
+  type DiagnosticEvent,
+  type DiagnosticSnapshot,
+} from './diagnostics.js';
+export {
+  GhIssueReporter,
+  fingerprint,
+  ghCommandRunner,
+  renderIssueBody,
+  type IssueReporter,
+  type IssueReportResult,
+  type ModelIssueReport,
+} from './issue-reporter.js';
 export interface PiToPiExtensionOptions extends PiToPiLifecycleOptions {
   /** Compatibility seam; normal installations resolve the active composition adapter. */
   readonly adapter?: PiAdapter;
