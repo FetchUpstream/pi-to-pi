@@ -5,6 +5,8 @@ import {
   type AgentCardRegistryOptions,
 } from '../discovery/agent-card-registry.js';
 import type { RuntimeIdentity } from '../identity.js';
+import { DiagnosticEventRing, formatDiagnosticSnapshot } from '../diagnostics.js';
+import { GhIssueReporter, ghCommandRunner } from '../issue-reporter.js';
 import { PiAdapter, type PiMessageDelivery } from '../pi/adapter.js';
 import type { ResolvedRoom } from '../room.js';
 import { MessageRouter, type RouterOptions } from '../router/router.js';
@@ -40,6 +42,7 @@ export class PiToPiRuntimeComposition {
   public readonly codec: ProtocolWireCodec;
   public readonly bridge: LocalIpcBridge;
   public readonly router: MessageRouter;
+  public readonly diagnostics = new DiagnosticEventRing();
   public readonly adapter: PiAdapter;
   private started = false;
   private shutdownPromise: Promise<void> | undefined;
@@ -81,6 +84,7 @@ export class PiToPiRuntimeComposition {
       peers: this.registry,
       codec: this.codec,
       router: () => routerRef.current,
+      diagnostics: this.diagnostics,
     });
     this.router = new MessageRouter({
       identity: this.identity,
@@ -88,7 +92,15 @@ export class PiToPiRuntimeComposition {
       delivery: this.bridge,
       limits: { maxEnvelopeBytes: maxPayloadBytes },
       taskExecutor: (context) => this.adapter.taskExecutor(context),
-      onTaskStateChange: () => {
+      onTaskStateChange: (requestId, snapshot) => {
+        this.diagnostics.record({
+          component: 'router',
+          name: 'task-state',
+          requestId,
+          runtimeId: this.identity.runtimeId,
+          operation: 'task',
+          code: snapshot.state,
+        });
         const current = routerRef.current;
         const active = current !== undefined && current.taskStore.size > 0;
         void this.registry
@@ -100,7 +112,29 @@ export class PiToPiRuntimeComposition {
       },
     } as RouterOptions);
     routerRef.current = this.router;
-    this.adapter = new PiAdapter({ router: this.router, peers: this.registry });
+    this.adapter = new PiAdapter({
+      router: this.router,
+      peers: this.registry,
+      reporter: new GhIssueReporter(ghCommandRunner),
+      diagnostics: (input) =>
+        formatDiagnosticSnapshot({
+          timestamp: new Date().toISOString(),
+          packageVersion: '0.0.1',
+          runtimeId: this.identity.runtimeId,
+          roomId: this.room.roomId,
+          platform: process.platform,
+          lifecycle: this.started ? 'started' : 'created',
+          operation: input.operation,
+          requestId: input.requestId,
+          peerRuntimeId: input.peerRuntimeId,
+          taskState:
+            input.requestId === undefined
+              ? undefined
+              : this.router.taskSnapshot(input.requestId as never)?.state,
+          queueDepth: this.router.taskStore.size,
+          events: this.diagnostics.list(),
+        }),
+    });
   }
 
   /** Bind first, then publish the discoverable card. */
@@ -111,6 +145,11 @@ export class PiToPiRuntimeComposition {
       await this.router.start();
       await this.registry.start();
       this.started = true;
+      this.diagnostics.record({
+        component: 'lifecycle',
+        name: 'started',
+        runtimeId: this.identity.runtimeId,
+      });
     } catch (error) {
       await this.shutdown();
       throw error;
@@ -135,6 +174,12 @@ export class PiToPiRuntimeComposition {
         await this.router.close();
         await this.registry.shutdown();
         await this.transport.close();
+        this.diagnostics.record({
+          component: 'lifecycle',
+          name: 'stopped',
+          runtimeId: this.identity.runtimeId,
+        });
+        this.diagnostics.clear();
         this.started = false;
       })();
     }

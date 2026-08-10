@@ -48,6 +48,7 @@ describe('PiAdapter', () => {
       'p2p_peers',
       'p2p_send',
       'p2p_reply',
+      'p2p_report_issue',
       'p2p_status',
     ]);
     await expect(adapter.listPeers()).resolves.toMatchObject([
