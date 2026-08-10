@@ -17,7 +17,10 @@ const STORAGE_KEY_A = 'room-a';
 const STORAGE_KEY_B = 'room-b';
 const CARD_BASE_NOW = Date.parse('2026-01-01T00:00:00.000Z');
 const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
-const LOADER_PATH = new URL('./ts-source-loader.mjs', import.meta.url).href;
+const LOADER_PATH =
+  process.platform === 'win32'
+    ? new URL('./ts-source-loader.mjs', import.meta.url).href
+    : fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 interface WorkerInput {
@@ -345,7 +348,7 @@ describe('multi-process registry publication and discovery', () => {
     );
     expect(result.records.every((record) => record.roomId === ROOM_A)).toBe(true);
     expect(result.lookup?.kind).toBe('ambiguous');
-    expect(result.lookup?.addresses?.map((address) => address.runtimeId).sort()).toEqual(
+    expect(result.lookup?.candidates?.map((address) => address.runtimeId).sort()).toEqual(
       [first.runtimeId, second.runtimeId].sort(),
     );
   }, 30_000);
@@ -373,7 +376,7 @@ describe('multi-process registry publication and discovery', () => {
     });
     const result = crossRoom.result as LookupResponse;
     expect(result.kind).toBe('cross-room');
-    expect(result.addresses?.map((address) => address.runtimeId)).toEqual([otherRoom.runtimeId]);
+    expect(result.candidates?.map((address) => address.runtimeId)).toEqual([otherRoom.runtimeId]);
   }, 30_000);
 
   it('keeps complete records from many concurrent child-process starts', async () => {
@@ -390,7 +393,7 @@ describe('multi-process registry publication and discovery', () => {
     );
     expect(sortedDiscoveredRecords).toEqual(sortedRecords);
     expect(result.lookup?.kind).toBe('ambiguous');
-    expect(result.lookup?.addresses).toHaveLength(indexes.length);
+    expect(result.lookup?.candidates).toHaveLength(indexes.length);
 
     const paths = getRegistryPaths(ROOM_A, { rootDirectory: root });
     const files = await readdir(paths.recordsDirectory);

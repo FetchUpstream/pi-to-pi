@@ -1,11 +1,4 @@
-# Local IPC Transport
-
-## Purpose
-
-Provide a bounded, platform-specific local IPC transport for Pi-to-Pi runtime communication using native local endpoints and length-prefixed opaque byte frames.
-
-## Requirements
-
+## MODIFIED Requirements
 
 ### Requirement: Platform-specific local endpoints
 The production transport SHALL use Node's path-based local IPC API. On Linux and macOS it SHALL bind Unix domain socket paths; on Windows it SHALL bind named-pipe paths using the `\\?\\pipe\\` or `\\.\\pipe\\` namespace. It MUST NOT introduce a TCP listener or another fallback transport for v1.

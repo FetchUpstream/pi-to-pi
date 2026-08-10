@@ -19,16 +19,9 @@ export type RuntimeId = string & { readonly [runtimeIdBrand]: 'RuntimeId' };
 /** Canonical, already-normalized network display base. */
 export type NormalizedName = NormalizedProjectLabel;
 
-/** Canonical project label used by explicit room configuration. */
-export type ProjectName = NormalizedProjectLabel;
-
-/** Stable logical session identity. */
-export interface SessionIdentity {
+/** Runtime identity combines Pi's logical session with one ephemeral runtime. */
+export interface RuntimeIdentity {
   readonly sessionId: SessionId;
-}
-
-/** Runtime identity and the logical session that owns it. */
-export interface RuntimeIdentity extends SessionIdentity {
   readonly runtimeId: RuntimeId;
 }
 
@@ -42,9 +35,6 @@ export interface CanonicalPeerAddress {
   readonly runtimeId: RuntimeId;
   readonly roomId: RoomId;
 }
-
-/** Alias used by protocol and discovery consumers. */
-export type PeerAddress = CanonicalPeerAddress;
 
 /** Brand Pi's native session identifier grammar. */
 export function asSessionId(value: unknown): SessionId {
@@ -83,20 +73,7 @@ export function asNormalizedName(value: string): NormalizedName {
   return normalizeProjectLabel(value) as NormalizedName;
 }
 
-/** Alias for name normalization at configuration and naming boundaries. */
-export const normalizePeerName = asNormalizedName;
-
-/** Normalize and brand an explicit project label. */
-export function asProjectName(value: string): ProjectName {
-  return normalizeProjectLabel(value);
-}
-
-/** Create a session identity from Pi's native session manager value. */
-export function createSessionIdentity(sessionId: string): SessionIdentity {
-  return Object.freeze({ sessionId: asSessionId(sessionId) });
-}
-
-/** Create a fresh runtime identity. */
+/** Create a fresh runtime identity from Pi's native session manager value. */
 export function createRuntimeIdentity(sessionId: string): RuntimeIdentity {
   return createRuntimeIdentityWithFactory(sessionId, createRuntimeId);
 }
@@ -106,7 +83,7 @@ function createRuntimeIdentityWithFactory(
   runtimeIdFactory: () => RuntimeId,
 ): RuntimeIdentity {
   return Object.freeze({
-    ...createSessionIdentity(sessionId),
+    sessionId: asSessionId(sessionId),
     runtimeId: runtimeIdFactory(),
   });
 }
@@ -114,6 +91,34 @@ function createRuntimeIdentityWithFactory(
 /** Generate one runtime UUID at the lifecycle boundary. */
 export function createRuntimeId(): RuntimeId {
   return asRuntimeId(crypto.randomUUID());
+}
+
+/**
+ * Adapt an external schema's `runtimeInstanceId` field to the canonical runtime
+ * identity. This validates the full UUID without introducing another identity type.
+ */
+export function adaptExternalRuntimeIdentity(value: {
+  readonly sessionId: unknown;
+  readonly runtimeInstanceId: unknown;
+}): RuntimeIdentity {
+  return Object.freeze({
+    sessionId: asSessionId(value.sessionId),
+    runtimeId: asRuntimeId(value.runtimeInstanceId),
+  });
+}
+
+/** Adapt an external runtime/room pair to the canonical machine address. */
+export function adaptExternalPeerAddress(value: {
+  readonly runtimeInstanceId: unknown;
+  readonly roomId: unknown;
+}): CanonicalPeerAddress {
+  if (typeof value.roomId !== 'string') {
+    throw new Error('Invalid room ID: expected a string');
+  }
+  return Object.freeze({
+    runtimeId: asRuntimeId(value.runtimeInstanceId),
+    roomId: asRoomId(value.roomId),
+  });
 }
 
 /** Create an exact-room canonical peer address. */

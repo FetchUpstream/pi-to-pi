@@ -23,15 +23,7 @@ import { resolveRoom, type ResolvedRoom } from '../room.js';
 /** Registry options supplied by the embedding host and lifecycle tests. */
 export type PiToPiRegistryOptions = Omit<
   RuntimeRegistryOptions,
-  | 'identity'
-  | 'runtimeIdentity'
-  | 'runtimeId'
-  | 'sessionId'
-  | 'roomId'
-  | 'room'
-  | 'networkName'
-  | 'name'
-  | 'endpoint'
+  'identity' | 'runtimeId' | 'sessionId' | 'roomId' | 'networkName' | 'endpoint'
 >;
 
 /** Endpoint construction remains opaque until the transport layer is wired. */
@@ -187,7 +179,7 @@ export function createPiToPiLifecycle(
         registry = createRegistry({
           ...options.registryOptions,
           identity,
-          room,
+          roomId: room.roomId,
           networkName: publishedName.networkName,
           endpoint,
         });
@@ -225,7 +217,7 @@ export function createPiToPiLifecycle(
       }
 
       const publishedName = synchronizePeerName(runtime.publishedName, event.name, {
-        nameOverride: runtime.config.nameOverride,
+        p2pName: runtime.config.nameOverride,
       });
       if (publishedName.networkName === runtime.publishedName.networkName) {
         return;
@@ -233,7 +225,7 @@ export function createPiToPiLifecycle(
 
       const config = resolveP2PConfig({
         sessionName: event.name,
-        projectOverride: runtime.config.projectOverride,
+        p2pProject: runtime.config.projectOverride,
       });
       await runtime.registry.updateNetworkName(publishedName.networkName);
       if (!isCurrentRuntime(runtime) || !hasCommittedName(runtime, publishedName)) {

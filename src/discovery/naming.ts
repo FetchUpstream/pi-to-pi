@@ -2,8 +2,6 @@ import { createHash } from 'node:crypto';
 
 import { asNormalizedName, asRuntimeId, type NormalizedName, type RuntimeId } from '../identity.js';
 
-/** Maximum number of Unicode code points allowed in a normalized name base. */
-export const MAX_NETWORK_BASE_CODE_POINTS = 48;
 /** The fallback used when neither a P2P override nor a native session name exists. */
 export const DEFAULT_NETWORK_BASE = 'agent' as const;
 /** Lowercase Crockford alphabet (ambiguous I, L, O, and U are omitted). */
@@ -18,12 +16,13 @@ declare const publishedNameBrand: unique symbol;
 
 /** A four-character lowercase Crockford-base32 runtime suffix. */
 export type RuntimeNameSuffix = string & { readonly [suffixBrand]: 'RuntimeNameSuffix' };
+
 /** A canonical published name consisting of a normalized base and runtime suffix. */
 export type PublishedNetworkName = string & {
   readonly [publishedNameBrand]: 'PublishedNetworkName';
 };
 
-/** The pure name state that can be replaced on a native session-name event. */
+/** Pure name state for one runtime; display and published values are distinct. */
 export interface PublishedPeerName {
   readonly runtimeId: RuntimeId;
   readonly base: NormalizedName;
@@ -31,15 +30,7 @@ export interface PublishedPeerName {
   readonly networkName: PublishedNetworkName;
 }
 
-/** Explicitly normalize a configured name; an empty normalized result is rejected. */
-export function normalizeExplicitPeerName(value: string): NormalizedName {
-  return asNormalizedName(value);
-}
-
-/**
- * Normalize a name supplied by a caller. An absent value is the documented
- * `agent` fallback; a supplied value that normalizes to empty is rejected.
- */
+/** Normalize a human-facing name, using the documented `agent` fallback. */
 export function normalizePeerName(value?: string): NormalizedName {
   return value === undefined ? asNormalizedName(DEFAULT_NETWORK_BASE) : asNormalizedName(value);
 }
@@ -56,6 +47,7 @@ export function normalizeSessionPeerName(value?: string): NormalizedName {
     return asNormalizedName(DEFAULT_NETWORK_BASE);
   }
 }
+
 /** Normalize a lookup key, accepting a full published name above the base limit. */
 export function normalizePeerLookupName(value: string): string {
   if (typeof value !== 'string') {
@@ -107,10 +99,6 @@ export function runtimeNameSuffix(runtimeId: RuntimeId | string): RuntimeNameSuf
   return suffix as RuntimeNameSuffix;
 }
 
-/** Short alias for callers that refer to the value as a runtime suffix. */
-export const runtimeSuffix = runtimeNameSuffix;
-export const deriveRuntimeSuffix = runtimeNameSuffix;
-
 /** Return whether a value is a canonical published base-plus-suffix name. */
 export function isPublishedNetworkName(value: unknown): value is PublishedNetworkName {
   if (typeof value !== 'string') {
@@ -149,14 +137,10 @@ export function buildNetworkName(
   base: NormalizedName | string,
   runtimeId: RuntimeId | string,
 ): PublishedNetworkName {
-  const normalizedBase = normalizeExplicitPeerName(String(base));
+  const normalizedBase = asNormalizedName(String(base));
   const suffix = runtimeNameSuffix(runtimeId);
   return `${normalizedBase}-${suffix}` as PublishedNetworkName;
 }
-
-/** Alias for integrations that name this value a published runtime name. */
-export const buildPublishedNetworkName = buildNetworkName;
-export const buildRuntimeNetworkName = buildNetworkName;
 
 /** Construct the complete pure name state for one runtime. */
 export function createPublishedPeerName(
@@ -171,7 +155,7 @@ export function createPublishedPeerName(
     runtimeId: canonicalRuntimeId,
     base: normalizedBase,
     suffix,
-    networkName: `${normalizedBase}-${suffix}` as PublishedNetworkName,
+    networkName: buildNetworkName(normalizedBase, canonicalRuntimeId),
   });
 }
 
@@ -186,8 +170,6 @@ export function createInitialPeerName(
 export interface SynchronizePeerNameOptions {
   /** Explicit `--p2p-name`; when present, native session names are ignored. */
   readonly p2pName?: NormalizedName | string;
-  /** Alias used by configuration integrations. */
-  readonly nameOverride?: NormalizedName | string;
 }
 
 /**
@@ -202,9 +184,8 @@ export function synchronizePeerName(
   sessionName: string | undefined,
   options: SynchronizePeerNameOptions = {},
 ): PublishedPeerName {
-  const override = options.p2pName ?? options.nameOverride;
-  if (override !== undefined) {
-    normalizeExplicitPeerName(String(override));
+  if (options.p2pName !== undefined) {
+    asNormalizedName(String(options.p2pName));
     return current;
   }
 
@@ -213,15 +194,11 @@ export function synchronizePeerName(
     runtimeId: current.runtimeId,
     base,
     suffix: current.suffix,
-    networkName: `${base}-${current.suffix}` as PublishedNetworkName,
+    networkName: buildNetworkName(base, current.runtimeId),
   });
 }
 
-/** Descriptive aliases for the lifecycle integration seam. */
-export const synchronizePublishedName = synchronizePeerName;
-export const updatePublishedPeerName = synchronizePeerName;
-
-/** Return the canonical full address-independent name components for tests. */
+/** Return the base and suffix components of a canonical published name. */
 export function splitPublishedNetworkName(value: PublishedNetworkName | string): {
   readonly base: NormalizedName;
   readonly suffix: RuntimeNameSuffix;

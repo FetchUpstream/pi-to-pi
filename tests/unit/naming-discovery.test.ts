@@ -6,7 +6,6 @@ import {
   createInitialPeerName,
   isPublishedNetworkName,
   isRuntimeNameSuffix,
-  normalizeExplicitPeerName,
   normalizePeerLookupName,
   normalizePeerName,
   normalizeSessionPeerName,
@@ -24,6 +23,7 @@ import {
   resolvePeerTargetOrThrow,
   type PeerRecordLike,
 } from '../../src/discovery/lookup.js';
+import { asNormalizedName } from '../../src/identity.js';
 import { asRoomId, type RoomId } from '../../src/room.js';
 
 const ROOM_A = asRoomId(`r1-${'a'.repeat(32)}`);
@@ -33,19 +33,19 @@ const RUNTIME_B = '22222222-2222-4222-8222-222222222222';
 const RUNTIME_C = '33333333-3333-4333-8333-333333333333';
 
 function record(runtimeId: string, roomId: RoomId, networkName: string): PeerRecordLike {
-  return { runtimeId, roomId, networkName };
+  return { runtimeId, roomId, networkName: asPublishedNetworkName(networkName) };
 }
 
 describe('canonical runtime peer naming', () => {
   it('normalizes NFKC text, case, Unicode letters/numbers, and separator runs', () => {
-    expect(normalizeExplicitPeerName('  Ｐlanner / 東京 ✨ １２３  ')).toBe('planner-東京-123');
-    expect(normalizeExplicitPeerName('Élan 東京')).toBe('élan-東京');
+    expect(asNormalizedName('  Ｐlanner / 東京 ✨ １２３  ')).toBe('planner-東京-123');
+    expect(asNormalizedName('Élan 東京')).toBe('élan-東京');
   });
 
   it('rejects controls and explicit values that become empty', () => {
-    expect(() => normalizeExplicitPeerName('planner\u0000')).toThrow();
-    expect(() => normalizeExplicitPeerName('planner\u200b')).toThrow();
-    expect(() => normalizeExplicitPeerName('--- ✨ ---')).toThrow();
+    expect(() => asNormalizedName('planner\u0000')).toThrow();
+    expect(() => asNormalizedName('planner\u200b')).toThrow();
+    expect(() => asNormalizedName('--- ✨ ---')).toThrow();
   });
 
   it('bounds the base to 48 Unicode code points and trims separator runs', () => {
@@ -109,17 +109,22 @@ describe('same-room collision-safe peer lookup', () => {
     expect(result.address).toEqual({ runtimeId: RUNTIME_A, roomId: ROOM_A });
     expect(result.record).toBe(plannerA);
   });
-  it('checks exact full names and base names for suffix-shaped queries', () => {
-    const baseOnly = record(RUNTIME_C, ROOM_A, 'planner');
-    const result = lookupPeerByName(plannerA.networkName, ROOM_A, [plannerA, plannerB, baseOnly]);
+  it('distinguishes exact published names from base-name collisions', () => {
+    const plannerC = record(RUNTIME_C, ROOM_A, buildNetworkName('planner', RUNTIME_C));
 
-    expect(result.kind).toBe('ambiguous');
-    if (result.kind !== 'ambiguous') return;
-    expect(result.candidates).toEqual([
+    const exact = lookupPeerByName(plannerA.networkName, ROOM_A, [plannerA, plannerC]);
+    expect(exact.kind).toBe('found');
+    if (exact.kind === 'found') {
+      expect(exact.address).toEqual({ runtimeId: RUNTIME_A, roomId: ROOM_A });
+    }
+
+    const base = lookupPeerByName('planner', ROOM_A, [plannerA, plannerC]);
+    expect(base.kind).toBe('ambiguous');
+    if (base.kind !== 'ambiguous') return;
+    expect(base.candidates).toEqual([
       { runtimeId: RUNTIME_A, roomId: ROOM_A },
       { runtimeId: RUNTIME_C, roomId: ROOM_A },
     ]);
-    expect(result.records).toEqual([plannerA, baseOnly]);
   });
 
   it('returns every full address for a normalized-name collision', () => {
@@ -131,13 +136,22 @@ describe('same-room collision-safe peer lookup', () => {
       { runtimeId: RUNTIME_A, roomId: ROOM_A },
       { runtimeId: RUNTIME_B, roomId: ROOM_A },
     ]);
-    expect(result.addresses).toEqual(result.candidates);
-    expect(result.records).toEqual([plannerA, plannerB]);
     expect(() => resolvePeerTargetOrThrow('planner', ROOM_A, [plannerA, plannerB])).toThrow(
       AmbiguousPeerNameError,
     );
   });
 
+  it('returns every address for a published-name suffix collision', () => {
+    const suffixCollision = record(RUNTIME_C, ROOM_A, plannerA.networkName);
+    const result = lookupPeerByName(plannerA.networkName, ROOM_A, [plannerA, suffixCollision]);
+
+    expect(result.kind).toBe('ambiguous');
+    if (result.kind !== 'ambiguous') return;
+    expect(result.candidates).toEqual([
+      { runtimeId: RUNTIME_A, roomId: ROOM_A },
+      { runtimeId: RUNTIME_C, roomId: ROOM_A },
+    ]);
+  });
   it('never considers records from another room for name lookup', () => {
     expect(lookupPeerByName('planner', ROOM_A, [otherRoom])).toEqual({
       kind: 'not-found',
@@ -173,6 +187,11 @@ describe('same-room collision-safe peer lookup', () => {
     const uppercase = 'ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF';
     const malformed = '11111111-1111-0111-8111-111111111111';
 
+    expect(() => lookupPeerByRuntimeId('qnv6', ROOM_A, [plannerA])).toThrow('full UUID');
+    expect(resolvePeerTarget('qnv6', ROOM_A, [plannerA])).toEqual({
+      kind: 'not-found',
+      query: 'qnv6',
+    });
     expect(resolvePeerTarget(uppercase, ROOM_A, [plannerA])).toEqual({
       kind: 'not-found',
       query: uppercase.toLowerCase(),

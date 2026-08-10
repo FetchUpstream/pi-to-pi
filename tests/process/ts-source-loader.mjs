@@ -1,10 +1,15 @@
+import { pathToFileURL } from 'node:url';
+
 export async function resolve(specifier, context, nextResolve) {
-  if (specifier.endsWith('.js')) {
+  const normalizedSpecifier = /^[A-Za-z]:[\\/]/u.test(specifier)
+    ? pathToFileURL(specifier).href
+    : specifier;
+  if (normalizedSpecifier.endsWith('.js')) {
     try {
-      return await nextResolve(`${specifier.slice(0, -3)}.ts`, context);
+      return await nextResolve(`${normalizedSpecifier.slice(0, -3)}.ts`, context);
     } catch {
       // Keep ordinary JavaScript package imports on the default resolver.
     }
   }
-  return nextResolve(specifier, context);
+  return nextResolve(normalizedSpecifier, context);
 }

@@ -73,7 +73,8 @@ describe('AgentCardRegistry boundary', () => {
     const rootDirectory = await root();
     const first = registry(rootDirectory, RUNTIME_A, () => BASE_NOW);
     const second = registry(rootDirectory, RUNTIME_B, () => BASE_NOW);
-    await Promise.all([first.start(), second.start()]);
+    await first.start();
+    await second.start();
 
     const peers = await listLiveAgentCardPeers(
       { roomId: ROOM_ID, storageKey: STORAGE_KEY },
@@ -251,7 +252,7 @@ describe('AgentCardRegistry boundary', () => {
     now = BASE_NOW + 300;
     const result = await cleanupAgentCardState(
       { roomId: ROOM_ID, storageKey: STORAGE_KEY },
-      { rootDirectory, now, ttlMs: 100, maxEntries: 32 },
+      { rootDirectory, now, ttlMs: 100, maxEntries: 32, maxDurationMs: 2_000 },
     );
     expect(result).toEqual({ cardsRemoved: 1, temporaryFilesRemoved: 1, totalRemoved: 2 });
     await expect(readFile(oldTemporary, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
