@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -125,7 +125,7 @@ describe('Git and cwd room derivation', () => {
     const runner = vi.fn(() => '.git\n');
 
     expect(discoverGitCommonDirectory(directory, { gitRunner: runner })).toBe(
-      resolve(commonDirectory),
+      realpathSync(resolve(commonDirectory)),
     );
     expect(runner).toHaveBeenCalledWith(resolve(directory), GIT_COMMON_DIRECTORY_ARGS);
     expect(Object.isFrozen(GIT_COMMON_DIRECTORY_ARGS)).toBe(true);

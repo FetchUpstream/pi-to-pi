@@ -690,6 +690,7 @@ describe('raw node:net local IPC candidate', () => {
     const response = encodeFrame(Buffer.from('slow-drip'));
     const server = createServer({ allowHalfOpen: true }, (socket) => {
       sockets.add(socket);
+      socket.on('error', () => undefined);
       const decoder = new FrameDecoder();
       let dripTimer: NodeJS.Timeout | undefined;
       let offset = 0;
