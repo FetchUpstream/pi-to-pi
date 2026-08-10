@@ -1,2 +1,1 @@
-/** Pi tool integration boundary reserved for a later implementation wave. */
-export {};
+export { registerPiTools } from './adapter.js';
