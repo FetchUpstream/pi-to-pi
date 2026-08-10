@@ -5,8 +5,9 @@
  * RuntimeRecord/RuntimeRegistry compatibility seam in `registry.ts`.
  */
 
-import { lstat, opendir, readFile, unlink } from 'node:fs/promises';
+import { lstat, open, opendir, unlink } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 
 import { resolveRuntimeRoot } from '../config.js';
 import type { RuntimeRootOptions, RuntimeRootSelection } from '../config.js';
@@ -438,11 +439,19 @@ async function readCandidate(
   }
 
   let source: string;
+  let handle: FileHandle | undefined;
   try {
-    const bytes = await readFile(path);
-    source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    handle = await open(path, 'r');
+    const bytes = Buffer.alloc(maxCardBytes + 1);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    if (bytesRead > maxCardBytes) {
+      return undefined;
+    }
+    source = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, bytesRead));
   } catch {
     return undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 
   let secondStats: Stats;
@@ -492,11 +501,13 @@ async function finalCardNames(
   }
 
   const names: string[] = [];
+  let inspected = 0;
   try {
     for await (const entry of directory) {
-      if (names.length >= maxEntries || Date.now() >= deadlineMs) {
+      if (inspected >= maxEntries || Date.now() >= deadlineMs) {
         break;
       }
+      inspected += 1;
       if (entry.name.endsWith('.json') && !entry.name.includes('.tmp-')) {
         names.push(entry.name);
       }
@@ -559,7 +570,15 @@ export async function listLiveAgentCardPeers(
   room: AgentCardRoomInput,
   options: AgentCardListingOptions = {},
 ): Promise<AgentCardPeerRecord[]> {
-  return (await listLiveAgentCards(room, options)).map(peerFromCard);
+  const peers: AgentCardPeerRecord[] = [];
+  for (const card of await listLiveAgentCards(room, options)) {
+    try {
+      peers.push(peerFromCard(card));
+    } catch {
+      // Skip cards whose display names cannot be represented as network names.
+    }
+  }
+  return peers;
 }
 
 export const listAgentCards = listLiveAgentCards;
@@ -866,8 +885,11 @@ function copyMetadata(
   return {
     protocolVersion: card.protocolVersion ?? AGENT_CARD_PROTOCOL_VERSION,
     displayName: displayName?.trim() || `pi-to-pi-${runtimeId.replaceAll('-', '').slice(-12)}`,
-    purpose: metadata.purpose ?? card.purpose ?? null,
-    workingDirectoryLabel: metadata.workingDirectoryLabel ?? card.workingDirectoryLabel ?? null,
+    purpose: metadata.purpose === undefined ? (card.purpose ?? null) : metadata.purpose,
+    workingDirectoryLabel:
+      metadata.workingDirectoryLabel === undefined
+        ? (card.workingDirectoryLabel ?? null)
+        : metadata.workingDirectoryLabel,
     roleTags: Object.freeze([...(metadata.roleTags ?? card.roleTags ?? [])]),
     model: metadata.model === undefined ? (card.model ?? null) : metadata.model,
     capabilities:
@@ -1019,10 +1041,13 @@ export class AgentCardRegistry {
     }
     const card = this.buildCard();
     const tree = await this.ensureTree();
-    await writeAgentCardAtomically(tree, this.runtimeInstanceId, card, {
+    const writtenPath = await writeAgentCardAtomically(tree, this.runtimeInstanceId, card, {
       ...filesystemOptions(this.pathOptions),
       maxCardBytes: this.maxCardBytes,
     });
+    if (writtenPath === undefined) {
+      throw new AgentCardRegistryError('Agent Card publication exceeded its write deadline');
+    }
     this.currentCardValue = card;
     return card;
   }
@@ -1103,13 +1128,21 @@ export class AgentCardRegistry {
   public listLiveCards(
     options: Omit<AgentCardListingOptions, keyof AgentCardPathOptions> = {},
   ): Promise<AgentCard[]> {
-    return listLiveAgentCards(this.room, { ...this.pathOptions, ...options });
+    return listLiveAgentCards(this.room, {
+      ...this.pathOptions,
+      now: options.now ?? this.clock(),
+      ...options,
+    });
   }
 
   public listPeers(
     options: Omit<AgentCardListingOptions, keyof AgentCardPathOptions> = {},
   ): Promise<AgentCardPeerRecord[]> {
-    return listLiveAgentCardPeers(this.room, { ...this.pathOptions, ...options });
+    return listLiveAgentCardPeers(this.room, {
+      ...this.pathOptions,
+      now: options.now ?? this.clock(),
+      ...options,
+    });
   }
 
   public lookupPeerByName(
@@ -1131,7 +1164,12 @@ export class AgentCardRegistry {
   public cleanupStale(
     options: Omit<AgentCardCleanupOptions, keyof AgentCardPathOptions> = {},
   ): Promise<number> {
-    return cleanupStaleAgentCards(this.room, { ...this.pathOptions, ...options });
+    return cleanupStaleAgentCards(this.room, {
+      ...this.pathOptions,
+      now: options.now ?? this.clock(),
+      ttlMs: options.ttlMs ?? this.ttlMs,
+      ...options,
+    });
   }
 
   public cleanup(
@@ -1147,15 +1185,21 @@ export class AgentCardRegistry {
       this.shutdownPromise = (async () => {
         await this.lease.stop();
         await this.pendingPublication;
-        const removed = await removeAgentCard(this.room, this.runtimeInstanceId, {
-          ...this.pathOptions,
-          expectedSessionId: this.sessionId,
-          expectedEndpoint: {
-            kind: this.metadata.endpoint.kind,
-            address: this.metadata.endpoint.address,
-          },
-        });
-        this.currentCardValue = undefined;
+        let removed = false;
+        try {
+          removed = await removeAgentCard(this.room, this.runtimeInstanceId, {
+            ...this.pathOptions,
+            expectedSessionId: this.sessionId,
+            expectedEndpoint: {
+              kind: this.metadata.endpoint.kind,
+              address: this.metadata.endpoint.address,
+            },
+          });
+        } catch {
+          // Lease expiry cleans up when best-effort shutdown removal fails.
+        } finally {
+          this.currentCardValue = undefined;
+        }
         return removed;
       })();
     }

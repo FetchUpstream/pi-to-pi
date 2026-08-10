@@ -314,4 +314,64 @@ describe('AgentCardRegistry boundary', () => {
     ).toHaveLength(1);
     await stale.shutdown();
   });
+  it('uses its injected clock and lease policy for instance listing and cleanup', async () => {
+    const rootDirectory = await root();
+    let now = BASE_NOW;
+    const instance = new AgentCardRegistry({
+      rootDirectory,
+      room: { roomId: ROOM_ID, storageKey: STORAGE_KEY },
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      endpoint: { kind: 'unix', address: '/tmp/clocked' },
+      clock: () => now,
+      ttlMs: 100_000,
+    });
+    await instance.start();
+
+    expect(await instance.listLiveCards()).toHaveLength(1);
+    expect(await instance.listPeers()).toHaveLength(1);
+    expect((await instance.lookupPeerByRuntimeId(RUNTIME_A)).kind).toBe('found');
+
+    now += 280_001;
+    expect(await instance.cleanupStale()).toBe(0);
+    await instance.shutdown();
+  });
+
+  it('preserves explicit null metadata overrides from constructor options', async () => {
+    const rootDirectory = await root();
+    const instance = new AgentCardRegistry({
+      rootDirectory,
+      room: { roomId: ROOM_ID, storageKey: STORAGE_KEY },
+      runtimeId: RUNTIME_A,
+      sessionId: 'session-a',
+      endpoint: { kind: 'unix', address: '/tmp/metadata' },
+      clock: () => BASE_NOW,
+      card: { purpose: 'old purpose', workingDirectoryLabel: 'old directory' },
+      metadata: { purpose: null, workingDirectoryLabel: null },
+    });
+
+    await instance.start();
+    expect(instance.current()).toMatchObject({ purpose: null, workingDirectoryLabel: null });
+    await instance.shutdown();
+  });
+
+  it('skips cards with display names that cannot become network names', async () => {
+    const rootDirectory = await root();
+    const valid = registry(rootDirectory, RUNTIME_A, () => BASE_NOW);
+    const invalid = new AgentCardRegistry({
+      rootDirectory,
+      room: { roomId: ROOM_ID, storageKey: STORAGE_KEY },
+      runtimeId: RUNTIME_B,
+      sessionId: 'session-b',
+      displayName: '---',
+      endpoint: { kind: 'unix', address: '/tmp/invalid-name' },
+      clock: () => BASE_NOW,
+    });
+    await Promise.all([valid.start(), invalid.start()]);
+
+    const peers = await valid.listPeers();
+    expect(peers).toHaveLength(1);
+    expect(peers[0]).toMatchObject({ runtimeId: RUNTIME_A });
+    await Promise.all([valid.shutdown(), invalid.shutdown()]);
+  });
 });
