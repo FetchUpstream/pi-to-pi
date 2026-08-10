@@ -1,7 +1,8 @@
+import { win32 } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 function normalizeSpecifier(specifier) {
-  return /^[A-Za-z]:[\\\\/]/u.test(specifier) ? pathToFileURL(specifier).href : specifier;
+  return win32.isAbsolute(specifier) ? pathToFileURL(specifier).href : specifier;
 }
 
 export async function resolve(specifier, context, nextResolve) {
