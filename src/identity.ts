@@ -112,9 +112,12 @@ export function adaptExternalPeerAddress(value: {
   readonly runtimeInstanceId: unknown;
   readonly roomId: unknown;
 }): CanonicalPeerAddress {
+  if (typeof value.roomId !== 'string') {
+    throw new Error('Invalid room ID: expected a string');
+  }
   return Object.freeze({
     runtimeId: asRuntimeId(value.runtimeInstanceId),
-    roomId: asRoomId(String(value.roomId)),
+    roomId: asRoomId(value.roomId),
   });
 }
 

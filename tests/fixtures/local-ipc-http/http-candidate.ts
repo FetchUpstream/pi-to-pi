@@ -6,7 +6,7 @@
  * top of the path-based IPC endpoint accepted by `http.Server.listen` and
  * `http.request({ socketPath })`.
  */
-import { link, lstat, rename, unlink } from 'node:fs/promises';
+import { link, lstat, readlink, rename, symlink, unlink } from 'node:fs/promises';
 import type { BigIntStats } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { EventEmitter } from 'node:events';
@@ -1062,6 +1062,7 @@ async function restoreQuarantinedUnixEntry(
   // when the endpoint is vacant; never overwrite a replacement endpoint.
   let operationError: unknown;
   let relinkSawEexist = false;
+  let restored = false;
   try {
     let endpointStat: BigIntStats | undefined;
     try {
@@ -1076,7 +1077,13 @@ async function restoreQuarantinedUnixEntry(
         await withDeadline(Promise.resolve().then(beforeRelink), deadline);
       }
       try {
-        await withDeadline(tracker.track(link(quarantine, endpoint)), deadline);
+        if (quarantinedStat.isSymbolicLink()) {
+          const target = await withDeadline(tracker.track(readlink(quarantine)), deadline);
+          await withDeadline(tracker.track(symlink(target, endpoint)), deadline);
+        } else {
+          await withDeadline(tracker.track(link(quarantine, endpoint)), deadline);
+        }
+        restored = true;
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           throw error;
@@ -1119,7 +1126,7 @@ async function restoreQuarantinedUnixEntry(
     // only pathname for a live listener moved by the racing rename. Only an
     // unchanged moved entry can be removed, and owned residuals are removable
     // even when the replacement owns the endpoint.
-    if (quarantinedIsOwned || (!relinkSawEexist && endpointSharesQuarantine)) {
+    if (quarantinedIsOwned || (!relinkSawEexist && (endpointSharesQuarantine || restored))) {
       await withDeadline(tracker.track(unlink(quarantine)), deadline);
     }
   } catch (error: unknown) {

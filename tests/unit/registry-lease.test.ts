@@ -32,6 +32,7 @@ import {
   readRuntimeRecord,
   removeRuntimeRecord,
   serializeRuntimeRecord,
+  isRuntimeRecord,
   validateRuntimeRecord,
 } from '../../src/discovery/registry.js';
 import { buildNetworkName } from '../../src/discovery/naming.js';
@@ -156,6 +157,11 @@ describe('runtime record validation and atomic publication', () => {
 
     expect(validateRuntimeRecord({ ...valid, runtimeId: 'runtime-a' }).valid).toBe(false);
     expect(validateRuntimeRecord({ ...valid, networkName: 'Planner' }).valid).toBe(false);
+    expect(validateRuntimeRecord({ ...valid, networkName: 'planner' }).valid).toBe(false);
+    expect(isRuntimeRecord({ ...valid, networkName: 'planner' })).toBe(false);
+    expect(() => serializeRuntimeRecord({ ...valid, networkName: 'planner' })).toThrow(
+      'networkName',
+    );
     expect(validateRuntimeRecord({ ...valid, sessionId: 'bad session' }).valid).toBe(false);
     expect(validateRuntimeRecord({ ...valid, sessionId: 'session-' }).valid).toBe(false);
     expect(

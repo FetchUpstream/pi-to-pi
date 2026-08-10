@@ -299,6 +299,13 @@ function canonicalNetworkName(value: unknown, runtimeId: RuntimeId): PublishedNe
   }
   return buildNetworkName(normalized, runtimeId);
 }
+
+function persistedNetworkName(value: unknown, runtimeId: RuntimeId): PublishedNetworkName {
+  if (!isPublishedNetworkName(value)) {
+    throw new TypeError('network name must be suffix-qualified');
+  }
+  return canonicalNetworkName(value, runtimeId);
+}
 function validateRecordFields(
   value: unknown,
   options: RuntimeRecordValidationOptions,
@@ -370,7 +377,7 @@ function validateRecordFields(
     networkName = '' as PublishedNetworkName;
   } else {
     try {
-      networkName = canonicalNetworkName(value.networkName, runtimeId);
+      networkName = persistedNetworkName(value.networkName, runtimeId);
     } catch {
       errors.push({ field: 'networkName', message: 'must be a canonical network name' });
       networkName = '' as PublishedNetworkName;
@@ -554,11 +561,20 @@ export function createRuntimeRecord(draft: RuntimeRecordDraft): RuntimeRecord {
     ]);
   }
 
+  let persistedName: PublishedNetworkName;
+  try {
+    persistedName = canonicalNetworkName(networkName, runtimeId);
+  } catch (error) {
+    throw new RuntimeRecordValidationError([
+      { field: 'networkName', message: error instanceof Error ? error.message : 'is invalid' },
+    ]);
+  }
+
   const candidate = {
     runtimeId,
     sessionId,
     roomId,
-    networkName,
+    networkName: persistedName,
     endpoint: draft.endpoint,
     leaseExpiresAt,
   };

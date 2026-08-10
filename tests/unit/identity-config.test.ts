@@ -119,6 +119,9 @@ describe('P2P identity and configuration foundations', () => {
     expect(() => adaptExternalPeerAddress({ runtimeInstanceId, roomId: '../room' })).toThrow(
       'Invalid room ID',
     );
+    expect(() => adaptExternalPeerAddress({ runtimeInstanceId, roomId: [roomId] })).toThrow(
+      'expected a string',
+    );
   });
   it('keys shutdown to the owning runtime and tolerates repeated cleanup', () => {
     const uuids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
