@@ -16,6 +16,10 @@ They are test infrastructure, not package or Pi-to-Pi implementation modules.
   Pi-to-Pi wire protocol or import protocol, registry, transport, routing, or Pi implementation
   modules.
 
+## Local IPC transport fixture
+
+`transport-process.mjs` is a standalone native `node:net` fixture used by the production transport process tests. It accepts `server` or `client` plus an endpoint, exchanges opaque four-byte length-prefixed payloads, and keeps JSON-lines commands/events only as test-harness control. It does not import the package transport or any Pi-to-Pi protocol module.
+
 Fixtures must be deterministic, local, and small: they do not require a daemon, provider
 credentials, network service, TTY, or interactive Pi session. A fixture may deliberately remain
 alive for a bounded-timeout test, but the parent remains responsible for terminating it.

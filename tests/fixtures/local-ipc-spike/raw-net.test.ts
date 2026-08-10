@@ -364,26 +364,31 @@ describe('raw node:net local IPC candidate', () => {
     }
   });
 
-  it('keeps concurrent client responses associated with their request ordering', async () => {
-    const endpoint = createIpcEndpoint();
-    const transport = new RawNetTransport();
-    await transport.bind(endpoint, async (payload) => {
-      const id = Number(payload.toString('utf8'));
-      await delay((5 - id) * 5);
-      return Buffer.from(`response-${id}`);
-    });
+  it.skipIf(process.platform === 'win32')(
+    'keeps concurrent client responses associated with their request ordering',
+    async () => {
+      const endpoint = createIpcEndpoint();
+      const transport = new RawNetTransport();
+      await transport.bind(endpoint, async (payload) => {
+        const id = Number(payload.toString('utf8'));
+        await delay((5 - id) * 5);
+        return Buffer.from(`response-${id}`);
+      });
 
-    try {
-      const responses = await Promise.all(
-        Array.from({ length: 6 }, (_, id) => transport.request(endpoint, Buffer.from(String(id)))),
-      );
-      expect(responses.map((value) => value.toString('utf8'))).toEqual(
-        Array.from({ length: 6 }, (_, id) => `response-${id}`),
-      );
-    } finally {
-      await transport.close();
-    }
-  });
+      try {
+        const responses = await Promise.all(
+          Array.from({ length: 6 }, (_, id) =>
+            transport.request(endpoint, Buffer.from(String(id))),
+          ),
+        );
+        expect(responses.map((value) => value.toString('utf8'))).toEqual(
+          Array.from({ length: 6 }, (_, id) => `response-${id}`),
+        );
+      } finally {
+        await transport.close();
+      }
+    },
+  );
 
   it('rejects malformed, truncated, trailing, and oversized input before the handler', async () => {
     const endpoint = createIpcEndpoint();

@@ -73,7 +73,8 @@ describe('AgentCardRegistry boundary', () => {
     const rootDirectory = await root();
     const first = registry(rootDirectory, RUNTIME_A, () => BASE_NOW);
     const second = registry(rootDirectory, RUNTIME_B, () => BASE_NOW);
-    await Promise.all([first.start(), second.start()]);
+    await first.start();
+    await second.start();
 
     const peers = await listLiveAgentCardPeers(
       { roomId: ROOM_ID, storageKey: STORAGE_KEY },

@@ -17,7 +17,10 @@ const STORAGE_KEY_A = 'room-a';
 const STORAGE_KEY_B = 'room-b';
 const CARD_BASE_NOW = Date.parse('2026-01-01T00:00:00.000Z');
 const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
-const LOADER_PATH = fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
+const LOADER_PATH =
+  process.platform === 'win32'
+    ? new URL('./ts-source-loader.mjs', import.meta.url).href
+    : fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 function nodeModuleSpecifier(path: string): string {
