@@ -1,8 +1,4 @@
-## Purpose
-
-The agent-card registry defines versioned, private, room-scoped presence cards and leases for Pi runtimes.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: The Agent Card registry SHALL be the single discovery authority
 
@@ -15,6 +11,8 @@ New discovery publication, renewal, listing, and owner-removal operations SHALL 
 #### Scenario: Legacy records are not dual-published
 - **WHEN** the Agent Card registry renews or removes a runtime
 - **THEN** it operates only on that runtime's Agent Card and does not create or update a `RuntimeRecord`
+
+## MODIFIED Requirements
 
 ### Requirement: Agent Cards SHALL be versioned and identity-safe
 
@@ -37,40 +35,6 @@ The card SHALL represent an unset Pi session name with a non-secret runtime-deri
 #### Scenario: Mismatched endpoint identity is rejected
 - **WHEN** a card's endpoint declares a runtime identity different from the card or its destination filename
 - **THEN** publication and discovery reject the card as invalid
-
-### Requirement: The registry SHALL use a private, deterministic, room-scoped layout
-
-The registry SHALL resolve a per-user runtime root from `PI_TO_PI_RUNTIME_DIR`, a valid POSIX `XDG_RUNTIME_DIR` child, Windows per-user LocalAppData, or a private per-user temporary fallback in that order. It SHALL fail closed when it cannot establish a private root. Within that root it SHALL store records at `rooms/<storageKey>/agents/<runtimeInstanceId>.json`, where `storageKey` is supplied by the room identity module and is safe as a filesystem component.
-
-The registry SHALL never use display names, raw room input, process IDs, session IDs, or endpoint addresses as record filenames. It SHALL not use Pi's persistent config or session directory as the default registry root.
-
-#### Scenario: POSIX runtime directory is selected
-- **WHEN** `XDG_RUNTIME_DIR` is absolute, owned by the current user, and private
-- **THEN** the registry uses `<XDG_RUNTIME_DIR>/pi-to-pi` and creates its room and agent directories beneath it
-
-#### Scenario: Windows uses a per-user location
-- **WHEN** the process runs on Windows and a usable per-user LocalAppData location exists
-- **THEN** the registry uses `%LOCALAPPDATA%\\pi-to-pi\\runtime` with current-user ACL protection
-
-#### Scenario: Room storage identity is supplied by room derivation
-- **WHEN** the room module provides `roomId` and `storageKey`
-- **THEN** the registry uses the storage key as the path component and records the canonical room ID in each card without independently hashing raw input
-
-### Requirement: Card publication SHALL be atomic and instance-owned
-
-A runtime SHALL write a complete card to a unique temporary file in the destination agent directory and replace the final card with a same-directory atomic rename. Renewal SHALL be serialized per runtime. A runtime SHALL publish, renew, or remove only the card whose filename contains its own runtime instance ID. Temporary files SHALL not be returned as peer cards.
-
-#### Scenario: Concurrent runtimes publish without overwriting
-- **WHEN** two runtimes in the same room publish at the same time
-- **THEN** each runtime has a distinct final card and neither publication replaces the other runtime's card
-
-#### Scenario: Reader observes only complete cards
-- **WHEN** a reader scans while a runtime is writing a temporary card
-- **THEN** the reader either sees the previous complete card or the new complete card, never a partial JSON document
-
-#### Scenario: Old runtime cannot remove a replacement
-- **WHEN** an old runtime shuts down after a different runtime has published a different instance record
-- **THEN** the old runtime removes at most its own exact record and leaves the replacement record unchanged
 
 ### Requirement: Leases SHALL provide bounded presence and safe cleanup
 
@@ -117,19 +81,3 @@ A room listing SHALL validate each candidate's JSON syntax, schema, protocol ver
 #### Scenario: Registry remains metadata-only
 - **WHEN** a runtime publishes or renews its card
 - **THEN** the stored record contains no request, response, prompt, or task body
-
-### Requirement: Registry resources SHALL follow Pi lifecycle and platform protection rules
-
-The extension SHALL start registry timers and publication during `session_start`, SHALL stop them during an idempotent `session_shutdown`, and SHALL not start long-lived registry resources from the extension factory. POSIX registry directories SHALL use mode `0700` and card files SHALL use mode `0600`. Windows SHALL use ACL-based current-user protection rather than relying on POSIX mode bits.
-
-#### Scenario: Shutdown is idempotent
-- **WHEN** Pi emits `session_shutdown` more than once or shutdown cleanup races with expiry cleanup
-- **THEN** registry resources are closed safely and no duplicate timers or destructive cross-instance removals occur
-
-#### Scenario: Private permissions are applied
-- **WHEN** the registry creates its runtime tree and a card file on POSIX
-- **THEN** directories are private to the user and card files are readable/writable only by the user
-
-#### Scenario: Reload closes the old runtime
-- **WHEN** Pi reloads the extension
-- **THEN** the old registry timer and endpoint resources stop before the new runtime instance registers
