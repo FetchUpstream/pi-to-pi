@@ -1,7 +1,7 @@
 import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -17,6 +17,9 @@ const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.ur
 const LOADER_PATH = fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
+function nodeModuleSpecifier(path: string): string {
+  return process.platform === 'win32' ? pathToFileURL(path).href : path;
+}
 interface WorkerInput {
   readonly root: string;
   readonly room: string;
@@ -95,7 +98,14 @@ async function temporaryRoot(): Promise<string> {
 function runWorker(mode: string, payload: WorkerInput): Promise<WorkerResponse> {
   const child = spawn(
     process.execPath,
-    ['--no-warnings', '--experimental-strip-types', '--loader', LOADER_PATH, WORKER_PATH, mode],
+    [
+      '--no-warnings',
+      '--experimental-strip-types',
+      '--loader',
+      nodeModuleSpecifier(LOADER_PATH),
+      nodeModuleSpecifier(WORKER_PATH),
+      mode,
+    ],
     {
       cwd: REPOSITORY_ROOT,
       env: {
