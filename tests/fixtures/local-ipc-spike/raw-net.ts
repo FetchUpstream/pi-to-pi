@@ -137,6 +137,17 @@ function errorCode(value: unknown): string | undefined {
     : undefined;
 }
 
+const MAX_WINDOWS_PIPE_CONNECT_RETRIES = 4;
+
+function isTransientWindowsPipeConnectError(error: unknown): boolean {
+  return (
+    process.platform === 'win32' &&
+    error instanceof RawNetError &&
+    error.code === 'connect-error' &&
+    errorCode(error.cause) === 'ENOENT'
+  );
+}
+
 function normalizeTimeout(value: number | undefined, fallback: number, name: string): number {
   const timeout = value ?? fallback;
   if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > MAX_TIMER_DELAY_MS) {
@@ -1090,7 +1101,7 @@ export class RawNetTransport {
       throw new RawNetError('shutdown-error', 'Transport is shutting down');
     }
 
-    const socket = this.options.socketFactory(endpoint);
+    let socket = this.options.socketFactory(endpoint);
     trackSocketClosure(socket);
     if (this.closing || this.closed) {
       destroySocket(socket);
@@ -1104,10 +1115,32 @@ export class RawNetTransport {
         options.connectDeadline,
         options.connectTimeoutMs ?? this.options.connectTimeoutMs,
       );
-      await withDeadline((signal) => waitForConnect(socket, signal), connectDeadline, {
-        signal: options.signal,
-        onTimeout: () => destroySocket(socket),
-      });
+      let connectRetries = 0;
+      for (;;) {
+        try {
+          await withDeadline((signal) => waitForConnect(socket, signal), connectDeadline, {
+            signal: options.signal,
+            onTimeout: () => destroySocket(socket),
+          });
+          break;
+        } catch (error: unknown) {
+          if (
+            !isTransientWindowsPipeConnectError(error) ||
+            connectRetries >= MAX_WINDOWS_PIPE_CONNECT_RETRIES
+          ) {
+            throw error;
+          }
+          connectRetries += 1;
+          this.clientSockets.delete(socket);
+          destroySocket(socket);
+          await waitForSocketClosure(socket);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          throwIfAborted(options.signal);
+          socket = this.options.socketFactory(endpoint);
+          trackSocketClosure(socket);
+          this.clientSockets.add(socket);
+        }
+      }
 
       const writeDeadline = phaseDeadline(
         'write',
