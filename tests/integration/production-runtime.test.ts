@@ -40,20 +40,21 @@ describe('production runtime composition', () => {
       await recipient.start();
       await sender.start();
       const peers = await sender.adapter.listPeers();
-      expect(peers).toEqual(
+      expect(peers.peers).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            runtimeId: recipient.identity.runtimeId,
-            endpoint: expect.objectContaining({ address: recipient.endpoint }),
+            displayName: 'recipient-session',
+            publishedTarget: expect.any(String),
           }),
         ]),
       );
+      expect(JSON.stringify(peers)).not.toContain(recipient.endpoint);
 
-      const request = await sender.router.createRequest({
-        recipientRuntimeId: recipient.identity.runtimeId,
-        content: { type: 'text', text: 'hello' },
-      });
-      await expect(request.admission).resolves.toMatchObject({ result: { state: 'accepted' } });
+      const target = peers.peers[0]?.publishedTarget;
+      if (target === undefined) throw new Error('peer target was not published');
+      const request = await sender.adapter.send(target, { type: 'text', text: 'hello' });
+      await expect(request).toMatchObject({ targetRuntimeId: recipient.identity.runtimeId });
+      expect(request.admission).toMatchObject({ result: { state: 'accepted' } });
       expect(recipient.router.taskSnapshot(request.requestId)).toMatchObject({ state: 'working' });
     } finally {
       await sender.shutdown();
@@ -124,9 +125,8 @@ describe('production runtime composition', () => {
     try {
       await Promise.all([sender.start(), first.start(), second.start()]);
       const peers = await sender.adapter.listPeers();
-      expect(
-        peers.filter((peer) => (peer as { displayName: string }).displayName === 'same-name'),
-      ).toHaveLength(2);
+      expect(peers.peers.filter((peer) => peer.displayName === 'same-name')).toHaveLength(2);
+      expect(peers.peers.filter((peer) => peer.runtimeId !== undefined)).toHaveLength(2);
     } finally {
       await Promise.all([sender.shutdown(), first.shutdown(), second.shutdown()]);
     }

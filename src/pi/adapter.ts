@@ -1,7 +1,7 @@
 import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
-import type { AgentCardRegistry } from '../discovery/agent-card-registry.js';
+import type { AgentCardPeerRecord, AgentCardRegistry } from '../discovery/agent-card-registry.js';
 import type { DiagnosticSnapshot } from '../diagnostics.js';
 import {
   unavailableIssueReporter,
@@ -10,6 +10,8 @@ import {
   type ModelIssueReport,
 } from '../issue-reporter.js';
 import { resolvePeerTarget } from '../discovery/lookup.js';
+import { publishedNetworkBase } from '../discovery/naming.js';
+import type { AgentModel, AgentState, ContextUsage } from '../protocol/agent-card.js';
 import { createProtocolError } from '../protocol/errors.js';
 import type {
   Content,
@@ -59,6 +61,21 @@ export interface PiAdapterOptions {
   readonly diagnostics?: (
     input: Pick<ModelIssueReport, 'operation' | 'requestId' | 'peerRuntimeId'>,
   ) => DiagnosticSnapshot;
+}
+
+export interface PeerDiscoveryEntry {
+  readonly displayName: string;
+  readonly publishedTarget: string;
+  readonly state: AgentState;
+  readonly inboundQueueDepth?: number;
+  readonly model?: AgentModel;
+  readonly contextUsage?: ContextUsage;
+  readonly runtimeId?: string;
+}
+
+export interface PeerDiscoveryView {
+  readonly self?: PeerDiscoveryEntry;
+  readonly peers: readonly PeerDiscoveryEntry[];
 }
 
 interface ActiveRuntime {
@@ -182,20 +199,22 @@ export class PiAdapter {
     return this.router.notify({ recipientRuntimeId: resolved.record.runtimeId, content });
   }
 
-  public async listPeers(): Promise<unknown[]> {
-    return this.peers.listPeers().then((peers) =>
-      peers.map((peer) => ({
-        displayName: peer.displayName,
-        publishedName: peer.networkName,
-        runtimeId: peer.runtimeId,
-        endpoint: peer.endpoint,
-        model: peer.card.model,
-        state: peer.card.state,
-        contextUsage: peer.card.contextUsage,
-        inboundQueueDepth: peer.card.inboundQueueDepth,
-        capabilities: peer.card.capabilities,
-      })),
+  public async listPeers(): Promise<PeerDiscoveryView> {
+    const records = await this.peers.listPeers();
+    const selfRecord = records.find(
+      (peer) => String(peer.runtimeId) === String(this.router.runtimeId),
     );
+    const remoteRecords = records.filter(
+      (peer) => String(peer.runtimeId) !== String(this.router.runtimeId),
+    );
+    const ambiguousNames = ambiguousPeerNames(records);
+
+    return {
+      ...(selfRecord === undefined ? {} : { self: projectPeer(selfRecord, false) }),
+      peers: remoteRecords.map((peer) =>
+        projectPeer(peer, ambiguousNames.has(String(peer.runtimeId))),
+      ),
+    };
   }
 
   public reply(input: PiReplyInput): TaskSnapshot {
@@ -320,6 +339,70 @@ export class PiAdapter {
   }
 }
 
+function projectPeer(peer: AgentCardPeerRecord, includeRuntimeId: boolean): PeerDiscoveryEntry {
+  const card = peer.card;
+  const contextUsage = meaningfulContextUsage(card.contextUsage);
+  return {
+    displayName: peer.displayName,
+    publishedTarget: peer.networkName,
+    state: card.state,
+    ...(card.inboundQueueDepth > 0 ? { inboundQueueDepth: card.inboundQueueDepth } : {}),
+    ...(card.model === null ? {} : { model: card.model }),
+    ...(contextUsage === undefined ? {} : { contextUsage }),
+    ...(includeRuntimeId ? { runtimeId: peer.runtimeId } : {}),
+  };
+}
+
+function meaningfulContextUsage(value: ContextUsage | null): ContextUsage | undefined {
+  if (value === null || (value.tokens === null && value.percent === null)) {
+    return undefined;
+  }
+  return value;
+}
+
+function ambiguousPeerNames(records: readonly AgentCardPeerRecord[]): Set<string> {
+  const names = new Map<string, AgentCardPeerRecord[]>();
+  for (const record of records) {
+    const keys = new Set([
+      record.displayName.normalize('NFKC').toLowerCase(),
+      publishedNetworkBase(record.networkName),
+    ]);
+    for (const key of keys) {
+      const matches = names.get(key) ?? [];
+      matches.push(record);
+      names.set(key, matches);
+    }
+  }
+  const ambiguous = new Set<string>();
+  for (const matches of names.values()) {
+    if (matches.length > 1) {
+      for (const record of matches) ambiguous.add(String(record.runtimeId));
+    }
+  }
+  return ambiguous;
+}
+
+export function formatPeerDiscovery(view: PeerDiscoveryView): string {
+  const lines = [view.self === undefined ? 'You: unavailable' : `You: ${formatPeer(view.self)}`];
+  if (view.peers.length > 0) {
+    lines.push('Peers:');
+    lines.push(...view.peers.map((peer) => `- ${formatPeer(peer)}`));
+  }
+  return lines.join('\n');
+}
+
+function formatPeer(peer: PeerDiscoveryEntry): string {
+  const details = [`target=${peer.publishedTarget}`, `state=${peer.state}`];
+  if (peer.inboundQueueDepth !== undefined) details.push(`queue=${peer.inboundQueueDepth}`);
+  if (peer.model !== undefined) details.push(`model=${peer.model.provider}/${peer.model.id}`);
+  if (peer.contextUsage !== undefined) {
+    if (peer.contextUsage.tokens !== null) details.push(`tokens=${peer.contextUsage.tokens}`);
+    if (peer.contextUsage.percent !== null) details.push(`context=${peer.contextUsage.percent}%`);
+  }
+  if (peer.runtimeId !== undefined) details.push(`runtime=${peer.runtimeId}`);
+  return `${peer.displayName} (${details.join(', ')})`;
+}
+
 function textResult(content: string, isError = false) {
   return { content: [{ type: 'text' as const, text: content }], details: { isError } };
 }
@@ -342,7 +425,7 @@ export function registerPiTools(
     parameters: Type.Object({}),
     execute: async () => {
       try {
-        return textResult(JSON.stringify(await current().listPeers(), null, 2));
+        return textResult(formatPeerDiscovery(await current().listPeers()));
       } catch (error) {
         return textResult(error instanceof Error ? error.message : 'Unable to list peers', true);
       }
