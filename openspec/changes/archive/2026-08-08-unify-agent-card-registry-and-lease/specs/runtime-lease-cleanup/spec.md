@@ -1,10 +1,4 @@
-# Runtime Lease Cleanup
-
-## Purpose
-
-TBD — define runtime-keyed registry leases and safe lifecycle cleanup.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: The legacy lease registry SHALL be isolated from Agent Card authority
 
@@ -17,6 +11,8 @@ The existing `RuntimeRecord` and `RuntimeRegistry` implementation SHALL be treat
 #### Scenario: Legacy removal is deferred to the integration point
 - **WHEN** this discovery foundation is used before P2P-013 lifecycle wiring lands
 - **THEN** existing compatibility exports may remain available, but no new Agent Card behavior is added to them
+
+## MODIFIED Requirements
 
 ### Requirement: Runtime-keyed lease records
 

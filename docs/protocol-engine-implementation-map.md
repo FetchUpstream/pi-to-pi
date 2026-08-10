@@ -42,3 +42,7 @@ The engine should accept a fake binding/transport that supplies authenticated id
 - End-to-end and concrete transport wiring belong to the dependent integration issues. Those issues compose the engine, binding, discovery, and Pi adapter; they do not redefine the v1 envelope, state machine, error codes, or room/authentication contract.
 
 The v1 engine intentionally provides no streaming, attachments, broker, durable offline delivery, or runtime task handoff.
+
+## Discovery compatibility handoff
+
+`src/discovery/registry.ts` remains a deprecated `RuntimeRecord`/`RuntimeRegistry` compatibility seam for current lifecycle callers. New discovery code uses `AgentCardRegistry` and must not dual-publish or translate legacy records. P2P-013 owns rewiring lifecycle startup, renewal, listing, and shutdown to the Agent Card boundary, then removing the compatibility seam once those callers have migrated.

@@ -19,6 +19,8 @@ const ROOM_ID_HEX_LENGTH = 32;
 const ROOM_ID_PATTERN = new RegExp(`^${ROOM_ID_PREFIX}[0-9a-f]{${ROOM_ID_HEX_LENGTH}}$`, 'u');
 const CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}]/u;
 const LETTER_OR_NUMBER_PATTERN = /[\p{L}\p{N}]/u;
+const SAFE_STORAGE_KEY_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/u;
+const WINDOWS_RESERVED_STORAGE_KEY_PATTERN = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)/iu;
 
 /** Canonical discriminators used in room hashing and automatic resolution. */
 export type CanonicalRoomSource = 'explicit' | 'git' | 'cwd';
@@ -88,6 +90,33 @@ export interface LegacyResolvedRoom {
 /** A room id or an object carrying one, accepted by exact-room helpers. */
 export type RoomLike =
   RoomId | string | { readonly roomId: RoomId | string } | { readonly id: RoomId | string };
+export interface RoomIdentity {
+  readonly roomId: RoomId;
+  readonly storageKey: string;
+}
+
+export interface RoomIdentityValidationIssue {
+  readonly field: 'roomId' | 'storageKey' | '$';
+  readonly message: string;
+}
+
+export interface RoomIdentityValidationResult {
+  readonly valid: boolean;
+  readonly value?: RoomIdentity;
+  readonly errors: readonly RoomIdentityValidationIssue[];
+}
+
+/** Thrown when a canonical room/storage identity is malformed. */
+export class InvalidRoomIdentityError extends TypeError {
+  public readonly errors: readonly RoomIdentityValidationIssue[];
+
+  public constructor(errors: readonly RoomIdentityValidationIssue[]) {
+    super(errors.map((error) => `${error.field}: ${error.message}`).join('; '));
+    this.name = 'InvalidRoomIdentityError';
+    this.errors = errors;
+  }
+}
+
 /** Thrown when an explicit project label cannot become a valid normalized label. */
 export class InvalidProjectLabelError extends TypeError {
   public constructor(message: string) {
@@ -222,6 +251,65 @@ export const normalizeProjectName = normalizeProjectLabel;
 /** Return whether a value is a valid filesystem-safe opaque room id. */
 export function isValidRoomId(value: unknown): value is RoomId {
   return typeof value === 'string' && ROOM_ID_PATTERN.test(value);
+}
+
+/** Descriptive alias for callers that distinguish canonical from legacy ids. */
+export function isCanonicalRoomId(value: unknown): value is RoomId {
+  return isValidRoomId(value);
+}
+
+/** Return whether a value is safe as one cross-platform room directory component. */
+export function isSafeStorageKey(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    SAFE_STORAGE_KEY_PATTERN.test(value) &&
+    !value.endsWith('.') &&
+    !value.endsWith(' ') &&
+    !WINDOWS_RESERVED_STORAGE_KEY_PATTERN.test(value) &&
+    !CONTROL_CHARACTER_PATTERN.test(value)
+  );
+}
+
+/** Validate a canonical room id and its already-derived filesystem key. */
+export function validateRoomIdentity(value: unknown): RoomIdentityValidationResult {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return {
+      valid: false,
+      errors: [{ field: '$', message: 'room identity must be an object' }],
+    };
+  }
+
+  const candidate = value as { readonly roomId?: unknown; readonly storageKey?: unknown };
+  const errors: RoomIdentityValidationIssue[] = [];
+  if (!isCanonicalRoomId(candidate.roomId)) {
+    errors.push({ field: 'roomId', message: 'must be a canonical r1 room id' });
+  }
+  if (!isSafeStorageKey(candidate.storageKey)) {
+    errors.push({ field: 'storageKey', message: 'must be a safe filesystem component' });
+  }
+  if (errors.length > 0) {
+    return { valid: false, errors };
+  }
+
+  return {
+    valid: true,
+    value: value as RoomIdentity,
+    errors: [],
+  };
+}
+
+/** Return whether a value carries a valid canonical room/storage identity. */
+export function isRoomIdentity(value: unknown): value is RoomIdentity {
+  return validateRoomIdentity(value).valid;
+}
+
+/** Assert and return a canonical room/storage identity. */
+export function assertRoomIdentity(value: unknown): RoomIdentity {
+  const result = validateRoomIdentity(value);
+  if (!result.valid || result.value === undefined) {
+    throw new InvalidRoomIdentityError(result.errors);
+  }
+  return result.value;
 }
 
 /** Validate and brand a room id before it is used for lookup or path construction. */
