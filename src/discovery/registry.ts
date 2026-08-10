@@ -1,3 +1,10 @@
+/**
+ * @deprecated Compatibility-only RuntimeRecord storage.
+ *
+ * The Agent Card registry is the discovery authority. P2P-013 owns lifecycle
+ * rewiring and the eventual removal of this seam; no new discovery behavior
+ * should be added here.
+ */
 import { randomBytes } from 'node:crypto';
 import { chmod, lstat, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
@@ -67,7 +74,10 @@ const MAX_ENDPOINT_LENGTH = 4096;
 export type RegistryClock = LeaseClock;
 export type LeaseExpiryInput = number | Date | string;
 
-/** The validated, machine-actionable runtime registry record. */
+/**
+ * @deprecated Compatibility schema retained for current lifecycle callers until
+ * P2P-013 switches them to AgentCardRegistry.
+ */
 export interface RuntimeRecord {
   readonly runtimeId: RuntimeId;
   readonly sessionId: SessionId;
@@ -1490,9 +1500,8 @@ function runtimeIdentityFromOptions(options: RuntimeRegistryOptions): {
 }
 
 /**
- * Lifecycle-facing registry owner.  Later Pi integration can create one at
- * `session_start`, call `start()`, and await `shutdown()` from
- * `session_shutdown`.  Shutdown is idempotent and never touches another key.
+ * @deprecated Compatibility-only lifecycle registry. P2P-013 owns migration to
+ * AgentCardRegistry and eventual removal; existing callers remain supported here.
  */
 export class RuntimeRegistry {
   public readonly runtimeId: RuntimeId;

@@ -5,21 +5,15 @@ import {
   type CanonicalPeerAddress,
   type RuntimeId,
 } from '../identity.js';
-import { asRoomId, type RoomId } from '../room.js';
-import {
-  asPublishedNetworkName,
-  isPublishedNetworkName,
-  normalizePeerLookupName,
-  publishedNetworkBase,
-  type PublishedNetworkName,
-} from './naming.js';
+import { asRoomId, type RoomId, type RoomLike } from '../room.js';
+import { isPublishedNetworkName, normalizePeerLookupName, publishedNetworkBase } from './naming.js';
 
 /** The registry fields required by pure same-room lookup. */
 export interface PeerRecordLike {
   readonly runtimeId: RuntimeId | string;
   readonly roomId: RoomId | string;
-  /** Canonical suffix-qualified lookup key; queries may use its normalized base. */
-  readonly networkName: PublishedNetworkName;
+  /** Base-only and full published names are both accepted at this seam. */
+  readonly networkName: string;
 }
 
 export interface PeerCandidate<TRecord extends PeerRecordLike = PeerRecordLike> {
@@ -40,24 +34,36 @@ export interface PeerFoundResult<TRecord extends PeerRecordLike = PeerRecordLike
   readonly record: TRecord;
 }
 
-export interface PeerAmbiguousResult {
+export interface PeerAmbiguousResult<TRecord extends PeerRecordLike = PeerRecordLike> {
   readonly kind: 'ambiguous';
   readonly query: string;
   /** Every full runtime address remains available to the caller. */
   readonly candidates: readonly CanonicalPeerAddress[];
+  /** Alias for callers that use the address terminology. */
+  readonly addresses: readonly CanonicalPeerAddress[];
+  /** The records corresponding to `candidates`, in the same order. */
+  readonly records: readonly TRecord[];
+  /** Rich candidates for callers that need both records and addresses. */
+  readonly matches: readonly PeerCandidate<TRecord>[];
 }
 
-export interface PeerCrossRoomResult {
+export interface PeerCrossRoomResult<TRecord extends PeerRecordLike = PeerRecordLike> {
   readonly kind: 'cross-room';
   readonly query: string;
   readonly currentRoom: RoomId;
   /** Every full runtime address found outside the current room. */
   readonly candidates: readonly CanonicalPeerAddress[];
+  readonly addresses: readonly CanonicalPeerAddress[];
+  readonly records: readonly TRecord[];
+  readonly matches: readonly PeerCandidate<TRecord>[];
   readonly targetRooms: readonly RoomId[];
 }
 
 export type PeerLookupResult<TRecord extends PeerRecordLike = PeerRecordLike> =
-  PeerNotFoundResult | PeerFoundResult<TRecord> | PeerAmbiguousResult | PeerCrossRoomResult;
+  | PeerNotFoundResult
+  | PeerFoundResult<TRecord>
+  | PeerAmbiguousResult<TRecord>
+  | PeerCrossRoomResult<TRecord>;
 
 export type PeerLookupErrorCode = 'not-found' | 'ambiguous' | 'cross-room';
 
@@ -81,26 +87,42 @@ export class PeerNotFoundError extends PeerLookupError {
   }
 }
 
-export class AmbiguousPeerNameError extends PeerLookupError {
+export class AmbiguousPeerNameError<
+  TRecord extends PeerRecordLike = PeerRecordLike,
+> extends PeerLookupError {
   public readonly candidates: readonly CanonicalPeerAddress[];
+  public readonly addresses: readonly CanonicalPeerAddress[];
+  public readonly records: readonly TRecord[];
+  public readonly matches: readonly PeerCandidate<TRecord>[];
 
-  public constructor(result: PeerAmbiguousResult) {
+  public constructor(result: PeerAmbiguousResult<TRecord>) {
     super('ambiguous', result.query, `Peer name is ambiguous: ${result.query}`);
     this.name = 'AmbiguousPeerNameError';
     this.candidates = result.candidates;
+    this.addresses = result.addresses;
+    this.records = result.records;
+    this.matches = result.matches;
   }
 }
 
-export class CrossRoomPeerError extends PeerLookupError {
+export class CrossRoomPeerError<
+  TRecord extends PeerRecordLike = PeerRecordLike,
+> extends PeerLookupError {
   public readonly currentRoom: RoomId;
   public readonly candidates: readonly CanonicalPeerAddress[];
+  public readonly addresses: readonly CanonicalPeerAddress[];
+  public readonly records: readonly TRecord[];
+  public readonly matches: readonly PeerCandidate<TRecord>[];
   public readonly targetRooms: readonly RoomId[];
 
-  public constructor(result: PeerCrossRoomResult) {
+  public constructor(result: PeerCrossRoomResult<TRecord>) {
     super('cross-room', result.query, `Peer target belongs to another room: ${result.query}`);
     this.name = 'CrossRoomPeerError';
     this.currentRoom = result.currentRoom;
     this.candidates = result.candidates;
+    this.addresses = result.addresses;
+    this.records = result.records;
+    this.matches = result.matches;
     this.targetRooms = result.targetRooms;
   }
 }
@@ -108,6 +130,22 @@ export class CrossRoomPeerError extends PeerLookupError {
 interface ParsedCandidate<TRecord extends PeerRecordLike> {
   readonly candidate: PeerCandidate<TRecord>;
   readonly normalizedName: string;
+}
+
+function roomIdFromLike(room: RoomLike): RoomId {
+  if (typeof room === 'string') {
+    return asRoomId(room);
+  }
+
+  if ('roomId' in room) {
+    return asRoomId(room.roomId);
+  }
+
+  return asRoomId(room.id);
+}
+
+function runtimeIdsEqual(left: RuntimeId, right: RuntimeId): boolean {
+  return left === right;
 }
 
 function parseCandidate<TRecord extends PeerRecordLike>(
@@ -125,11 +163,7 @@ function parseCandidate<TRecord extends PeerRecordLike>(
   try {
     const runtimeId = asRuntimeId(record.runtimeId);
     const roomId = asRoomId(record.roomId);
-    const normalizedLookupName = normalizePeerLookupName(record.networkName);
-    if (normalizedLookupName !== record.networkName) {
-      return undefined;
-    }
-    const normalizedName = asPublishedNetworkName(normalizedLookupName);
+    const normalizedName = normalizePeerLookupName(record.networkName);
     return {
       candidate: {
         address: createCanonicalPeerAddress(runtimeId, roomId),
@@ -150,19 +184,38 @@ function candidateBase(normalizedName: string): string {
     : normalizedName;
 }
 
+function freezeMatches<TRecord extends PeerRecordLike>(
+  matches: readonly PeerCandidate<TRecord>[],
+): readonly PeerCandidate<TRecord>[] {
+  return Object.freeze([...matches]);
+}
+
 function addressesFor<TRecord extends PeerRecordLike>(
   matches: readonly PeerCandidate<TRecord>[],
 ): readonly CanonicalPeerAddress[] {
   return Object.freeze(matches.map(({ address }) => address));
 }
 
-/** Resolve a normalized human-facing name in one exact room. */
+function recordsFor<TRecord extends PeerRecordLike>(
+  matches: readonly PeerCandidate<TRecord>[],
+): readonly TRecord[] {
+  return Object.freeze(matches.map(({ record }) => record));
+}
+
+/**
+ * Resolve a normalized human-facing name in one exact room.
+ *
+ * The input records are expected to come from a room-scoped discovery adapter;
+ * both the Agent Card boundary and the deprecated compatibility seam can provide
+ * this pure lookup shape. Room filtering is repeated here so this helper cannot
+ * accidentally become a cross-room fallback when used with a broader collection.
+ */
 export function lookupPeerByName<TRecord extends PeerRecordLike>(
   name: string,
-  currentRoom: RoomId | string,
+  currentRoom: RoomLike,
   records: readonly TRecord[],
 ): PeerLookupResult<TRecord> {
-  const roomId = asRoomId(currentRoom);
+  const roomId = roomIdFromLike(currentRoom);
   const normalizedQuery = normalizePeerLookupName(name);
   const queryIsFullName = isPublishedNetworkName(normalizedQuery);
   const queryBase = queryIsFullName
@@ -189,8 +242,9 @@ export function lookupPeerByName<TRecord extends PeerRecordLike>(
     return { kind: 'not-found', query: normalizedQuery };
   }
 
-  if (matching.length === 1) {
-    const [candidate] = matching;
+  const matches = freezeMatches(matching);
+  if (matches.length === 1) {
+    const [candidate] = matches;
     return {
       kind: 'found',
       query: normalizedQuery,
@@ -200,27 +254,34 @@ export function lookupPeerByName<TRecord extends PeerRecordLike>(
     };
   }
 
+  const candidates = addressesFor(matches);
   return {
     kind: 'ambiguous',
     query: normalizedQuery,
-    candidates: addressesFor(matching),
+    candidates,
+    addresses: candidates,
+    records: recordsFor(matches),
+    matches,
   };
 }
 
 /** Resolve one exact full runtime UUID, requiring exact room equality. */
 export function lookupPeerByRuntimeId<TRecord extends PeerRecordLike>(
   runtimeId: RuntimeId | string,
-  currentRoom: RoomId | string,
+  currentRoom: RoomLike,
   records: readonly TRecord[],
 ): PeerLookupResult<TRecord> {
   const targetRuntimeId = asRuntimeId(runtimeId);
-  const roomId = asRoomId(currentRoom);
+  const roomId = roomIdFromLike(currentRoom);
   const sameRoom: PeerCandidate<TRecord>[] = [];
   const otherRoom: PeerCandidate<TRecord>[] = [];
 
   for (const record of records) {
     const parsed = parseCandidate(record);
-    if (parsed === undefined || parsed.candidate.address.runtimeId !== targetRuntimeId) {
+    if (
+      parsed === undefined ||
+      !runtimeIdsEqual(parsed.candidate.address.runtimeId, targetRuntimeId)
+    ) {
       continue;
     }
 
@@ -232,10 +293,15 @@ export function lookupPeerByRuntimeId<TRecord extends PeerRecordLike>(
   }
 
   if (sameRoom.length > 1) {
+    const matches = freezeMatches(sameRoom);
+    const candidates = addressesFor(matches);
     return {
       kind: 'ambiguous',
       query: targetRuntimeId,
-      candidates: addressesFor(sameRoom),
+      candidates,
+      addresses: candidates,
+      records: recordsFor(matches),
+      matches,
     };
   }
 
@@ -251,21 +317,30 @@ export function lookupPeerByRuntimeId<TRecord extends PeerRecordLike>(
   }
 
   if (sameRoom.length === 0 && otherRoom.length > 0) {
-    const candidates = addressesFor(otherRoom);
+    const matches = freezeMatches(otherRoom);
+    const candidates = addressesFor(matches);
     return {
       kind: 'cross-room',
       query: targetRuntimeId,
       currentRoom: roomId,
       candidates,
+      addresses: candidates,
+      records: recordsFor(matches),
+      matches,
       targetRooms: Object.freeze([...new Set(candidates.map(({ roomId: target }) => target))]),
     };
   }
 
   if (sameRoom.length === 1) {
+    const matches = freezeMatches([...sameRoom, ...otherRoom]);
+    const candidates = addressesFor(matches);
     return {
       kind: 'ambiguous',
       query: targetRuntimeId,
-      candidates: addressesFor([...sameRoom, ...otherRoom]),
+      candidates,
+      addresses: candidates,
+      records: recordsFor(matches),
+      matches,
     };
   }
 
@@ -275,7 +350,7 @@ export function lookupPeerByRuntimeId<TRecord extends PeerRecordLike>(
 /** Resolve a name or full runtime UUID using the appropriate exact strategy. */
 export function resolvePeerTarget<TRecord extends PeerRecordLike>(
   target: string,
-  currentRoom: RoomId | string,
+  currentRoom: RoomLike,
   records: readonly TRecord[],
 ): PeerLookupResult<TRecord> {
   if (isUuid(target)) {
@@ -288,7 +363,7 @@ export function resolvePeerTarget<TRecord extends PeerRecordLike>(
 /** Throwing counterpart for protocol code that treats non-found as an error. */
 export function resolvePeerTargetOrThrow<TRecord extends PeerRecordLike>(
   target: string,
-  currentRoom: RoomId | string,
+  currentRoom: RoomLike,
   records: readonly TRecord[],
 ): PeerCandidate<TRecord> {
   const result = resolvePeerTarget(target, currentRoom, records);
@@ -303,3 +378,8 @@ export function resolvePeerTargetOrThrow<TRecord extends PeerRecordLike>(
   }
   throw new PeerNotFoundError(result.query);
 }
+
+/** Explicit aliases for integrations that already distinguish name and address. */
+export const resolvePeerName = lookupPeerByName;
+export const resolveRuntimeAddress = lookupPeerByRuntimeId;
+export const resolvePeer = resolvePeerTarget;

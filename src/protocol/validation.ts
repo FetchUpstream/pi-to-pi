@@ -13,12 +13,14 @@ import {
   MAX_PURPOSE_LENGTH,
   MAX_ROLE_TAG_LENGTH,
   MAX_ROLE_TAGS,
+  MAX_ROOM_ID_LENGTH,
   MAX_SUPPORTED_CONTENT_TYPES,
   MAX_WORKING_DIRECTORY_LABEL_LENGTH,
   SUPPORTED_AGENT_CARD_PROTOCOL_VERSIONS,
   type AgentCard,
 } from './agent-card.js';
-import { isValidRoomId } from '../room.js';
+import { isCanonicalRoomId } from '../room.js';
+import { isUuid } from '../identity.js';
 
 export type AgentCardValidationCode =
   | 'invalid-type'
@@ -106,9 +108,6 @@ const ENDPOINT_FIELDS = new Set(['kind', 'address', 'runtimeInstanceId']);
 const ISO_TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/u;
-const SAFE_RUNTIME_INSTANCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-const WINDOWS_RESERVED_RUNTIME_INSTANCE_ID_PATTERN =
-  /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)/iu;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -153,17 +152,11 @@ function isIdentifier(value: unknown): value is string {
 
 /**
  * Runtime identities are shared by registry construction, path construction, and
- * card schema validation. Keep this check cross-platform and stricter than the
- * generic logical session identity grammar.
+ * card schema validation. They are full canonical UUIDs so a filename, card, and
+ * endpoint can all identify the same runtime without truncation.
  */
 export function isSafeRuntimeInstanceId(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    SAFE_RUNTIME_INSTANCE_ID_PATTERN.test(value) &&
-    !value.endsWith('.') &&
-    !value.endsWith(' ') &&
-    !WINDOWS_RESERVED_RUNTIME_INSTANCE_ID_PATTERN.test(value)
-  );
+  return isUuid(value);
 }
 
 function isFiniteInteger(value: unknown): value is number {
@@ -589,8 +582,13 @@ export function validateAgentCard(
   if (!isBoundedText(input.displayName, MAX_DISPLAY_NAME_LENGTH)) {
     issue(errors, 'displayName', 'invalid-value', 'must be bounded non-empty text');
   }
-  if (!isValidRoomId(input.roomId)) {
-    issue(errors, 'roomId', 'invalid-value', 'must be a canonical r1 room ID');
+  if (!isCanonicalRoomId(input.roomId)) {
+    issue(
+      errors,
+      'roomId',
+      'invalid-value',
+      `must be a canonical room identity of at most ${MAX_ROOM_ID_LENGTH} characters`,
+    );
   }
   if (options.expectedRoomId !== undefined && input.roomId !== options.expectedRoomId) {
     issue(errors, 'roomId', 'room-mismatch', 'does not match the room being listed');

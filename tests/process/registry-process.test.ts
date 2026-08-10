@@ -13,6 +13,9 @@ const PUBLICATION_READY_TIMEOUT_MS = 2_000;
 const PUBLICATION_POLL_INTERVAL_MS = 25;
 const ROOM_A = `r1-${'a'.repeat(32)}`;
 const ROOM_B = `r1-${'b'.repeat(32)}`;
+const STORAGE_KEY_A = 'room-a';
+const STORAGE_KEY_B = 'room-b';
+const CARD_BASE_NOW = Date.parse('2026-01-01T00:00:00.000Z');
 const WORKER_PATH = fileURLToPath(new URL('./registry-worker.ts', import.meta.url));
 const LOADER_PATH = fileURLToPath(new URL('./ts-source-loader.mjs', import.meta.url));
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -41,6 +44,45 @@ interface StartResponse extends WorkerResponse {
   readonly record: PublishedRecord;
 }
 
+interface PublishedAgentCard {
+  readonly runtimeInstanceId: string;
+  readonly sessionId: string;
+  readonly roomId: string;
+  readonly displayName: string;
+  readonly runtimeStartedAt: string;
+  readonly leaseExpiresAt: string;
+  readonly endpoint: {
+    readonly kind: string;
+    readonly address: string;
+    readonly runtimeInstanceId: string;
+  };
+}
+
+interface AgentCardStartResponse extends WorkerResponse {
+  readonly card: PublishedAgentCard;
+}
+
+interface AgentCardPeer {
+  readonly runtimeId: string;
+  readonly runtimeInstanceId: string;
+  readonly roomId: string;
+  readonly networkName: string;
+  readonly displayName: string;
+}
+
+interface AgentCardDiscoveryResponse extends WorkerResponse {
+  readonly peers: readonly AgentCardPeer[];
+  readonly lookup?: LookupResponse;
+}
+
+interface AgentCardCleanupResponse extends WorkerResponse {
+  readonly result: {
+    readonly cardsRemoved: number;
+    readonly temporaryFilesRemoved: number;
+    readonly totalRemoved: number;
+  };
+}
+
 interface CleanupResponse extends WorkerResponse {
   readonly removed: boolean;
 }
@@ -53,6 +95,7 @@ interface LookupAddress {
 interface LookupResponse {
   readonly kind: string;
   readonly address?: LookupAddress;
+  readonly addresses?: readonly LookupAddress[];
   readonly candidates?: readonly LookupAddress[];
 }
 
@@ -81,6 +124,19 @@ function inputFor(
     sessionId: `process-session-${index}`,
     networkName: 'planner',
     endpoint: `process-endpoint-${index}`,
+    ...overrides,
+  };
+}
+
+function agentCardInputFor(
+  root: string,
+  room: string,
+  index: number,
+  overrides: Readonly<Record<string, unknown>> = {},
+): WorkerInput {
+  return {
+    ...inputFor(root, room, index),
+    storageKey: room === ROOM_A ? STORAGE_KEY_A : STORAGE_KEY_B,
     ...overrides,
   };
 }
@@ -189,6 +245,43 @@ async function startRuntime(
     inputFor(root, room, index, overrides),
   )) as StartResponse;
   return result.record;
+}
+
+async function startAgentCard(
+  root: string,
+  room: string,
+  index: number,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Promise<PublishedAgentCard> {
+  const result = (await runWorker(
+    'agent-card-start',
+    agentCardInputFor(root, room, index, overrides),
+  )) as AgentCardStartResponse;
+  return result.card;
+}
+
+async function discoverAgentCards(
+  root: string,
+  room: string,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Promise<AgentCardDiscoveryResponse> {
+  return (await runWorker(
+    'agent-card-discover',
+    agentCardInputFor(root, room, 0, overrides),
+  )) as AgentCardDiscoveryResponse;
+}
+
+async function cleanupAgentCards(
+  root: string,
+  room: string,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Promise<AgentCardCleanupResponse> {
+  return (await runWorker('agent-card-cleanup', {
+    root,
+    room,
+    storageKey: room === ROOM_A ? STORAGE_KEY_A : STORAGE_KEY_B,
+    ...overrides,
+  })) as AgentCardCleanupResponse;
 }
 
 async function discover(
@@ -381,5 +474,116 @@ describe('multi-process registry publication and discovery', () => {
     const result = await discover(root, ROOM_A, { removeExpired: true, now: 30_000 });
     expect(result.records.map((record) => record.runtimeId)).toEqual([valid.runtimeId]);
     expect(await readFile(join(malformedPath, malformedFile), 'utf8')).toBe('{not-json');
+  }, 30_000);
+});
+
+describe('multi-process Agent Card registry publication and cleanup', () => {
+  it('publishes concurrent cards atomically and maps duplicate names to distinct peers', async () => {
+    const root = await temporaryRoot();
+    const indexes = Array.from({ length: 6 }, (_, offset) => offset + 60);
+    const cards = await Promise.all(indexes.map((index) => startAgentCard(root, ROOM_A, index)));
+    const discovery = await discoverAgentCards(root, ROOM_A, { query: 'planner' });
+
+    expect(discovery.peers.map((peer) => peer.runtimeId).sort()).toEqual(
+      cards.map((card) => card.runtimeInstanceId).sort(),
+    );
+    expect(new Set(discovery.peers.map((peer) => peer.networkName)).size).toBe(indexes.length);
+    expect(discovery.lookup?.kind).toBe('ambiguous');
+    expect(discovery.lookup?.addresses).toHaveLength(indexes.length);
+    expect(
+      discovery.peers.every(
+        (peer) => peer.runtimeId === peer.runtimeInstanceId && peer.roomId === ROOM_A,
+      ),
+    ).toBe(true);
+
+    const files = await readdir(join(root, 'rooms', STORAGE_KEY_A, 'agents'));
+    expect(files.filter((file) => file.endsWith('.json'))).toHaveLength(indexes.length);
+    expect(files.some((file) => file.includes('.tmp-') || file.endsWith('.lock'))).toBe(false);
+    for (const card of cards) {
+      const source = await readFile(
+        join(root, 'rooms', STORAGE_KEY_A, 'agents', `${card.runtimeInstanceId}.json`),
+        'utf8',
+      );
+      const persisted = JSON.parse(source) as PublishedAgentCard;
+      expect(persisted.runtimeInstanceId).toBe(card.runtimeInstanceId);
+      expect(persisted.endpoint.runtimeInstanceId).toBe(card.runtimeInstanceId);
+      expect(typeof persisted.leaseExpiresAt).toBe('string');
+    }
+  }, 30_000);
+
+  it('isolates room listings and prevents an old owner from removing a replacement card', async () => {
+    const root = await temporaryRoot();
+    const [oldCard, replacementCard, otherRoomCard] = await Promise.all([
+      startAgentCard(root, ROOM_A, 70),
+      startAgentCard(root, ROOM_A, 71),
+      startAgentCard(root, ROOM_B, 72),
+    ]);
+
+    const removal = (await runWorker(
+      'agent-card-remove',
+      agentCardInputFor(root, ROOM_A, 70, {
+        expectedSessionId: `process-session-70`,
+        expectedEndpoint: 'process-endpoint-70',
+      }),
+    )) as CleanupResponse;
+    expect(removal.removed).toBe(true);
+
+    const roomA = await discoverAgentCards(root, ROOM_A, { query: 'planner' });
+    const roomB = await discoverAgentCards(root, ROOM_B, { query: 'planner' });
+    expect(roomA.peers.map((peer) => peer.runtimeId)).toEqual([replacementCard.runtimeInstanceId]);
+    expect(roomB.peers.map((peer) => peer.runtimeId)).toEqual([otherRoomCard.runtimeInstanceId]);
+    expect(roomA.lookup?.kind).toBe('found');
+    expect(roomB.lookup?.kind).toBe('found');
+    expect(
+      await pathExists(
+        join(root, 'rooms', STORAGE_KEY_A, 'agents', `${oldCard.runtimeInstanceId}.json`),
+      ),
+    ).toBe(false);
+    expect(
+      await pathExists(
+        join(root, 'rooms', STORAGE_KEY_A, 'agents', `${replacementCard.runtimeInstanceId}.json`),
+      ),
+    ).toBe(true);
+  }, 30_000);
+
+  it('bounds stale-card and temporary-file cleanup across processes', async () => {
+    const root = await temporaryRoot();
+    const now = CARD_BASE_NOW + 151;
+    const stale = await startAgentCard(root, ROOM_A, 80, { now: CARD_BASE_NOW, ttlMs: 50 });
+    const oldTemporaryName = `.${stale.runtimeInstanceId}.json.tmp-123-abcd-deadbeef`;
+    const freshTemporaryName = `.${runtimeId(81)}.json.tmp-123-abcd-deadbeef`;
+    await runWorker(
+      'agent-card-temp',
+      agentCardInputFor(root, ROOM_A, 80, {
+        fileName: oldTemporaryName,
+        mtimeMs: CARD_BASE_NOW - 100,
+        now,
+        ttlMs: 50,
+      }),
+    );
+    await runWorker(
+      'agent-card-temp',
+      agentCardInputFor(root, ROOM_A, 81, {
+        fileName: freshTemporaryName,
+        mtimeMs: CARD_BASE_NOW + 150,
+        now,
+        ttlMs: 50,
+      }),
+    );
+
+    const cleanup = await cleanupAgentCards(root, ROOM_A, {
+      now,
+      ttlMs: 50,
+      maxEntries: 4,
+      maxDurationMs: 2_000,
+    });
+    expect(cleanup.result).toEqual({ cardsRemoved: 1, temporaryFilesRemoved: 1, totalRemoved: 2 });
+    expect(await pathExists(join(root, 'rooms', STORAGE_KEY_A, 'agents', oldTemporaryName))).toBe(
+      false,
+    );
+    expect(await pathExists(join(root, 'rooms', STORAGE_KEY_A, 'agents', freshTemporaryName))).toBe(
+      true,
+    );
+    expect((await discoverAgentCards(root, ROOM_A, { now })).peers).toEqual([]);
   }, 30_000);
 });

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -13,10 +13,11 @@ import {
   assertExactRoom,
   canonicalizeDirectory,
   deriveExplicitRoomId,
+  deriveRoom,
   deriveRoomId,
   discoverGitCommonDirectory,
   hashRoomId,
-  roomsEqual,
+  isSameRoom,
   isValidRoomId,
   normalizeProjectLabel,
   resolveRoom,
@@ -124,9 +125,12 @@ describe('Git and cwd room derivation', () => {
     const runner = vi.fn(() => '.git\n');
 
     expect(discoverGitCommonDirectory(directory, { gitRunner: runner })).toBe(
-      realpathSync(commonDirectory),
+      canonicalizeDirectory(commonDirectory),
     );
-    expect(runner).toHaveBeenCalledWith(realpathSync(directory), GIT_COMMON_DIRECTORY_ARGS);
+    expect(runner).toHaveBeenCalledWith(
+      canonicalizeDirectory(directory),
+      GIT_COMMON_DIRECTORY_ARGS,
+    );
     expect(Object.isFrozen(GIT_COMMON_DIRECTORY_ARGS)).toBe(true);
   });
 
@@ -163,7 +167,7 @@ describe('Git and cwd room derivation', () => {
     initializeRepository(first);
     initializeRepository(second);
 
-    expect(deriveRoomId({ cwd: first })).not.toBe(deriveRoomId({ cwd: second }));
+    expect(deriveRoom({ cwd: first })).not.toBe(deriveRoom({ cwd: second }));
   });
 
   it('falls back to canonical cwd when Git fails', () => {
@@ -243,9 +247,10 @@ describe('exact room isolation', () => {
     const current = deriveExplicitRoomId('frontend');
     const other = deriveExplicitRoomId('backend');
 
-    expect(roomsEqual(current, current)).toBe(true);
-    expect(roomsEqual(current, other)).toBe(false);
-    expect(roomsEqual('not-a-room', 'not-a-room')).toBe(false);
+    expect(isSameRoom(current, current)).toBe(true);
+    expect(isSameRoom(current, { roomId: current })).toBe(true);
+    expect(isSameRoom(current, other)).toBe(false);
+    expect(isSameRoom('not-a-room', 'not-a-room')).toBe(false);
     expect(assertExactRoom(current, current)).toBe(current);
     expect(() => assertExactRoom(current, other)).toThrow(RoomIsolationError);
     expect(() => assertExactRoom(current, 'not-a-room')).toThrow(InvalidRoomIdError);
